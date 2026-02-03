@@ -18,12 +18,11 @@ cargo run --release -- <args>  # Run release build
 
 ## Release Build
 
-After `cargo build --release`, copy TDLib library to `target/lib/`:
-
 ```bash
-mkdir -p target/lib
-cp target/release/build/tdlib-rs-*/out/tdlib/lib/libtdjson*.dylib target/lib/
+make release              # Build release and copy library
 ./target/release/tg search "test"
+
+make install              # Install to /usr/local/bin (may need sudo)
 ```
 
 The binary uses `@executable_path/../lib` rpath, so the structure is:
