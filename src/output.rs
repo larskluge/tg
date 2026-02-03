@@ -1,8 +1,9 @@
 use colored::Colorize;
-use comfy_table::{Attribute, Cell, ContentArrangement, Table};
+use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Table};
 use serde::Serialize;
 use std::env;
 use terminal_size::terminal_size;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -89,7 +90,7 @@ fn terminal_width() -> usize {
 }
 
 fn display_width(text: &str) -> usize {
-    text.chars().count()
+    text.width()
 }
 
 fn strip_ansi(text: &str) -> String {
@@ -126,6 +127,8 @@ fn single_line(text: &str) -> String {
 }
 
 fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+
     if max_width == 0 {
         return String::new();
     }
@@ -139,8 +142,19 @@ fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
         return ".".repeat(max_width);
     }
 
-    let take = max_width - 3;
-    let mut result = text.chars().take(take).collect::<String>();
+    let target_width = max_width - 3;
+    let mut result = String::new();
+    let mut current_width = 0;
+
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0);
+        if current_width + ch_width > target_width {
+            break;
+        }
+        result.push(ch);
+        current_width += ch_width;
+    }
+
     result.push_str("...");
     result
 }
@@ -192,14 +206,15 @@ pub fn print_chats_table(chats: &[ChatInfo]) {
 
     let overhead = chats_table_overhead();
     let base_width = name_width + id_width + unread_width + overhead;
-    let available = terminal_width().saturating_sub(base_width);
+    // Add safety margin for emoji width calculation differences
+    let available = terminal_width().saturating_sub(base_width + 4);
     let max_last_width = available.max(1);
 
     let last_header = truncate_with_ellipsis("Last message", max_last_width);
 
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::NOTHING);
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_content_arrangement(ContentArrangement::Disabled);
     table.set_header(vec![
         Cell::new("Name")
             .add_attribute(Attribute::Bold)
@@ -225,6 +240,15 @@ pub fn print_chats_table(chats: &[ChatInfo]) {
             Cell::new(chat.unread_count),
             Cell::new(last_message),
         ]);
+    }
+
+    // Set right alignment for numeric columns and prevent wrapping
+    for (index, column) in table.column_iter_mut().enumerate() {
+        // Use a delimiter that won't appear in text to prevent wrapping
+        column.set_delimiter('\0');
+        if index == 1 || index == 2 {
+            column.set_cell_alignment(CellAlignment::Right);
+        }
     }
 
     println!("{table}");
@@ -260,7 +284,7 @@ pub fn print_contacts_table(contacts: &[ContactInfo]) {
 
     let mut table = Table::new();
     table.load_preset(comfy_table::presets::NOTHING);
-    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_content_arrangement(ContentArrangement::Disabled);
     table.set_header(vec![
         Cell::new("Name")
             .add_attribute(Attribute::Bold)
@@ -289,6 +313,14 @@ pub fn print_contacts_table(contacts: &[ContactInfo]) {
             Cell::new(contact.id),
             Cell::new(phone),
         ]);
+    }
+
+    // Set right alignment for numeric column and prevent wrapping
+    for (index, column) in table.column_iter_mut().enumerate() {
+        column.set_delimiter('\0');
+        if index == 2 {
+            column.set_cell_alignment(CellAlignment::Right);
+        }
     }
 
     println!("{table}");

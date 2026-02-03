@@ -1845,6 +1845,7 @@ dependencies = [
  "terminal_size",
  "thiserror",
  "tokio",
+ "unicode-width",
 ]
 
 [[package]]
