@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::os::raw::c_int;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -206,6 +207,140 @@ impl TdLibClient {
             .await
             .ok_or_else(|| TgError::Other("Client not started".to_string()))
     }
+
+    async fn collect_filtered_chats<F>(&self, limit: i32, filter: F) -> Result<Vec<ChatInfo>>
+    where
+        F: Fn(&ChatSnapshot) -> bool,
+    {
+        collect_filtered_chats_from_source(self, limit, filter).await
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChatTypeKind {
+    Private,
+    BasicGroup,
+    Supergroup,
+    Other,
+}
+
+#[derive(Clone, Debug)]
+struct ChatSnapshot {
+    id: i64,
+    title: String,
+    unread_count: i32,
+    last_message: Option<String>,
+    chat_type: ChatTypeKind,
+}
+
+impl ChatSnapshot {
+    fn to_chat_info(&self) -> ChatInfo {
+        ChatInfo {
+            id: self.id,
+            name: self.title.clone(),
+            unread_count: self.unread_count,
+            last_message: self.last_message.clone(),
+        }
+    }
+}
+
+#[async_trait]
+trait ChatDataSource {
+    async fn fetch_chat_ids(&self, limit: i32) -> Result<Vec<i64>>;
+    async fn fetch_chat_snapshot(&self, chat_id: i64) -> Result<ChatSnapshot>;
+}
+
+#[async_trait]
+impl ChatDataSource for TdLibClient {
+    async fn fetch_chat_ids(&self, limit: i32) -> Result<Vec<i64>> {
+        let client_id = self.get_client_id().await?;
+        let chats_enum = tdlib_rs::functions::get_chats(None, limit, client_id)
+            .await
+            .map_err(|e| TgError::TdLib(e.message))?;
+        Ok(unwrap_chats(chats_enum).chat_ids)
+    }
+
+    async fn fetch_chat_snapshot(&self, chat_id: i64) -> Result<ChatSnapshot> {
+        let client_id = self.get_client_id().await?;
+        let chat_enum = tdlib_rs::functions::get_chat(chat_id, client_id)
+            .await
+            .map_err(|e| TgError::TdLib(e.message))?;
+        let chat = unwrap_chat(chat_enum);
+        let chat_type = match chat.r#type {
+            tdlib_rs::enums::ChatType::Private(_) => ChatTypeKind::Private,
+            tdlib_rs::enums::ChatType::BasicGroup(_) => ChatTypeKind::BasicGroup,
+            tdlib_rs::enums::ChatType::Supergroup(_) => ChatTypeKind::Supergroup,
+            _ => ChatTypeKind::Other,
+        };
+
+        Ok(ChatSnapshot {
+            id: chat.id,
+            title: chat.title,
+            unread_count: chat.unread_count,
+            last_message: chat
+                .last_message
+                .as_ref()
+                .and_then(|m| extract_message_text(&m.content)),
+            chat_type,
+        })
+    }
+}
+
+async fn collect_filtered_chats_from_source<S, F>(
+    source: &S,
+    limit: i32,
+    filter: F,
+) -> Result<Vec<ChatInfo>>
+where
+    S: ChatDataSource,
+    F: Fn(&ChatSnapshot) -> bool,
+{
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut result = Vec::new();
+    let mut seen = HashSet::new();
+    let mut fetch_limit = limit.max(1);
+    let mut previous_total = 0usize;
+
+    loop {
+        let chat_ids = source.fetch_chat_ids(fetch_limit).await?;
+        let total = chat_ids.len();
+
+        for chat_id in chat_ids {
+            if !seen.insert(chat_id) {
+                continue;
+            }
+
+            if let Ok(chat) = source.fetch_chat_snapshot(chat_id).await {
+                if filter(&chat) {
+                    result.push(chat.to_chat_info());
+                    if result.len() as i32 >= limit {
+                        return Ok(result);
+                    }
+                }
+            }
+        }
+
+        if total <= previous_total {
+            break;
+        }
+
+        previous_total = total;
+
+        if total < fetch_limit as usize {
+            break;
+        }
+
+        let next_limit = fetch_limit.saturating_mul(2);
+        if next_limit == fetch_limit {
+            break;
+        }
+        fetch_limit = next_limit;
+    }
+
+    Ok(result)
 }
 
 // Helper to extract Chat fields from the enum
@@ -371,96 +506,25 @@ impl TelegramClient for TdLibClient {
     }
 
     async fn get_chats(&self, limit: i32) -> Result<Vec<ChatInfo>> {
-        let client_id = self.get_client_id().await?;
-
-        let chats_enum = tdlib_rs::functions::get_chats(None, limit, client_id)
-            .await
-            .map_err(|e| TgError::TdLib(e.message))?;
-
-        let chats = unwrap_chats(chats_enum);
-        let mut result = Vec::new();
-
-        for chat_id in chats.chat_ids {
-            if let Ok(chat_enum) = tdlib_rs::functions::get_chat(chat_id, client_id).await {
-                let chat = unwrap_chat(chat_enum);
-                // Filter for 1:1 chats only (private chats)
-                if matches!(chat.r#type, tdlib_rs::enums::ChatType::Private(_)) {
-                    result.push(ChatInfo {
-                        id: chat.id,
-                        name: chat.title,
-                        unread_count: chat.unread_count,
-                        last_message: chat
-                            .last_message
-                            .as_ref()
-                            .and_then(|m| extract_message_text(&m.content)),
-                    });
-                }
-            }
-        }
-        Ok(result)
+        self.collect_filtered_chats(limit, |chat| {
+            chat.chat_type == ChatTypeKind::Private
+        })
+        .await
     }
 
     async fn get_groups(&self, limit: i32) -> Result<Vec<ChatInfo>> {
-        let client_id = self.get_client_id().await?;
-
-        let chats_enum = tdlib_rs::functions::get_chats(None, limit, client_id)
-            .await
-            .map_err(|e| TgError::TdLib(e.message))?;
-
-        let chats = unwrap_chats(chats_enum);
-        let mut result = Vec::new();
-
-        for chat_id in chats.chat_ids {
-            if let Ok(chat_enum) = tdlib_rs::functions::get_chat(chat_id, client_id).await {
-                let chat = unwrap_chat(chat_enum);
-                // Filter for group chats only
-                if matches!(
-                    chat.r#type,
-                    tdlib_rs::enums::ChatType::BasicGroup(_)
-                        | tdlib_rs::enums::ChatType::Supergroup(_)
-                ) {
-                    result.push(ChatInfo {
-                        id: chat.id,
-                        name: chat.title,
-                        unread_count: chat.unread_count,
-                        last_message: chat
-                            .last_message
-                            .as_ref()
-                            .and_then(|m| extract_message_text(&m.content)),
-                    });
-                }
-            }
-        }
-        Ok(result)
+        self.collect_filtered_chats(limit, |chat| {
+            matches!(
+                chat.chat_type,
+                ChatTypeKind::BasicGroup | ChatTypeKind::Supergroup
+            )
+        })
+        .await
     }
 
     async fn get_unread_chats(&self, limit: i32) -> Result<Vec<ChatInfo>> {
-        let client_id = self.get_client_id().await?;
-
-        let chats_enum = tdlib_rs::functions::get_chats(None, limit, client_id)
+        self.collect_filtered_chats(limit, |chat| chat.unread_count > 0)
             .await
-            .map_err(|e| TgError::TdLib(e.message))?;
-
-        let chats = unwrap_chats(chats_enum);
-        let mut result = Vec::new();
-
-        for chat_id in chats.chat_ids {
-            if let Ok(chat_enum) = tdlib_rs::functions::get_chat(chat_id, client_id).await {
-                let chat = unwrap_chat(chat_enum);
-                if chat.unread_count > 0 {
-                    result.push(ChatInfo {
-                        id: chat.id,
-                        name: chat.title,
-                        unread_count: chat.unread_count,
-                        last_message: chat
-                            .last_message
-                            .as_ref()
-                            .and_then(|m| extract_message_text(&m.content)),
-                    });
-                }
-            }
-        }
-        Ok(result)
     }
 
     async fn search_contacts(&self, query: &str) -> Result<Vec<ContactInfo>> {
@@ -925,9 +989,103 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    struct TestChatSource {
+        chat_ids: Vec<i64>,
+        chats: HashMap<i64, ChatSnapshot>,
+    }
+
+    #[async_trait]
+    impl ChatDataSource for TestChatSource {
+        async fn fetch_chat_ids(&self, limit: i32) -> Result<Vec<i64>> {
+            if limit <= 0 {
+                return Ok(Vec::new());
+            }
+            let take = limit as usize;
+            Ok(self.chat_ids.iter().cloned().take(take).collect())
+        }
+
+        async fn fetch_chat_snapshot(&self, chat_id: i64) -> Result<ChatSnapshot> {
+            self.chats
+                .get(&chat_id)
+                .cloned()
+                .ok_or_else(|| TgError::Other(format!("Missing chat {chat_id}")))
+        }
+    }
+
+    fn chat_snapshot(
+        id: i64,
+        title: &str,
+        unread_count: i32,
+        chat_type: ChatTypeKind,
+    ) -> ChatSnapshot {
+        ChatSnapshot {
+            id,
+            title: title.to_string(),
+            unread_count,
+            last_message: None,
+            chat_type,
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_filtered_chats_expands_limit_for_private_chats() {
+        let chat_ids = vec![1, 2, 3, 4, 5, 6, 7];
+        let mut chats = HashMap::new();
+        chats.insert(1, chat_snapshot(1, "Group A", 0, ChatTypeKind::BasicGroup));
+        chats.insert(2, chat_snapshot(2, "Group B", 1, ChatTypeKind::Supergroup));
+        chats.insert(3, chat_snapshot(3, "Alice", 0, ChatTypeKind::Private));
+        chats.insert(4, chat_snapshot(4, "Bob", 0, ChatTypeKind::Private));
+        chats.insert(5, chat_snapshot(5, "Cara", 0, ChatTypeKind::Private));
+        chats.insert(6, chat_snapshot(6, "Group C", 0, ChatTypeKind::BasicGroup));
+        chats.insert(7, chat_snapshot(7, "Group D", 0, ChatTypeKind::Supergroup));
+
+        let source = TestChatSource { chat_ids, chats };
+        let result = collect_filtered_chats_from_source(&source, 3, |chat| {
+            chat.chat_type == ChatTypeKind::Private
+        })
+        .await
+        .unwrap();
+
+        let ids: Vec<i64> = result.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn collect_filtered_chats_returns_partial_when_insufficient() {
+        let chat_ids = vec![10, 11, 12, 13];
+        let mut chats = HashMap::new();
+        chats.insert(10, chat_snapshot(10, "Group", 0, ChatTypeKind::BasicGroup));
+        chats.insert(11, chat_snapshot(11, "Unread A", 2, ChatTypeKind::Private));
+        chats.insert(12, chat_snapshot(12, "Read", 0, ChatTypeKind::Private));
+        chats.insert(13, chat_snapshot(13, "Unread B", 1, ChatTypeKind::Supergroup));
+
+        let source = TestChatSource { chat_ids, chats };
+        let result = collect_filtered_chats_from_source(&source, 5, |chat| {
+            chat.unread_count > 0
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.len(), 2);
+        assert!(result.iter().all(|c| c.unread_count > 0));
+    }
+
+    #[tokio::test]
+    async fn collect_filtered_chats_handles_zero_limit() {
+        let source = TestChatSource {
+            chat_ids: vec![1, 2, 3],
+            chats: HashMap::new(),
+        };
+
+        let result =
+            collect_filtered_chats_from_source(&source, 0, |_| true).await.unwrap();
+        assert!(result.is_empty());
+    }
 
     #[test]
     fn client_new_initializes_shutdown_flag_to_false() {
