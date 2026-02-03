@@ -1,0 +1,6 @@
+/target/
+/_links/
+
+# Environment
+.env
+.env.local
