@@ -1,5 +1,8 @@
 use colored::Colorize;
+use comfy_table::{Attribute, Cell, ContentArrangement, Table};
 use serde::Serialize;
+use std::env;
+use terminal_size::terminal_size;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
@@ -73,6 +76,160 @@ impl PlainText for ChatInfo {
     }
 }
 
+fn terminal_width() -> usize {
+    if let Some((terminal_size::Width(width), _)) = terminal_size() {
+        return width as usize;
+    }
+
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|cols| cols.parse::<usize>().ok())
+        .filter(|cols| *cols > 0)
+        .unwrap_or(80)
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                let _ = chars.next();
+                while let Some(next) = chars.next() {
+                    if next == 'm' {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        result.push(ch);
+    }
+    result
+}
+
+fn max_visible_width(text: &str) -> usize {
+    text.lines()
+        .map(|line| display_width(&strip_ansi(line)))
+        .max()
+        .unwrap_or(0)
+}
+
+fn single_line(text: &str) -> String {
+    text.chars()
+        .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+        .collect()
+}
+
+fn truncate_with_ellipsis(text: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+
+    let text_width = display_width(text);
+    if text_width <= max_width {
+        return text.to_string();
+    }
+
+    if max_width < 3 {
+        return ".".repeat(max_width);
+    }
+
+    let take = max_width - 3;
+    let mut result = text.chars().take(take).collect::<String>();
+    result.push_str("...");
+    result
+}
+
+fn chats_table_overhead() -> usize {
+    let mut table = Table::new();
+    table.load_preset(comfy_table::presets::NOTHING);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        Cell::new("H"),
+        Cell::new("H"),
+        Cell::new("H"),
+        Cell::new("H"),
+    ]);
+    table.add_row(vec![
+        Cell::new("x"),
+        Cell::new("x"),
+        Cell::new("x"),
+        Cell::new("x"),
+    ]);
+    let rendered = table.to_string();
+    max_visible_width(&rendered).saturating_sub(4)
+}
+
+/// Print a list of chats as a formatted table
+pub fn print_chats_table(chats: &[ChatInfo]) {
+    if chats.is_empty() {
+        return;
+    }
+
+    let name_width = chats
+        .iter()
+        .map(|c| display_width(&c.name))
+        .max()
+        .unwrap_or(4)
+        .max(display_width("Name"));
+    let id_width = chats
+        .iter()
+        .map(|c| display_width(&c.id.to_string()))
+        .max()
+        .unwrap_or(7)
+        .max(display_width("Chat ID"));
+    let unread_width = chats
+        .iter()
+        .map(|c| display_width(&c.unread_count.to_string()))
+        .max()
+        .unwrap_or(6)
+        .max(display_width("Unread"));
+
+    let overhead = chats_table_overhead();
+    let base_width = name_width + id_width + unread_width + overhead;
+    let available = terminal_width().saturating_sub(base_width);
+    let max_last_width = available.max(1);
+
+    let last_header = truncate_with_ellipsis("Last message", max_last_width);
+
+    let mut table = Table::new();
+    table.load_preset(comfy_table::presets::NOTHING);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        Cell::new("Name")
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Underlined),
+        Cell::new("Chat ID")
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Underlined),
+        Cell::new("Unread")
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Underlined),
+        Cell::new(last_header)
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Underlined),
+    ]);
+
+    for chat in chats {
+        let last_message = chat.last_message.as_deref().unwrap_or("-");
+        let last_message = single_line(last_message);
+        let last_message = truncate_with_ellipsis(&last_message, max_last_width);
+        table.add_row(vec![
+            Cell::new(&chat.name),
+            Cell::new(chat.id),
+            Cell::new(chat.unread_count),
+            Cell::new(last_message),
+        ]);
+    }
+
+    println!("{table}");
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ContactInfo {
     pub id: i64,
@@ -101,52 +258,24 @@ pub fn print_contacts_table(contacts: &[ContactInfo]) {
         return;
     }
 
-    // Calculate column widths
-    let name_width = contacts.iter().map(|c| c.name.len()).max().unwrap_or(4).max(4);
-    let username_width = contacts
-        .iter()
-        .map(|c| c.username.as_ref().map(|u| u.len() + 1).unwrap_or(1)) // +1 for @
-        .max()
-        .unwrap_or(8)
-        .max(8);
-    let id_width = contacts
-        .iter()
-        .map(|c| c.id.to_string().len())
-        .max()
-        .unwrap_or(7)
-        .max(7);
-    let phone_width = contacts
-        .iter()
-        .map(|c| c.phone.as_ref().map(|p| p.len()).unwrap_or(1))
-        .max()
-        .unwrap_or(5)
-        .max(5);
+    let mut table = Table::new();
+    table.load_preset(comfy_table::presets::NOTHING);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        Cell::new("Name")
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Underlined),
+        Cell::new("Username")
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Underlined),
+        Cell::new("Chat ID")
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Underlined),
+        Cell::new("Phone")
+            .add_attribute(Attribute::Bold)
+            .add_attribute(Attribute::Underlined),
+    ]);
 
-    // Print header
-    println!(
-        "{:<name_width$}  {:<username_width$}  {:>id_width$}  {:<phone_width$}",
-        "Name".bold(),
-        "Username".bold(),
-        "Chat ID".bold(),
-        "Phone".bold(),
-        name_width = name_width,
-        username_width = username_width,
-        id_width = id_width,
-        phone_width = phone_width,
-    );
-    println!(
-        "{:-<name_width$}  {:-<username_width$}  {:-<id_width$}  {:-<phone_width$}",
-        "",
-        "",
-        "",
-        "",
-        name_width = name_width,
-        username_width = username_width,
-        id_width = id_width,
-        phone_width = phone_width,
-    );
-
-    // Print rows
     for contact in contacts {
         let username = contact
             .username
@@ -154,18 +283,15 @@ pub fn print_contacts_table(contacts: &[ContactInfo]) {
             .map(|u| format!("@{}", u))
             .unwrap_or_else(|| "-".to_string());
         let phone = contact.phone.as_deref().unwrap_or("-");
-        println!(
-            "{:<name_width$}  {:<username_width$}  {:>id_width$}  {:<phone_width$}",
-            contact.name,
-            username.dimmed(),
-            contact.id,
-            phone.dimmed(),
-            name_width = name_width,
-            username_width = username_width,
-            id_width = id_width,
-            phone_width = phone_width,
-        );
+        table.add_row(vec![
+            Cell::new(&contact.name),
+            Cell::new(username),
+            Cell::new(contact.id),
+            Cell::new(phone),
+        ]);
     }
+
+    println!("{table}");
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -370,5 +496,40 @@ mod tests {
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"message_id\":12345"));
         assert!(json.contains("\"chat_id\":67890"));
+    }
+
+    #[test]
+    fn single_line_replaces_controls() {
+        let text = "hello\nworld\ttest\rline";
+        let normalized = single_line(text);
+        assert_eq!(normalized, "hello world test line");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_shortens() {
+        let text = "abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(truncate_with_ellipsis(text, 10), "abcdefg...");
+        assert_eq!(truncate_with_ellipsis(text, 3), "...");
+        assert_eq!(truncate_with_ellipsis(text, 2), "..");
+        assert_eq!(truncate_with_ellipsis(text, 1), ".");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_no_change_when_fits() {
+        let text = "short";
+        assert_eq!(truncate_with_ellipsis(text, 5), "short");
+        assert_eq!(truncate_with_ellipsis(text, 10), "short");
+    }
+
+    #[test]
+    fn strip_ansi_removes_escape_sequences() {
+        let text = "\u{1b}[31mred\u{1b}[0m";
+        assert_eq!(strip_ansi(text), "red");
+    }
+
+    #[test]
+    fn max_visible_width_ignores_ansi_and_lines() {
+        let text = "short\n\u{1b}[32mverylong\u{1b}[0m";
+        assert_eq!(max_visible_width(text), 8);
     }
 }

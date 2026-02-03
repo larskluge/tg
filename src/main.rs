@@ -6,7 +6,10 @@ use tg::cli::{Cli, Command};
 use tg::client::TdLibClient;
 use tg::commands::{chats, groups, mark_read, mark_unread, messages, search, send, unread};
 use tg::error::{Result, TgError};
-use tg::output::{print_contacts_table, print_error, print_list, print_output, print_success, OutputFormat};
+use tg::output::{
+    print_chats_table, print_contacts_table, print_error, print_list, print_output, print_success,
+    OutputFormat,
+};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -49,19 +52,28 @@ async fn run_command(client: &mut TdLibClient, command: Command, format: OutputF
         Command::Chats(args) => {
             client.start().await?;
             let chats = chats::list_chats(client, args.limit).await?;
-            print_list(format, &chats);
+            match format {
+                OutputFormat::Json => print_list(format, &chats),
+                OutputFormat::Plain => print_chats_table(&chats),
+            }
         }
 
         Command::Groups(args) => {
             client.start().await?;
             let groups = groups::list_groups(client, args.limit).await?;
-            print_list(format, &groups);
+            match format {
+                OutputFormat::Json => print_list(format, &groups),
+                OutputFormat::Plain => print_chats_table(&groups),
+            }
         }
 
         Command::Unread(args) => {
             client.start().await?;
             let unread = unread::list_unread(client, args.limit).await?;
-            print_list(format, &unread);
+            match format {
+                OutputFormat::Json => print_list(format, &unread),
+                OutputFormat::Plain => print_chats_table(&unread),
+            }
         }
 
         Command::Search(args) => {
