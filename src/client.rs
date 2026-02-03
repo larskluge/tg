@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 
 use crate::error::{Result, TgError};
 use crate::output::{ChatInfo, ContactInfo, MessageInfo, SendResult};
@@ -38,15 +38,24 @@ pub struct TdLibClient {
     api_hash: String,
     data_dir: PathBuf,
     authenticated: Arc<Mutex<bool>>,
+    /// Broadcast sender for TDLib updates from the background receive thread
+    update_sender: broadcast::Sender<tdlib_rs::enums::Update>,
 }
 
 impl TdLibClient {
     pub fn new(api_id: i32, api_hash: String) -> Result<Self> {
+        println!("[DEBUG] TdLibClient::new: api_id={}", api_id);
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("tg");
+        println!("[DEBUG] TdLibClient::new: data_dir={:?}", data_dir);
 
         std::fs::create_dir_all(&data_dir)?;
+        println!("[DEBUG] TdLibClient::new: Directory created/verified");
+
+        // Create broadcast channel for updates (capacity 100)
+        let (update_sender, _) = broadcast::channel(100);
+        println!("[DEBUG] TdLibClient::new: Broadcast channel created");
 
         Ok(Self {
             client_id: Arc::new(Mutex::new(None)),
@@ -54,68 +63,101 @@ impl TdLibClient {
             api_hash,
             data_dir,
             authenticated: Arc::new(Mutex::new(false)),
+            update_sender,
         })
     }
 
+    /// Spawn the background receive loop as a native thread.
+    /// TDLib's receive() blocks, so we use a dedicated thread.
+    fn spawn_receive_loop(&self) {
+        let sender = self.update_sender.clone();
+        println!("[DEBUG] spawn_receive_loop: Starting background receive thread...");
+
+        std::thread::spawn(move || {
+            println!("[DEBUG] receive_loop: Thread started");
+            loop {
+                // TDLib's receive() blocks waiting for updates
+                if let Some((update, _client_id)) = tdlib_rs::receive() {
+                    println!("[DEBUG] receive_loop: Got update: {:?}", std::mem::discriminant(&update));
+                    // Send to all subscribers, ignore errors (no receivers is ok)
+                    let _ = sender.send(update);
+                }
+            }
+        });
+        println!("[DEBUG] spawn_receive_loop: Background thread spawned");
+    }
+
     pub async fn start(&mut self) -> Result<()> {
-        let client_id = tdlib_rs::create_client();
-        *self.client_id.lock().await = Some(client_id);
-
-        // Set TDLib parameters
-        self.set_tdlib_parameters().await?;
-
-        // Wait for authorization state
-        self.wait_for_ready().await
-    }
-
-    async fn set_tdlib_parameters(&self) -> Result<()> {
-        let client_id = self.get_client_id().await?;
-
-        tdlib_rs::functions::set_tdlib_parameters(
-            false, // use_test_dc
-            self.data_dir.join("db").to_string_lossy().to_string(),
-            self.data_dir.join("files").to_string_lossy().to_string(),
-            String::new(), // database_encryption_key
-            true,  // use_file_database
-            true,  // use_chat_info_database
-            true,  // use_message_database
-            false, // use_secret_chats
-            self.api_id,
-            self.api_hash.clone(),
-            "en".to_string(),    // system_language_code
-            "CLI".to_string(),   // device_model
-            "1.0".to_string(),   // system_version
-            env!("CARGO_PKG_VERSION").to_string(), // application_version
-            client_id,
-        )
-        .await
-        .map_err(|e| TgError::TdLib(e.message))?;
-
-        Ok(())
-    }
-
-    async fn wait_for_ready(&self) -> Result<()> {
         use tdlib_rs::enums::AuthorizationState;
 
+        println!("[DEBUG] start: Creating TDLib client...");
+        let client_id = tdlib_rs::create_client();
+        println!("[DEBUG] start: Client created with id={}", client_id);
+        *self.client_id.lock().await = Some(client_id);
+
+        // CRITICAL: Spawn receive loop BEFORE any TDLib operations
+        self.spawn_receive_loop();
+
+        // Small delay to let the receive loop start
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        // Subscribe to updates before triggering TDLib
+        let mut receiver = self.update_sender.subscribe();
+
+        // Trigger TDLib to start sending updates
+        println!("[DEBUG] start: Sending initial request to trigger TDLib...");
+        let _ = tdlib_rs::functions::get_option("version".to_string(), client_id).await;
+
+        // Wait for TDLib to be ready (parameters set + authenticated)
+        println!("[DEBUG] start: Waiting for TDLib to be ready...");
         loop {
-            if let Some((tdlib_rs::enums::Update::AuthorizationState(state), _)) =
-                tdlib_rs::receive()
-            {
-                match state.authorization_state {
-                    AuthorizationState::Ready => {
-                        *self.authenticated.lock().await = true;
-                        return Ok(());
+            match receiver.recv().await {
+                Ok(update) => {
+                    if let tdlib_rs::enums::Update::AuthorizationState(state) = update {
+                        println!("[DEBUG] start: AuthorizationState = {:?}", std::mem::discriminant(&state.authorization_state));
+                        match state.authorization_state {
+                            AuthorizationState::WaitTdlibParameters => {
+                                println!("[DEBUG] start: Setting TDLib parameters...");
+                                tdlib_rs::functions::set_tdlib_parameters(
+                                    false,
+                                    self.data_dir.join("db").to_string_lossy().to_string(),
+                                    self.data_dir.join("files").to_string_lossy().to_string(),
+                                    String::new(),
+                                    true, true, true, false,
+                                    self.api_id,
+                                    self.api_hash.clone(),
+                                    "en".to_string(),
+                                    "CLI".to_string(),
+                                    "1.0".to_string(),
+                                    env!("CARGO_PKG_VERSION").to_string(),
+                                    client_id,
+                                )
+                                .await
+                                .map_err(|e| TgError::TdLib(e.message))?;
+                                println!("[DEBUG] start: TDLib parameters set");
+                            }
+                            AuthorizationState::Ready => {
+                                println!("[DEBUG] start: TDLib is ready (authenticated)");
+                                *self.authenticated.lock().await = true;
+                                return Ok(());
+                            }
+                            AuthorizationState::WaitPhoneNumber
+                            | AuthorizationState::WaitCode(_)
+                            | AuthorizationState::WaitPassword(_) => {
+                                println!("[DEBUG] start: Not authenticated, run `tg auth` first");
+                                return Err(TgError::AuthFailed(
+                                    "Not authenticated. Run `tg auth --phone <number>` first.".to_string()
+                                ));
+                            }
+                            AuthorizationState::Closed => {
+                                return Err(TgError::AuthFailed("Session closed".to_string()));
+                            }
+                            _ => {}
+                        }
                     }
-                    AuthorizationState::WaitPhoneNumber
-                    | AuthorizationState::WaitCode(_)
-                    | AuthorizationState::WaitPassword(_) => {
-                        // Not yet authenticated, caller should use authenticate()
-                        return Ok(());
-                    }
-                    AuthorizationState::Closed => {
-                        return Err(TgError::AuthFailed("Session closed".to_string()));
-                    }
-                    _ => {}
+                }
+                Err(e) => {
+                    return Err(TgError::Other(format!("Update channel error: {}", e)));
                 }
             }
         }
@@ -188,79 +230,141 @@ impl TelegramClient for TdLibClient {
         use std::io::{self, BufRead, Write};
         use tdlib_rs::enums::AuthorizationState;
 
-        // Initialize client without waiting for ready state
+        println!("[DEBUG] authenticate: Starting, phone={:?}", phone.map(|_| "<redacted>"));
+
+        // Initialize client if needed (this starts the receive loop)
         if self.client_id.lock().await.is_none() {
-            let client_id = tdlib_rs::create_client();
-            *self.client_id.lock().await = Some(client_id);
-            self.set_tdlib_parameters().await?;
+            println!("[DEBUG] authenticate: No client_id, calling start()...");
+            self.start().await?;
+            println!("[DEBUG] authenticate: start() completed");
+        } else {
+            println!("[DEBUG] authenticate: Client already exists");
         }
 
         let client_id = self.get_client_id().await?;
+        println!("[DEBUG] authenticate: Using client_id={}", client_id);
 
+        // Subscribe to updates from the background receive loop
+        let mut receiver = self.update_sender.subscribe();
+
+        // TDLib needs at least one request before it sends updates.
+        // Send a simple request to trigger the update flow.
+        println!("[DEBUG] authenticate: Sending initial request to trigger TDLib...");
+        let _ = tdlib_rs::functions::get_option("version".to_string(), client_id).await;
+        println!("[DEBUG] authenticate: Initial request completed");
+
+        println!("[DEBUG] authenticate: Entering main auth loop...");
         loop {
-            if let Some((tdlib_rs::enums::Update::AuthorizationState(state), _)) =
-                tdlib_rs::receive()
-            {
-                match state.authorization_state {
-                    AuthorizationState::WaitPhoneNumber => {
-                        let phone = phone.ok_or_else(|| {
-                            TgError::Other(
-                                "Phone number required. Run: tg auth --phone +1234567890"
-                                    .to_string(),
-                            )
-                        })?;
-                        println!("Sending phone number...");
-                        tdlib_rs::functions::set_authentication_phone_number(
-                            phone.to_string(),
-                            None,
-                            client_id,
-                        )
-                        .await
-                        .map_err(|e| TgError::AuthFailed(e.message))?;
-                        // After sending phone, wait for next state then exit
-                    }
-                    AuthorizationState::WaitCode(_) => {
-                        if phone.is_some() {
-                            // Phone was just sent, exit so user can run `tg auth` to enter code
-                            println!("Verification code sent to your Telegram app.");
-                            println!("Run `tg auth` to enter the code.");
-                            return Ok(());
+            println!("[DEBUG] authenticate: Waiting for update from channel...");
+            match receiver.recv().await {
+                Ok(update) => {
+                    println!("[DEBUG] authenticate: Received update type: {:?}", std::mem::discriminant(&update));
+                    if let tdlib_rs::enums::Update::AuthorizationState(state) = update {
+                        println!("[DEBUG] authenticate: AuthorizationState = {:?}", std::mem::discriminant(&state.authorization_state));
+                        match state.authorization_state {
+                            AuthorizationState::WaitTdlibParameters => {
+                                println!("[DEBUG] authenticate: State=WaitTdlibParameters, setting params...");
+                                tdlib_rs::functions::set_tdlib_parameters(
+                                    false,
+                                    self.data_dir.join("db").to_string_lossy().to_string(),
+                                    self.data_dir.join("files").to_string_lossy().to_string(),
+                                    String::new(),
+                                    true, true, true, false,
+                                    self.api_id,
+                                    self.api_hash.clone(),
+                                    "en".to_string(),
+                                    "CLI".to_string(),
+                                    "1.0".to_string(),
+                                    env!("CARGO_PKG_VERSION").to_string(),
+                                    client_id,
+                                )
+                                .await
+                                .map_err(|e| TgError::TdLib(e.message))?;
+                                println!("[DEBUG] authenticate: TDLib parameters set");
+                            }
+                            AuthorizationState::WaitPhoneNumber => {
+                                println!("[DEBUG] authenticate: State=WaitPhoneNumber");
+                                let phone = phone.ok_or_else(|| {
+                                    println!("[DEBUG] authenticate: No phone provided, returning error");
+                                    TgError::Other(
+                                        "Phone number required. Run: tg auth --phone +1234567890"
+                                            .to_string(),
+                                    )
+                                })?;
+                                println!("[DEBUG] authenticate: Sending phone number...");
+                                println!("Sending phone number...");
+                                tdlib_rs::functions::set_authentication_phone_number(
+                                    phone.to_string(),
+                                    None,
+                                    client_id,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    println!("[DEBUG] authenticate: set_authentication_phone_number failed: {}", e.message);
+                                    TgError::AuthFailed(e.message)
+                                })?;
+                                println!("[DEBUG] authenticate: Phone number sent successfully");
+                            }
+                            AuthorizationState::WaitCode(_) => {
+                                println!("[DEBUG] authenticate: State=WaitCode");
+                                println!("A verification code was sent to your Telegram app.");
+                                print!("Enter the code from Telegram: ");
+                                io::stdout().flush().ok();
+                                let code = io::stdin()
+                                    .lock()
+                                    .lines()
+                                    .next()
+                                    .ok_or_else(|| TgError::Other("Failed to read code".to_string()))?
+                                    .map_err(|e| TgError::Other(e.to_string()))?;
+                                println!("[DEBUG] authenticate: Code entered, submitting...");
+                                tdlib_rs::functions::check_authentication_code(code, client_id)
+                                    .await
+                                    .map_err(|e| {
+                                        println!("[DEBUG] authenticate: check_authentication_code failed: {}", e.message);
+                                        TgError::AuthFailed(e.message)
+                                    })?;
+                                println!("[DEBUG] authenticate: Code accepted");
+                            }
+                            AuthorizationState::WaitPassword(_) => {
+                                println!("[DEBUG] authenticate: State=WaitPassword");
+                                print!("Enter 2FA password: ");
+                                io::stdout().flush().ok();
+                                let password = io::stdin()
+                                    .lock()
+                                    .lines()
+                                    .next()
+                                    .ok_or_else(|| TgError::Other("Failed to read password".to_string()))?
+                                    .map_err(|e| TgError::Other(e.to_string()))?;
+                                println!("[DEBUG] authenticate: Password entered, submitting...");
+                                tdlib_rs::functions::check_authentication_password(password, client_id)
+                                    .await
+                                    .map_err(|e| {
+                                        println!("[DEBUG] authenticate: check_authentication_password failed: {}", e.message);
+                                        TgError::AuthFailed(e.message)
+                                    })?;
+                                println!("[DEBUG] authenticate: Password accepted");
+                            }
+                            AuthorizationState::Ready => {
+                                println!("[DEBUG] authenticate: State=Ready, authentication complete");
+                                *self.authenticated.lock().await = true;
+                                println!("Authenticated successfully!");
+                                return Ok(());
+                            }
+                            AuthorizationState::Closed => {
+                                println!("[DEBUG] authenticate: State=Closed, session ended");
+                                return Err(TgError::AuthFailed("Session closed".to_string()));
+                            }
+                            _ => {
+                                println!("[DEBUG] authenticate: Ignoring other authorization state");
+                            }
                         }
-                        // No phone provided, prompt for code
-                        print!("Enter verification code: ");
-                        io::stdout().flush().ok();
-                        let code = io::stdin()
-                            .lock()
-                            .lines()
-                            .next()
-                            .ok_or_else(|| TgError::Other("Failed to read code".to_string()))?
-                            .map_err(|e| TgError::Other(e.to_string()))?;
-                        tdlib_rs::functions::check_authentication_code(code, client_id)
-                            .await
-                            .map_err(|e| TgError::AuthFailed(e.message))?;
+                    } else {
+                        println!("[DEBUG] authenticate: Non-AuthorizationState update, ignoring");
                     }
-                    AuthorizationState::WaitPassword(_) => {
-                        print!("Enter 2FA password: ");
-                        io::stdout().flush().ok();
-                        let password = io::stdin()
-                            .lock()
-                            .lines()
-                            .next()
-                            .ok_or_else(|| TgError::Other("Failed to read password".to_string()))?
-                            .map_err(|e| TgError::Other(e.to_string()))?;
-                        tdlib_rs::functions::check_authentication_password(password, client_id)
-                            .await
-                            .map_err(|e| TgError::AuthFailed(e.message))?;
-                    }
-                    AuthorizationState::Ready => {
-                        *self.authenticated.lock().await = true;
-                        println!("Already authenticated.");
-                        return Ok(());
-                    }
-                    AuthorizationState::Closed => {
-                        return Err(TgError::AuthFailed("Session closed".to_string()));
-                    }
-                    _ => {}
+                }
+                Err(e) => {
+                    println!("[DEBUG] authenticate: Channel error: {:?}", e);
+                    return Err(TgError::Other(format!("Update channel error: {}", e)));
                 }
             }
         }
