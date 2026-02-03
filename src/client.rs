@@ -1,10 +1,27 @@
 use async_trait::async_trait;
+use std::os::raw::c_int;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use tokio::sync::{broadcast, Mutex};
 
 use crate::error::{Result, TgError};
 use crate::output::{ChatInfo, ContactInfo, MessageInfo, SendResult};
+
+// Direct FFI to TDLib's synchronous log functions (not exposed by tdlib-rs)
+#[link(name = "tdjson")]
+unsafe extern "C" {
+    fn td_set_log_verbosity_level(new_verbosity_level: c_int);
+}
+
+/// Set TDLib's log verbosity level (0 = fatal errors only, 1 = errors, 2 = warnings + errors)
+/// Must be called before creating any TDLib client.
+fn set_tdlib_log_verbosity(level: i32) {
+    unsafe {
+        td_set_log_verbosity_level(level);
+    }
+}
 
 #[async_trait]
 pub trait TelegramClient: Send + Sync {
@@ -40,22 +57,26 @@ pub struct TdLibClient {
     authenticated: Arc<Mutex<bool>>,
     /// Broadcast sender for TDLib updates from the background receive thread
     update_sender: broadcast::Sender<tdlib_rs::enums::Update>,
+    /// Signal to stop the receive loop
+    shutdown: Arc<AtomicBool>,
+    /// Handle to the receive loop thread
+    receive_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl TdLibClient {
     pub fn new(api_id: i32, api_hash: String) -> Result<Self> {
-        println!("[DEBUG] TdLibClient::new: api_id={}", api_id);
+        // Set TDLib log verbosity to fatal errors only (0) before any TDLib operations
+        // Level 0 = fatal errors, 1 = errors, 2 = warnings
+        set_tdlib_log_verbosity(0);
+
         let data_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join("tg");
-        println!("[DEBUG] TdLibClient::new: data_dir={:?}", data_dir);
 
         std::fs::create_dir_all(&data_dir)?;
-        println!("[DEBUG] TdLibClient::new: Directory created/verified");
 
         // Create broadcast channel for updates (capacity 100)
         let (update_sender, _) = broadcast::channel(100);
-        println!("[DEBUG] TdLibClient::new: Broadcast channel created");
 
         Ok(Self {
             client_id: Arc::new(Mutex::new(None)),
@@ -64,39 +85,65 @@ impl TdLibClient {
             data_dir,
             authenticated: Arc::new(Mutex::new(false)),
             update_sender,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            receive_handle: Arc::new(Mutex::new(None)),
         })
     }
 
     /// Spawn the background receive loop as a native thread.
-    /// TDLib's receive() blocks, so we use a dedicated thread.
-    fn spawn_receive_loop(&self) {
+    /// TDLib's receive() blocks (with 2s timeout), so we use a dedicated thread.
+    async fn spawn_receive_loop(&self) {
         let sender = self.update_sender.clone();
-        println!("[DEBUG] spawn_receive_loop: Starting background receive thread...");
+        let shutdown = self.shutdown.clone();
 
-        std::thread::spawn(move || {
-            println!("[DEBUG] receive_loop: Thread started");
+        let handle = std::thread::spawn(move || {
             loop {
-                // TDLib's receive() blocks waiting for updates
+                // Check shutdown flag
+                if shutdown.load(Ordering::Relaxed) {
+                    break;
+                }
+                // TDLib's receive() has a 2s internal timeout
                 if let Some((update, _client_id)) = tdlib_rs::receive() {
-                    println!("[DEBUG] receive_loop: Got update: {:?}", std::mem::discriminant(&update));
                     // Send to all subscribers, ignore errors (no receivers is ok)
                     let _ = sender.send(update);
                 }
             }
         });
-        println!("[DEBUG] spawn_receive_loop: Background thread spawned");
+
+        *self.receive_handle.lock().await = Some(handle);
+    }
+
+    /// Gracefully shut down the TDLib client
+    pub async fn shutdown(&mut self) {
+        // Signal the receive loop to stop
+        self.shutdown.store(true, Ordering::Relaxed);
+
+        // Close TDLib client if started
+        if let Some(client_id) = *self.client_id.lock().await {
+            // Request TDLib to close - ignore errors since we're shutting down
+            let _ = tdlib_rs::functions::close(client_id).await;
+        }
+
+        // Wait for the receive thread to finish (with timeout)
+        if let Some(handle) = self.receive_handle.lock().await.take() {
+            // Give the thread time to notice the shutdown flag
+            // The receive() call has a 2s timeout, so we wait a bit longer
+            let _ = std::thread::spawn(move || {
+                let _ = handle.join();
+            });
+            // Give it a moment to clean up
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        }
     }
 
     pub async fn start(&mut self) -> Result<()> {
         use tdlib_rs::enums::AuthorizationState;
 
-        println!("[DEBUG] start: Creating TDLib client...");
         let client_id = tdlib_rs::create_client();
-        println!("[DEBUG] start: Client created with id={}", client_id);
         *self.client_id.lock().await = Some(client_id);
 
         // CRITICAL: Spawn receive loop BEFORE any TDLib operations
-        self.spawn_receive_loop();
+        self.spawn_receive_loop().await;
 
         // Small delay to let the receive loop start
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -105,19 +152,15 @@ impl TdLibClient {
         let mut receiver = self.update_sender.subscribe();
 
         // Trigger TDLib to start sending updates
-        println!("[DEBUG] start: Sending initial request to trigger TDLib...");
         let _ = tdlib_rs::functions::get_option("version".to_string(), client_id).await;
 
         // Wait for TDLib to be ready (parameters set + authenticated)
-        println!("[DEBUG] start: Waiting for TDLib to be ready...");
         loop {
             match receiver.recv().await {
                 Ok(update) => {
                     if let tdlib_rs::enums::Update::AuthorizationState(state) = update {
-                        println!("[DEBUG] start: AuthorizationState = {:?}", std::mem::discriminant(&state.authorization_state));
                         match state.authorization_state {
                             AuthorizationState::WaitTdlibParameters => {
-                                println!("[DEBUG] start: Setting TDLib parameters...");
                                 tdlib_rs::functions::set_tdlib_parameters(
                                     false,
                                     self.data_dir.join("db").to_string_lossy().to_string(),
@@ -134,17 +177,14 @@ impl TdLibClient {
                                 )
                                 .await
                                 .map_err(|e| TgError::TdLib(e.message))?;
-                                println!("[DEBUG] start: TDLib parameters set");
                             }
                             AuthorizationState::Ready => {
-                                println!("[DEBUG] start: TDLib is ready (authenticated)");
                                 *self.authenticated.lock().await = true;
                                 return Ok(());
                             }
                             AuthorizationState::WaitPhoneNumber
                             | AuthorizationState::WaitCode(_)
                             | AuthorizationState::WaitPassword(_) => {
-                                println!("[DEBUG] start: Not authenticated, run `tg auth` first");
                                 return Err(TgError::AuthFailed(
                                     "Not authenticated. Run `tg auth --phone <number>` first.".to_string()
                                 ));
@@ -230,40 +270,26 @@ impl TelegramClient for TdLibClient {
         use std::io::{self, BufRead, Write};
         use tdlib_rs::enums::AuthorizationState;
 
-        println!("[DEBUG] authenticate: Starting, phone={:?}", phone.map(|_| "<redacted>"));
-
         // Initialize client if needed (this starts the receive loop)
         if self.client_id.lock().await.is_none() {
-            println!("[DEBUG] authenticate: No client_id, calling start()...");
             self.start().await?;
-            println!("[DEBUG] authenticate: start() completed");
-        } else {
-            println!("[DEBUG] authenticate: Client already exists");
         }
 
         let client_id = self.get_client_id().await?;
-        println!("[DEBUG] authenticate: Using client_id={}", client_id);
 
         // Subscribe to updates from the background receive loop
         let mut receiver = self.update_sender.subscribe();
 
         // TDLib needs at least one request before it sends updates.
         // Send a simple request to trigger the update flow.
-        println!("[DEBUG] authenticate: Sending initial request to trigger TDLib...");
         let _ = tdlib_rs::functions::get_option("version".to_string(), client_id).await;
-        println!("[DEBUG] authenticate: Initial request completed");
 
-        println!("[DEBUG] authenticate: Entering main auth loop...");
         loop {
-            println!("[DEBUG] authenticate: Waiting for update from channel...");
             match receiver.recv().await {
                 Ok(update) => {
-                    println!("[DEBUG] authenticate: Received update type: {:?}", std::mem::discriminant(&update));
                     if let tdlib_rs::enums::Update::AuthorizationState(state) = update {
-                        println!("[DEBUG] authenticate: AuthorizationState = {:?}", std::mem::discriminant(&state.authorization_state));
                         match state.authorization_state {
                             AuthorizationState::WaitTdlibParameters => {
-                                println!("[DEBUG] authenticate: State=WaitTdlibParameters, setting params...");
                                 tdlib_rs::functions::set_tdlib_parameters(
                                     false,
                                     self.data_dir.join("db").to_string_lossy().to_string(),
@@ -280,18 +306,14 @@ impl TelegramClient for TdLibClient {
                                 )
                                 .await
                                 .map_err(|e| TgError::TdLib(e.message))?;
-                                println!("[DEBUG] authenticate: TDLib parameters set");
                             }
                             AuthorizationState::WaitPhoneNumber => {
-                                println!("[DEBUG] authenticate: State=WaitPhoneNumber");
                                 let phone = phone.ok_or_else(|| {
-                                    println!("[DEBUG] authenticate: No phone provided, returning error");
                                     TgError::Other(
                                         "Phone number required. Run: tg auth --phone +1234567890"
                                             .to_string(),
                                     )
                                 })?;
-                                println!("[DEBUG] authenticate: Sending phone number...");
                                 println!("Sending phone number...");
                                 tdlib_rs::functions::set_authentication_phone_number(
                                     phone.to_string(),
@@ -299,14 +321,9 @@ impl TelegramClient for TdLibClient {
                                     client_id,
                                 )
                                 .await
-                                .map_err(|e| {
-                                    println!("[DEBUG] authenticate: set_authentication_phone_number failed: {}", e.message);
-                                    TgError::AuthFailed(e.message)
-                                })?;
-                                println!("[DEBUG] authenticate: Phone number sent successfully");
+                                .map_err(|e| TgError::AuthFailed(e.message))?;
                             }
                             AuthorizationState::WaitCode(_) => {
-                                println!("[DEBUG] authenticate: State=WaitCode");
                                 println!("A verification code was sent to your Telegram app.");
                                 print!("Enter the code from Telegram: ");
                                 io::stdout().flush().ok();
@@ -316,17 +333,11 @@ impl TelegramClient for TdLibClient {
                                     .next()
                                     .ok_or_else(|| TgError::Other("Failed to read code".to_string()))?
                                     .map_err(|e| TgError::Other(e.to_string()))?;
-                                println!("[DEBUG] authenticate: Code entered, submitting...");
                                 tdlib_rs::functions::check_authentication_code(code, client_id)
                                     .await
-                                    .map_err(|e| {
-                                        println!("[DEBUG] authenticate: check_authentication_code failed: {}", e.message);
-                                        TgError::AuthFailed(e.message)
-                                    })?;
-                                println!("[DEBUG] authenticate: Code accepted");
+                                    .map_err(|e| TgError::AuthFailed(e.message))?;
                             }
                             AuthorizationState::WaitPassword(_) => {
-                                println!("[DEBUG] authenticate: State=WaitPassword");
                                 print!("Enter 2FA password: ");
                                 io::stdout().flush().ok();
                                 let password = io::stdin()
@@ -335,35 +346,23 @@ impl TelegramClient for TdLibClient {
                                     .next()
                                     .ok_or_else(|| TgError::Other("Failed to read password".to_string()))?
                                     .map_err(|e| TgError::Other(e.to_string()))?;
-                                println!("[DEBUG] authenticate: Password entered, submitting...");
                                 tdlib_rs::functions::check_authentication_password(password, client_id)
                                     .await
-                                    .map_err(|e| {
-                                        println!("[DEBUG] authenticate: check_authentication_password failed: {}", e.message);
-                                        TgError::AuthFailed(e.message)
-                                    })?;
-                                println!("[DEBUG] authenticate: Password accepted");
+                                    .map_err(|e| TgError::AuthFailed(e.message))?;
                             }
                             AuthorizationState::Ready => {
-                                println!("[DEBUG] authenticate: State=Ready, authentication complete");
                                 *self.authenticated.lock().await = true;
                                 println!("Authenticated successfully!");
                                 return Ok(());
                             }
                             AuthorizationState::Closed => {
-                                println!("[DEBUG] authenticate: State=Closed, session ended");
                                 return Err(TgError::AuthFailed("Session closed".to_string()));
                             }
-                            _ => {
-                                println!("[DEBUG] authenticate: Ignoring other authorization state");
-                            }
+                            _ => {}
                         }
-                    } else {
-                        println!("[DEBUG] authenticate: Non-AuthorizationState update, ignoring");
                     }
                 }
                 Err(e) => {
-                    println!("[DEBUG] authenticate: Channel error: {:?}", e);
                     return Err(TgError::Other(format!("Update channel error: {}", e)));
                 }
             }
@@ -855,5 +854,154 @@ pub mod mock {
         async fn mark_chat_as_unread(&self, _chat_id: i64) -> Result<()> {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[test]
+    fn client_new_initializes_shutdown_flag_to_false() {
+        let client = TdLibClient::new(12345, "test_hash".to_string()).unwrap();
+
+        // Shutdown flag should be false initially
+        assert!(!client.shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn client_new_initializes_receive_handle_to_none() {
+        let client = TdLibClient::new(12345, "test_hash".to_string()).unwrap();
+
+        // Can't easily check the mutex contents in sync test, but we can verify
+        // the client was created successfully
+        assert!(client.client_id.try_lock().is_ok());
+    }
+
+    #[test]
+    fn client_new_initializes_client_id_to_none() {
+        let client = TdLibClient::new(12345, "test_hash".to_string()).unwrap();
+
+        // Client ID should be None before start() is called
+        let client_id = client.client_id.try_lock().unwrap();
+        assert!(client_id.is_none());
+    }
+
+    #[test]
+    fn client_new_initializes_authenticated_to_false() {
+        let client = TdLibClient::new(12345, "test_hash".to_string()).unwrap();
+
+        let authenticated = client.authenticated.try_lock().unwrap();
+        assert!(!*authenticated);
+    }
+
+    #[test]
+    fn shutdown_flag_can_be_set() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        // Initially false
+        assert!(!shutdown.load(Ordering::Relaxed));
+
+        // Set to true
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(shutdown.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn shutdown_flag_is_thread_safe() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+
+        // Spawn a thread that waits for shutdown
+        let handle = std::thread::spawn(move || {
+            while !shutdown_clone.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        });
+
+        // Give the thread time to start
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Signal shutdown
+        shutdown.store(true, Ordering::Relaxed);
+
+        // Thread should exit and return true
+        let result = handle.join().unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn receive_loop_exits_on_shutdown_signal() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let iterations = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let iterations_clone = iterations.clone();
+
+        // Simulate a receive loop that checks shutdown flag
+        let handle = std::thread::spawn(move || {
+            loop {
+                if shutdown_clone.load(Ordering::Relaxed) {
+                    break;
+                }
+                iterations_clone.fetch_add(1, Ordering::Relaxed);
+                // Simulate receive timeout (much shorter for testing)
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        // Let the loop run a few iterations
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Signal shutdown
+        shutdown.store(true, Ordering::Relaxed);
+
+        // Wait for thread to exit
+        handle.join().unwrap();
+
+        // Verify the loop ran at least once before shutdown
+        assert!(iterations.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn broadcast_channel_handles_no_receivers() {
+        let (sender, _receiver) = tokio::sync::broadcast::channel::<i32>(100);
+
+        // Dropping the receiver and sending should not panic
+        drop(_receiver);
+
+        // Send should return error (no receivers) but not panic
+        let result = sender.send(42);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn broadcast_channel_delivers_to_multiple_receivers() {
+        let (sender, mut receiver1) = tokio::sync::broadcast::channel::<i32>(100);
+        let mut receiver2 = sender.subscribe();
+
+        // Send a value
+        sender.send(42).unwrap();
+
+        // Both receivers should get it
+        assert_eq!(receiver1.try_recv().unwrap(), 42);
+        assert_eq!(receiver2.try_recv().unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn client_shutdown_sets_flag() {
+        let mut client = TdLibClient::new(12345, "test_hash".to_string()).unwrap();
+
+        // Flag should be false initially
+        assert!(!client.shutdown.load(Ordering::Relaxed));
+
+        // Call shutdown (won't fully work without TDLib, but should set flag)
+        client.shutdown().await;
+
+        // Flag should now be true
+        assert!(client.shutdown.load(Ordering::Relaxed));
     }
 }

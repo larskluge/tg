@@ -32,32 +32,41 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
 
     let mut client = TdLibClient::new(api_id, api_hash)?;
 
+    let result = run_command(&mut client, command, format).await;
+
+    // Always shut down the client gracefully
+    client.shutdown().await;
+
+    result
+}
+
+async fn run_command(client: &mut TdLibClient, command: Command, format: OutputFormat) -> Result<()> {
     match command {
         Command::Auth(args) => {
-            tg::auth::authenticate(&mut client, args.phone.as_deref()).await?;
+            tg::auth::authenticate(client, args.phone.as_deref()).await?;
         }
 
         Command::Chats(args) => {
             client.start().await?;
-            let chats = chats::list_chats(&client, args.limit).await?;
+            let chats = chats::list_chats(client, args.limit).await?;
             print_list(format, &chats);
         }
 
         Command::Groups(args) => {
             client.start().await?;
-            let groups = groups::list_groups(&client, args.limit).await?;
+            let groups = groups::list_groups(client, args.limit).await?;
             print_list(format, &groups);
         }
 
         Command::Unread(args) => {
             client.start().await?;
-            let unread = unread::list_unread(&client, args.limit).await?;
+            let unread = unread::list_unread(client, args.limit).await?;
             print_list(format, &unread);
         }
 
         Command::Search(args) => {
             client.start().await?;
-            let contacts = search::search_contacts(&client, &args.query).await?;
+            let contacts = search::search_contacts(client, &args.query).await?;
             print_list(format, &contacts);
         }
 
@@ -71,7 +80,7 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
                 send::SendTarget::Name(args.name.unwrap())
             };
 
-            let result = send::send_message(&client, target, &args.message).await?;
+            let result = send::send_message(client, target, &args.message).await?;
             print_output(format, &result);
         }
 
@@ -83,7 +92,7 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
                 messages::ChatTarget::Name(args.name.unwrap())
             };
 
-            let msgs = messages::get_messages(&client, target, args.limit).await?;
+            let msgs = messages::get_messages(client, target, args.limit).await?;
             print_list(format, &msgs);
         }
 
@@ -95,7 +104,7 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
                 mark_read::ChatTarget::Name(args.name.unwrap())
             };
 
-            mark_read::mark_as_read(&client, target).await?;
+            mark_read::mark_as_read(client, target).await?;
             print_success("Chat marked as read");
         }
 
@@ -107,7 +116,7 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
                 mark_unread::ChatTarget::Name(args.name.unwrap())
             };
 
-            mark_unread::mark_as_unread(&client, target).await?;
+            mark_unread::mark_as_unread(client, target).await?;
             print_success("Chat marked as unread");
         }
     }
