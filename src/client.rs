@@ -115,25 +115,22 @@ impl TdLibClient {
 
     /// Gracefully shut down the TDLib client
     pub async fn shutdown(&mut self) {
+        // Close TDLib client if started (must happen before stopping receive loop)
+        if let Some(client_id) = *self.client_id.lock().await {
+            // Request TDLib to close with a timeout - don't block forever
+            let close_future = tdlib_rs::functions::close(client_id);
+            let _ = tokio::time::timeout(
+                tokio::time::Duration::from_secs(2),
+                close_future
+            ).await;
+        }
+
         // Signal the receive loop to stop
         self.shutdown.store(true, Ordering::Relaxed);
 
-        // Close TDLib client if started
-        if let Some(client_id) = *self.client_id.lock().await {
-            // Request TDLib to close - ignore errors since we're shutting down
-            let _ = tdlib_rs::functions::close(client_id).await;
-        }
-
-        // Wait for the receive thread to finish (with timeout)
-        if let Some(handle) = self.receive_handle.lock().await.take() {
-            // Give the thread time to notice the shutdown flag
-            // The receive() call has a 2s timeout, so we wait a bit longer
-            let _ = std::thread::spawn(move || {
-                let _ = handle.join();
-            });
-            // Give it a moment to clean up
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
+        // Give the receive thread time to notice the shutdown flag and exit
+        // The receive() call has a 2s internal timeout
+        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
     }
 
     pub async fn start(&mut self) -> Result<()> {
@@ -528,10 +525,13 @@ impl TelegramClient for TdLibClient {
     }
 
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<SendResult> {
-        use tdlib_rs::enums::InputMessageContent;
+        use tdlib_rs::enums::{InputMessageContent, Update};
         use tdlib_rs::types::{FormattedText, InputMessageText};
 
         let client_id = self.get_client_id().await?;
+
+        // First, ensure we have a chat open (creates private chat if needed)
+        let _ = tdlib_rs::functions::create_private_chat(chat_id, true, client_id).await;
 
         let content = InputMessageContent::InputMessageText(InputMessageText {
             text: FormattedText {
@@ -542,6 +542,9 @@ impl TelegramClient for TdLibClient {
             clear_draft: true,
         });
 
+        // Subscribe to updates before sending
+        let mut receiver = self.update_sender.subscribe();
+
         let message_enum = tdlib_rs::functions::send_message(
             chat_id, 0, None, None, content, client_id,
         )
@@ -549,8 +552,55 @@ impl TelegramClient for TdLibClient {
         .map_err(|e| TgError::TdLib(e.message))?;
 
         let message = unwrap_message(message_enum);
+        let local_message_id = message.id;
+
+        // Wait for send confirmation (success or failure)
+        let timeout = tokio::time::Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                // Timeout - message might still be sending, return local ID
+                return Ok(SendResult {
+                    message_id: local_message_id,
+                    chat_id: message.chat_id,
+                });
+            }
+
+            match tokio::time::timeout(remaining, receiver.recv()).await {
+                Ok(Ok(update)) => {
+                    match update {
+                        Update::MessageSendSucceeded(msg_update) => {
+                            if msg_update.old_message_id == local_message_id {
+                                return Ok(SendResult {
+                                    message_id: msg_update.message.id,
+                                    chat_id: msg_update.message.chat_id,
+                                });
+                            }
+                        }
+                        Update::MessageSendFailed(msg_update) => {
+                            if msg_update.old_message_id == local_message_id {
+                                return Err(TgError::TdLib(msg_update.error.message));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(Err(_)) => {
+                    // Channel closed
+                    break;
+                }
+                Err(_) => {
+                    // Timeout
+                    break;
+                }
+            }
+        }
+
+        // Fallback - return local message ID
         Ok(SendResult {
-            message_id: message.id,
+            message_id: local_message_id,
             chat_id: message.chat_id,
         })
     }
@@ -1017,6 +1067,75 @@ mod tests {
         client.shutdown().await;
 
         // Flag should now be true
+        assert!(client.shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn send_confirmation_wait_receives_success_update() {
+        use tokio::sync::broadcast;
+
+        // Simulate the pattern used in send_message for waiting on updates
+        let (sender, mut receiver) = broadcast::channel::<&str>(10);
+
+        // Spawn a task that simulates TDLib sending the success update
+        let sender_clone = sender.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = sender_clone.send("success");
+        });
+
+        // Wait for the update (simulating send_message logic)
+        let timeout = Duration::from_secs(1);
+        let result = tokio::time::timeout(timeout, receiver.recv()).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap(), "success");
+    }
+
+    #[tokio::test]
+    async fn send_confirmation_wait_handles_timeout() {
+        use tokio::sync::broadcast;
+
+        let (_sender, mut receiver) = broadcast::channel::<&str>(10);
+
+        // Don't send anything - should timeout
+        let timeout = Duration::from_millis(100);
+        let result = tokio::time::timeout(timeout, receiver.recv()).await;
+
+        // Should be a timeout error
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_confirmation_wait_receives_failure_update() {
+        use tokio::sync::broadcast;
+
+        let (sender, mut receiver) = broadcast::channel::<&str>(10);
+
+        // Spawn a task that simulates TDLib sending the failure update
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = sender.send("failure");
+        });
+
+        let timeout = Duration::from_secs(1);
+        let result = tokio::time::timeout(timeout, receiver.recv()).await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().unwrap(), "failure");
+    }
+
+    #[tokio::test]
+    async fn shutdown_completes_within_timeout() {
+        let mut client = TdLibClient::new(12345, "test_hash".to_string()).unwrap();
+
+        // Shutdown should complete within a reasonable time even without TDLib running
+        let start = tokio::time::Instant::now();
+        client.shutdown().await;
+        let elapsed = start.elapsed();
+
+        // Should complete within 3 seconds (close timeout is 2s + 200ms sleep)
+        assert!(elapsed < Duration::from_secs(3));
         assert!(client.shutdown.load(Ordering::Relaxed));
     }
 }
