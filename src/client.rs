@@ -479,9 +479,20 @@ impl TelegramClient for TdLibClient {
         for user_id in users.user_ids {
             if let Ok(user_enum) = tdlib_rs::functions::get_user(user_id, client_id).await {
                 let user = unwrap_user(user_enum);
+                let username = user
+                    .usernames
+                    .as_ref()
+                    .and_then(|u| u.active_usernames.first().cloned());
+                let phone = if user.phone_number.is_empty() {
+                    None
+                } else {
+                    Some(user.phone_number.clone())
+                };
                 result.push(ContactInfo {
                     id: user_id,
                     name: get_user_full_name(&user),
+                    username,
+                    phone,
                 });
             }
         }
@@ -726,10 +737,14 @@ pub mod mock {
                     ContactInfo {
                         id: 1,
                         name: "John Doe".to_string(),
+                        username: Some("johndoe".to_string()),
+                        phone: Some("+1234567890".to_string()),
                     },
                     ContactInfo {
                         id: 2,
                         name: "Jane Smith".to_string(),
+                        username: None,
+                        phone: None,
                     },
                 ],
                 messages: vec![

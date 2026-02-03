@@ -6,7 +6,7 @@ use tg::cli::{Cli, Command};
 use tg::client::TdLibClient;
 use tg::commands::{chats, groups, mark_read, mark_unread, messages, search, send, unread};
 use tg::error::{Result, TgError};
-use tg::output::{print_error, print_list, print_output, print_success, OutputFormat};
+use tg::output::{print_contacts_table, print_error, print_list, print_output, print_success, OutputFormat};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -67,7 +67,10 @@ async fn run_command(client: &mut TdLibClient, command: Command, format: OutputF
         Command::Search(args) => {
             client.start().await?;
             let contacts = search::search_contacts(client, &args.query).await?;
-            print_list(format, &contacts);
+            match format {
+                OutputFormat::Json => print_list(format, &contacts),
+                OutputFormat::Plain => print_contacts_table(&contacts),
+            }
         }
 
         Command::Send(args) => {

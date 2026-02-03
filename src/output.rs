@@ -77,11 +77,94 @@ impl PlainText for ChatInfo {
 pub struct ContactInfo {
     pub id: i64,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
 }
 
 impl PlainText for ContactInfo {
     fn to_plain_text(&self) -> String {
-        format!("{}  {}", self.id, self.name)
+        // Single row format: Name | Username | Chat ID | Phone
+        let username = self.username.as_deref().unwrap_or("-");
+        let phone = self.phone.as_deref().unwrap_or("-");
+        format!(
+            "{}  @{}  {}  {}",
+            self.name, username, self.id, phone
+        )
+    }
+}
+
+/// Print a list of contacts as a formatted table
+pub fn print_contacts_table(contacts: &[ContactInfo]) {
+    if contacts.is_empty() {
+        return;
+    }
+
+    // Calculate column widths
+    let name_width = contacts.iter().map(|c| c.name.len()).max().unwrap_or(4).max(4);
+    let username_width = contacts
+        .iter()
+        .map(|c| c.username.as_ref().map(|u| u.len() + 1).unwrap_or(1)) // +1 for @
+        .max()
+        .unwrap_or(8)
+        .max(8);
+    let id_width = contacts
+        .iter()
+        .map(|c| c.id.to_string().len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let phone_width = contacts
+        .iter()
+        .map(|c| c.phone.as_ref().map(|p| p.len()).unwrap_or(1))
+        .max()
+        .unwrap_or(5)
+        .max(5);
+
+    // Print header
+    println!(
+        "{:<name_width$}  {:<username_width$}  {:>id_width$}  {:<phone_width$}",
+        "Name".bold(),
+        "Username".bold(),
+        "Chat ID".bold(),
+        "Phone".bold(),
+        name_width = name_width,
+        username_width = username_width,
+        id_width = id_width,
+        phone_width = phone_width,
+    );
+    println!(
+        "{:-<name_width$}  {:-<username_width$}  {:-<id_width$}  {:-<phone_width$}",
+        "",
+        "",
+        "",
+        "",
+        name_width = name_width,
+        username_width = username_width,
+        id_width = id_width,
+        phone_width = phone_width,
+    );
+
+    // Print rows
+    for contact in contacts {
+        let username = contact
+            .username
+            .as_ref()
+            .map(|u| format!("@{}", u))
+            .unwrap_or_else(|| "-".to_string());
+        let phone = contact.phone.as_deref().unwrap_or("-");
+        println!(
+            "{:<name_width$}  {:<username_width$}  {:>id_width$}  {:<phone_width$}",
+            contact.name,
+            username.dimmed(),
+            contact.id,
+            phone.dimmed(),
+            name_width = name_width,
+            username_width = username_width,
+            id_width = id_width,
+            phone_width = phone_width,
+        );
     }
 }
 
@@ -186,8 +269,28 @@ mod tests {
         let contact = ContactInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            username: Some("johndoe".to_string()),
+            phone: Some("+1234567890".to_string()),
         };
-        assert_eq!(contact.to_plain_text(), "123456789  John Doe");
+        let text = contact.to_plain_text();
+        assert!(text.contains("John Doe"));
+        assert!(text.contains("@johndoe"));
+        assert!(text.contains("123456789"));
+        assert!(text.contains("+1234567890"));
+    }
+
+    #[test]
+    fn contact_info_plain_text_no_optional_fields() {
+        let contact = ContactInfo {
+            id: 123456789,
+            name: "John Doe".to_string(),
+            username: None,
+            phone: None,
+        };
+        let text = contact.to_plain_text();
+        assert!(text.contains("John Doe"));
+        assert!(text.contains("123456789"));
+        assert!(text.contains("-")); // placeholder for missing fields
     }
 
     #[test]
@@ -195,10 +298,29 @@ mod tests {
         let contact = ContactInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            username: Some("johndoe".to_string()),
+            phone: Some("+1234567890".to_string()),
         };
         let json = serde_json::to_string(&contact).unwrap();
         assert!(json.contains("\"id\":123456789"));
         assert!(json.contains("\"name\":\"John Doe\""));
+        assert!(json.contains("\"username\":\"johndoe\""));
+        assert!(json.contains("\"phone\":\"+1234567890\""));
+    }
+
+    #[test]
+    fn contact_info_json_no_optional_fields() {
+        let contact = ContactInfo {
+            id: 123456789,
+            name: "John Doe".to_string(),
+            username: None,
+            phone: None,
+        };
+        let json = serde_json::to_string(&contact).unwrap();
+        assert!(json.contains("\"id\":123456789"));
+        assert!(json.contains("\"name\":\"John Doe\""));
+        assert!(!json.contains("username")); // should be skipped
+        assert!(!json.contains("phone")); // should be skipped
     }
 
     #[test]
