@@ -13,6 +13,24 @@ cargo test <test_name>         # Run a single test
 cargo clippy                   # Lint
 cargo fmt                      # Format
 cargo run -- <args>            # Run with args (sets up library path)
+cargo run --release -- <args>  # Run release build
+```
+
+## Release Build
+
+After `cargo build --release`, copy TDLib library to `target/lib/`:
+
+```bash
+mkdir -p target/lib
+cp target/release/build/tdlib-rs-*/out/tdlib/lib/libtdjson*.dylib target/lib/
+./target/release/tg search "test"
+```
+
+The binary uses `@executable_path/../lib` rpath, so the structure is:
+```
+target/
+├── lib/libtdjson.dylib
+└── release/tg
 ```
 
 ## Environment Variables
