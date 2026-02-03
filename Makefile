@@ -1,5 +1,7 @@
 .PHONY: build release install clean test
 
+BIN_DIR ?= $(HOME)/bin
+
 # Debug build
 build:
 	cargo build
@@ -14,13 +16,12 @@ release:
 	@echo "  Binary: target/release/tg"
 	@echo "  Library: target/lib/libtdjson.dylib"
 
-# Install to /usr/local (requires sudo for lib)
+# Install a symlink to the release binary
 install: release
-	install -d /usr/local/bin /usr/local/lib
-	install target/release/tg /usr/local/bin/
-	install target/lib/libtdjson*.dylib /usr/local/lib/
+	@mkdir -p "$(BIN_DIR)"
+	@ln -sfn "$(PWD)/target/release/tg" "$(BIN_DIR)/tg"
 	@echo ""
-	@echo "Installed to /usr/local/bin/tg"
+	@echo "Linked $(BIN_DIR)/tg -> $(PWD)/target/release/tg"
 
 # Run tests
 test:
