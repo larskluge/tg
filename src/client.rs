@@ -672,49 +672,82 @@ impl TelegramClient for TdLibClient {
     async fn get_messages(&self, chat_id: i64, limit: i32) -> Result<Vec<MessageInfo>> {
         let client_id = self.get_client_id().await?;
 
-        let messages_enum =
-            tdlib_rs::functions::get_chat_history(chat_id, 0, 0, limit, false, client_id)
-                .await
-                .map_err(|e| TgError::TdLib(e.message))?;
-
-        let messages = unwrap_messages(messages_enum);
         let mut result = Vec::new();
+        let mut from_message_id: i64 = 0;
+        let mut seen_ids = std::collections::HashSet::new();
+        let mut empty_attempts = 0;
+        const MAX_EMPTY_ATTEMPTS: u32 = 5;
 
-        for msg in messages.messages.into_iter().flatten() {
-            let sender = match &msg.sender_id {
-                tdlib_rs::enums::MessageSender::User(u) => {
-                    if let Ok(user_enum) =
-                        tdlib_rs::functions::get_user(u.user_id, client_id).await
-                    {
-                        let user = unwrap_user(user_enum);
-                        get_user_full_name(&user)
-                    } else {
-                        "Unknown".to_string()
-                    }
+        while result.len() < limit as usize {
+            let remaining = (limit - result.len() as i32).min(100);
+
+            let messages_enum = tdlib_rs::functions::get_chat_history(
+                chat_id, from_message_id, 0, remaining, false, client_id,
+            )
+            .await
+            .map_err(|e| TgError::TdLib(e.message))?;
+
+            let msgs: Vec<_> = unwrap_messages(messages_enum)
+                .messages
+                .into_iter()
+                .flatten()
+                .filter(|m| seen_ids.insert(m.id))
+                .collect();
+
+            if msgs.is_empty() {
+                empty_attempts += 1;
+                if empty_attempts >= MAX_EMPTY_ATTEMPTS {
+                    break;
                 }
-                tdlib_rs::enums::MessageSender::Chat(c) => {
-                    if let Ok(chat_enum) =
-                        tdlib_rs::functions::get_chat(c.chat_id, client_id).await
-                    {
-                        let chat = unwrap_chat(chat_enum);
-                        chat.title
-                    } else {
-                        "Unknown".to_string()
+                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+                continue;
+            }
+
+            empty_attempts = 0;
+            // Oldest message is last; use its ID as the next page cursor
+            from_message_id = msgs.last().unwrap().id;
+
+            for msg in msgs {
+                let sender = match &msg.sender_id {
+                    tdlib_rs::enums::MessageSender::User(u) => {
+                        if let Ok(user_enum) =
+                            tdlib_rs::functions::get_user(u.user_id, client_id).await
+                        {
+                            let user = unwrap_user(user_enum);
+                            get_user_full_name(&user)
+                        } else {
+                            "Unknown".to_string()
+                        }
                     }
+                    tdlib_rs::enums::MessageSender::Chat(c) => {
+                        if let Ok(chat_enum) =
+                            tdlib_rs::functions::get_chat(c.chat_id, client_id).await
+                        {
+                            let chat = unwrap_chat(chat_enum);
+                            chat.title
+                        } else {
+                            "Unknown".to_string()
+                        }
+                    }
+                };
+
+                let text = extract_message_text(&msg.content).unwrap_or_default();
+                let date = format_timestamp(msg.date);
+
+                result.push(MessageInfo {
+                    id: msg.id,
+                    sender,
+                    text,
+                    date,
+                    is_outgoing: msg.is_outgoing,
+                });
+
+                if result.len() >= limit as usize {
+                    break;
                 }
-            };
-
-            let text = extract_message_text(&msg.content).unwrap_or_default();
-            let date = format_timestamp(msg.date);
-
-            result.push(MessageInfo {
-                id: msg.id,
-                sender,
-                text,
-                date,
-                is_outgoing: msg.is_outgoing,
-            });
+            }
         }
+
         Ok(result)
     }
 
