@@ -385,11 +385,113 @@ fn unwrap_messages(msgs: tdlib_rs::enums::Messages) -> tdlib_rs::types::Messages
     }
 }
 
+#[async_trait]
+trait MessageHistorySource: Send + Sync {
+    /// Fetch a batch of messages for `chat_id` older than or at `from_message_id` (0 = latest).
+    /// Returns messages newest-first. May return fewer than `limit`.
+    async fn fetch_batch(
+        &self,
+        chat_id: i64,
+        from_message_id: i64,
+        limit: i32,
+    ) -> Result<Vec<MessageInfo>>;
+}
+
+async fn collect_messages_paginated<S: MessageHistorySource>(
+    source: &S,
+    chat_id: i64,
+    limit: i32,
+) -> Result<Vec<MessageInfo>> {
+    let mut result = Vec::new();
+    let mut from_message_id: i64 = 0;
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut empty_attempts = 0;
+    const MAX_EMPTY_ATTEMPTS: u32 = 5;
+
+    while result.len() < limit as usize {
+        let remaining = (limit - result.len() as i32).min(100);
+
+        let msgs: Vec<_> = source
+            .fetch_batch(chat_id, from_message_id, remaining)
+            .await?
+            .into_iter()
+            .filter(|m| seen_ids.insert(m.id))
+            .collect();
+
+        if msgs.is_empty() {
+            empty_attempts += 1;
+            if empty_attempts >= MAX_EMPTY_ATTEMPTS {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            continue;
+        }
+
+        empty_attempts = 0;
+        from_message_id = msgs.last().unwrap().id;
+
+        for msg in msgs {
+            result.push(msg);
+            if result.len() >= limit as usize {
+                break;
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 fn get_user_full_name(user: &tdlib_rs::types::User) -> String {
     if user.last_name.is_empty() {
         user.first_name.clone()
     } else {
         format!("{} {}", user.first_name, user.last_name)
+    }
+}
+
+#[async_trait]
+impl MessageHistorySource for TdLibClient {
+    async fn fetch_batch(
+        &self,
+        chat_id: i64,
+        from_message_id: i64,
+        limit: i32,
+    ) -> Result<Vec<MessageInfo>> {
+        let client_id = self.get_client_id().await?;
+
+        let msgs_enum = tdlib_rs::functions::get_chat_history(
+            chat_id, from_message_id, 0, limit, false, client_id,
+        )
+        .await
+        .map_err(|e| TgError::TdLib(e.message))?;
+
+        let mut result = Vec::new();
+        for msg in unwrap_messages(msgs_enum).messages.into_iter().flatten() {
+            let sender = match &msg.sender_id {
+                tdlib_rs::enums::MessageSender::User(u) => {
+                    if let Ok(ue) = tdlib_rs::functions::get_user(u.user_id, client_id).await {
+                        get_user_full_name(&unwrap_user(ue))
+                    } else {
+                        "Unknown".to_string()
+                    }
+                }
+                tdlib_rs::enums::MessageSender::Chat(c) => {
+                    if let Ok(ce) = tdlib_rs::functions::get_chat(c.chat_id, client_id).await {
+                        unwrap_chat(ce).title
+                    } else {
+                        "Unknown".to_string()
+                    }
+                }
+            };
+            result.push(MessageInfo {
+                id: msg.id,
+                sender,
+                text: extract_message_text(&msg.content).unwrap_or_default(),
+                date: format_timestamp(msg.date),
+                is_outgoing: msg.is_outgoing,
+            });
+        }
+        Ok(result)
     }
 }
 
@@ -670,85 +772,7 @@ impl TelegramClient for TdLibClient {
     }
 
     async fn get_messages(&self, chat_id: i64, limit: i32) -> Result<Vec<MessageInfo>> {
-        let client_id = self.get_client_id().await?;
-
-        let mut result = Vec::new();
-        let mut from_message_id: i64 = 0;
-        let mut seen_ids = std::collections::HashSet::new();
-        let mut empty_attempts = 0;
-        const MAX_EMPTY_ATTEMPTS: u32 = 5;
-
-        while result.len() < limit as usize {
-            let remaining = (limit - result.len() as i32).min(100);
-
-            let messages_enum = tdlib_rs::functions::get_chat_history(
-                chat_id, from_message_id, 0, remaining, false, client_id,
-            )
-            .await
-            .map_err(|e| TgError::TdLib(e.message))?;
-
-            let msgs: Vec<_> = unwrap_messages(messages_enum)
-                .messages
-                .into_iter()
-                .flatten()
-                .filter(|m| seen_ids.insert(m.id))
-                .collect();
-
-            if msgs.is_empty() {
-                empty_attempts += 1;
-                if empty_attempts >= MAX_EMPTY_ATTEMPTS {
-                    break;
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-                continue;
-            }
-
-            empty_attempts = 0;
-            // Oldest message is last; use its ID as the next page cursor
-            from_message_id = msgs.last().unwrap().id;
-
-            for msg in msgs {
-                let sender = match &msg.sender_id {
-                    tdlib_rs::enums::MessageSender::User(u) => {
-                        if let Ok(user_enum) =
-                            tdlib_rs::functions::get_user(u.user_id, client_id).await
-                        {
-                            let user = unwrap_user(user_enum);
-                            get_user_full_name(&user)
-                        } else {
-                            "Unknown".to_string()
-                        }
-                    }
-                    tdlib_rs::enums::MessageSender::Chat(c) => {
-                        if let Ok(chat_enum) =
-                            tdlib_rs::functions::get_chat(c.chat_id, client_id).await
-                        {
-                            let chat = unwrap_chat(chat_enum);
-                            chat.title
-                        } else {
-                            "Unknown".to_string()
-                        }
-                    }
-                };
-
-                let text = extract_message_text(&msg.content).unwrap_or_default();
-                let date = format_timestamp(msg.date);
-
-                result.push(MessageInfo {
-                    id: msg.id,
-                    sender,
-                    text,
-                    date,
-                    is_outgoing: msg.is_outgoing,
-                });
-
-                if result.len() >= limit as usize {
-                    break;
-                }
-            }
-        }
-
-        Ok(result)
+        collect_messages_paginated(self, chat_id, limit).await
     }
 
     async fn mark_chat_as_read(&self, chat_id: i64) -> Result<()> {
@@ -1118,6 +1142,111 @@ mod tests {
         let result =
             collect_filtered_chats_from_source(&source, 0, |_| true).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    // --- collect_messages_paginated tests ---
+
+    fn msg(id: i64) -> MessageInfo {
+        MessageInfo {
+            id,
+            sender: "Alice".to_string(),
+            text: format!("msg {id}"),
+            date: "1h ago".to_string(),
+            is_outgoing: false,
+        }
+    }
+
+    struct TestMessageSource {
+        /// Each inner Vec is one batch returned per call (in order).
+        batches: std::sync::Mutex<Vec<Vec<MessageInfo>>>,
+    }
+
+    impl TestMessageSource {
+        fn new(batches: Vec<Vec<MessageInfo>>) -> Self {
+            Self {
+                batches: std::sync::Mutex::new(batches),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MessageHistorySource for TestMessageSource {
+        async fn fetch_batch(
+            &self,
+            _chat_id: i64,
+            _from_message_id: i64,
+            _limit: i32,
+        ) -> Result<Vec<MessageInfo>> {
+            let mut batches = self.batches.lock().unwrap();
+            if batches.is_empty() {
+                Ok(vec![])
+            } else {
+                Ok(batches.remove(0))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_messages_returns_exact_limit() {
+        // Single batch has exactly `limit` messages.
+        let source = TestMessageSource::new(vec![vec![msg(3), msg(2), msg(1)]]);
+        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].id, 3);
+        assert_eq!(result[2].id, 1);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_paginates_across_batches() {
+        // TDLib returns 1 message per call; need 3 total.
+        let source = TestMessageSource::new(vec![
+            vec![msg(10)],
+            vec![msg(9)],
+            vec![msg(8)],
+        ]);
+        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        assert_eq!(result.len(), 3);
+        assert_eq!(result.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 9, 8]);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_stops_at_limit_even_with_extra() {
+        // Batch has more messages than limit; should stop at limit.
+        let source = TestMessageSource::new(vec![vec![msg(5), msg(4), msg(3), msg(2), msg(1)]]);
+        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_retries_on_empty_then_succeeds() {
+        // First two calls return empty (TDLib syncing), third returns data.
+        let source = TestMessageSource::new(vec![
+            vec![],
+            vec![],
+            vec![msg(1), msg(2), msg(3)],
+        ]);
+        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        assert_eq!(result.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_returns_partial_when_exhausted() {
+        // Only 2 messages exist but limit is 5; should return 2.
+        let source = TestMessageSource::new(vec![vec![msg(2), msg(1)]]);
+        let result = collect_messages_paginated(&source, 0, 5).await.unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_deduplicates_across_pages() {
+        // Second batch repeats an ID from the first (can happen at page boundary).
+        let source = TestMessageSource::new(vec![
+            vec![msg(3), msg(2)],
+            vec![msg(2), msg(1)],
+        ]);
+        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![3, 2, 1]);
     }
 
     #[test]

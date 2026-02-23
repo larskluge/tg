@@ -309,4 +309,51 @@ mod tests {
         let cli = Cli::parse_from(["tg", "chats", "--json"]);
         assert!(cli.json);
     }
+
+    // Negative ID tests (supergroups have negative IDs like -1001234567890)
+
+    #[test]
+    fn parse_messages_by_negative_id() {
+        let cli = Cli::parse_from(["tg", "messages", "--id", "-1001666847309"]);
+        match cli.command {
+            Command::Messages(args) => {
+                assert_eq!(args.id, Some(-1001666847309));
+                assert_eq!(args.name, None);
+            }
+            _ => panic!("Expected Messages command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_by_negative_id() {
+        let cli = Cli::parse_from(["tg", "send", "--id", "-1001234567890", "-m", "hi"]);
+        match cli.command {
+            Command::Send(args) => {
+                assert_eq!(args.id, Some(-1001234567890));
+            }
+            _ => panic!("Expected Send command"),
+        }
+    }
+
+    #[test]
+    fn parse_mark_read_by_negative_id() {
+        let cli = Cli::parse_from(["tg", "mark-read", "--id", "-1001234567890"]);
+        match cli.command {
+            Command::MarkRead(args) => {
+                assert_eq!(args.id, Some(-1001234567890));
+            }
+            _ => panic!("Expected MarkRead command"),
+        }
+    }
+
+    #[test]
+    fn parse_mark_unread_by_negative_id() {
+        let cli = Cli::parse_from(["tg", "mark-unread", "--id", "-1001234567890"]);
+        match cli.command {
+            Command::MarkUnread(args) => {
+                assert_eq!(args.id, Some(-1001234567890));
+            }
+            _ => panic!("Expected MarkUnread command"),
+        }
+    }
 }
