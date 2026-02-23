@@ -60,7 +60,7 @@ pub struct SendArgs {
     pub message: String,
 
     /// Chat ID (for piping from search)
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub id: Option<i64>,
 
     /// Group name to send to
@@ -96,7 +96,7 @@ pub struct MessagesArgs {
     pub name: Option<String>,
 
     /// Chat ID
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub id: Option<i64>,
 
     /// Maximum number of messages to read
@@ -111,7 +111,7 @@ pub struct MarkReadArgs {
     pub name: Option<String>,
 
     /// Chat ID
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub id: Option<i64>,
 }
 
@@ -122,7 +122,7 @@ pub struct MarkUnreadArgs {
     pub name: Option<String>,
 
     /// Chat ID
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub id: Option<i64>,
 }
 
