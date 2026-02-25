@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use tokio::sync::{Mutex, broadcast};
 
+use crate::credentials::tg_data_dir;
 use crate::error::{Result, TgError};
 use crate::output::{
     ChatInfo, ContactInfo, DownloadReport, DownloadStatus, DownloadedFileResult,
@@ -82,9 +83,7 @@ impl TdLibClient {
         // Level 0 = fatal errors, 1 = errors, 2 = warnings
         set_tdlib_log_verbosity(0);
 
-        let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("tg");
+        let data_dir = tg_data_dir();
 
         std::fs::create_dir_all(&data_dir)?;
 

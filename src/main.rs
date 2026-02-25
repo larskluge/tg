@@ -1,5 +1,4 @@
 use clap::Parser;
-use std::env;
 use std::process::ExitCode;
 
 use tg::cli::{Cli, Command};
@@ -7,6 +6,7 @@ use tg::client::TdLibClient;
 use tg::commands::{
     chats, download, groups, mark_read, mark_unread, messages, search, send, unread,
 };
+use tg::credentials::{self, CredentialSource};
 use tg::error::{Result, TgError};
 use tg::output::{
     DownloadStatus, OutputFormat, print_chats_table, print_contacts_table, print_error, print_list,
@@ -27,20 +27,28 @@ async fn main() -> ExitCode {
 }
 
 async fn run(command: Command, format: OutputFormat) -> Result<()> {
-    let api_id: i32 = env::var("TG_API_ID")
-        .map_err(|_| TgError::EnvVarMissing("TG_API_ID".to_string()))?
-        .parse()
-        .map_err(|_| TgError::Other("TG_API_ID must be a number".to_string()))?;
+    let is_auth = matches!(&command, Command::Auth(_));
+    let data_dir = credentials::tg_data_dir();
 
-    let api_hash =
-        env::var("TG_API_HASH").map_err(|_| TgError::EnvVarMissing("TG_API_HASH".to_string()))?;
+    let (api_credentials, credential_source) = if is_auth {
+        credentials::load_credentials_for_auth(&data_dir)?
+    } else {
+        (
+            credentials::load_credentials_for_non_auth(&data_dir)?,
+            CredentialSource::Stored,
+        )
+    };
 
-    let mut client = TdLibClient::new(api_id, api_hash)?;
+    let mut client = TdLibClient::new(api_credentials.api_id, api_credentials.api_hash.clone())?;
 
     let result = run_command(&mut client, command, format).await;
 
     // Always shut down the client gracefully
     client.shutdown().await;
+
+    if is_auth && result.is_ok() && credential_source == CredentialSource::Env {
+        credentials::save_credentials(&api_credentials, &data_dir)?;
+    }
 
     result
 }

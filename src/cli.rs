@@ -15,7 +15,11 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Authenticate with Telegram
+    #[command(
+        about = "Authenticate with Telegram",
+        long_about = "Authenticate with Telegram and create/update your local session.\n\nFor first-time login, provide a phone number with --phone. The command then prompts for the verification code, and for your 2FA password if your account has 2FA enabled.\n\nOutcome: on success, tg stores your authenticated session and API credentials in the OS data directory (<data_dir>/tg), typically ~/Library/Application Support/tg on macOS and ~/.local/share/tg on Linux, so later commands do not require TG_API_ID/TG_API_HASH in the environment.",
+        after_help = "Examples:\n  TG_API_ID=12345 TG_API_HASH=abcdef tg auth --phone +1234567890\n\nEnvironment:\n  TG_API_ID    Required for initial auth (or when re-authing with new credentials)\n  TG_API_HASH  Required for initial auth (or when re-authing with new credentials)"
+    )]
     Auth(AuthArgs),
 
     /// Send a message to a contact or group
@@ -48,8 +52,8 @@ pub enum Command {
 
 #[derive(Parser, Debug)]
 pub struct AuthArgs {
-    /// Phone number (e.g., +1234567890)
-    #[arg(long, env = "TG_PHONE")]
+    /// Phone number (E.164 format, e.g. +1234567890)
+    #[arg(long)]
     pub phone: Option<String>,
 }
 
@@ -174,6 +178,28 @@ mod tests {
             }
             _ => panic!("Expected Auth command"),
         }
+    }
+
+    #[test]
+    fn auth_help_documents_flow_and_env() {
+        let mut cmd = Cli::command();
+        let mut help_buf = Vec::new();
+
+        cmd.find_subcommand_mut("auth")
+            .expect("auth subcommand should exist")
+            .write_long_help(&mut help_buf)
+            .expect("writing help should succeed");
+
+        let help = String::from_utf8(help_buf).expect("help should be valid utf-8");
+
+        assert!(help.contains("verification code"));
+        assert!(help.contains("TG_API_ID"));
+        assert!(help.contains("TG_API_HASH"));
+        assert!(help.contains("Examples:"));
+        assert!(help.contains("Outcome:"));
+        assert!(help.contains("OS data directory"));
+        assert!(help.contains("do not require TG_API_ID/TG_API_HASH"));
+        assert!(!help.contains("[env:"));
     }
 
     #[test]
