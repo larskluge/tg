@@ -185,12 +185,34 @@ impl TdLibClient {
 
     /// Gracefully shut down the TDLib client
     pub async fn shutdown(&mut self) {
+        use tdlib_rs::enums::{AuthorizationState, Update};
+
         // Close TDLib client if started (must happen before stopping receive loop)
         let client_id = *self.client_id.lock().await;
         if let Some(client_id) = client_id {
+            // Keep receiving updates until Closed to let TDLib finish teardown.
+            let mut receiver = self.update_sender.subscribe();
+
             // Request TDLib to close with a timeout - don't block forever
             let close_future = tdlib_rs::functions::close(client_id);
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), close_future).await;
+
+            // Wait briefly for authorizationStateClosed before stopping receive loop.
+            let wait_for_closed = async {
+                loop {
+                    match receiver.recv().await {
+                        Ok(Update::AuthorizationState(state))
+                            if matches!(state.authorization_state, AuthorizationState::Closed) =>
+                        {
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+            };
+            let _ =
+                tokio::time::timeout(tokio::time::Duration::from_secs(3), wait_for_closed).await;
         }
         *self.client_id.lock().await = None;
 
