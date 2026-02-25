@@ -69,6 +69,7 @@ pub struct TdLibClient {
     api_hash: String,
     data_dir: PathBuf,
     authenticated: Arc<Mutex<bool>>,
+    tdlib_parameters_sent: Arc<AtomicBool>,
     /// Broadcast sender for TDLib updates from the background receive thread
     update_sender: broadcast::Sender<tdlib_rs::enums::Update>,
     /// Signal to stop the receive loop
@@ -96,6 +97,7 @@ impl TdLibClient {
             api_hash,
             data_dir,
             authenticated: Arc::new(Mutex::new(false)),
+            tdlib_parameters_sent: Arc::new(AtomicBool::new(false)),
             update_sender,
             shutdown: Arc::new(AtomicBool::new(false)),
             receive_handle: Arc::new(Mutex::new(None)),
@@ -125,25 +127,14 @@ impl TdLibClient {
         *self.receive_handle.lock().await = Some(handle);
     }
 
-    /// Gracefully shut down the TDLib client
-    pub async fn shutdown(&mut self) {
-        // Close TDLib client if started (must happen before stopping receive loop)
+    /// Ensure TDLib client and receive loop are initialized.
+    async fn ensure_client_initialized(&mut self) -> Result<i32> {
         if let Some(client_id) = *self.client_id.lock().await {
-            // Request TDLib to close with a timeout - don't block forever
-            let close_future = tdlib_rs::functions::close(client_id);
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), close_future).await;
+            return Ok(client_id);
         }
 
-        // Signal the receive loop to stop
-        self.shutdown.store(true, Ordering::Relaxed);
-
-        // Give the receive thread time to notice the shutdown flag and exit
-        // The receive() call has a 2s internal timeout
-        tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-    }
-
-    pub async fn start(&mut self) -> Result<()> {
-        use tdlib_rs::enums::AuthorizationState;
+        self.shutdown.store(false, Ordering::Relaxed);
+        self.tdlib_parameters_sent.store(false, Ordering::Relaxed);
 
         let client_id = tdlib_rs::create_client();
         *self.client_id.lock().await = Some(client_id);
@@ -153,6 +144,75 @@ impl TdLibClient {
 
         // Small delay to let the receive loop start
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        Ok(client_id)
+    }
+
+    async fn set_tdlib_parameters(&self, client_id: i32) -> Result<()> {
+        tdlib_rs::functions::set_tdlib_parameters(
+            false,
+            self.data_dir.join("db").to_string_lossy().to_string(),
+            self.data_dir.join("files").to_string_lossy().to_string(),
+            String::new(),
+            true,
+            true,
+            true,
+            false,
+            self.api_id,
+            self.api_hash.clone(),
+            "en".to_string(),
+            "CLI".to_string(),
+            "1.0".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+            client_id,
+        )
+        .await
+        .map_err(|e| TgError::TdLib(e.message))
+    }
+
+    async fn ensure_tdlib_parameters(&self, client_id: i32) -> Result<()> {
+        if self.tdlib_parameters_sent.swap(true, Ordering::Relaxed) {
+            return Ok(());
+        }
+
+        if let Err(err) = self.set_tdlib_parameters(client_id).await {
+            self.tdlib_parameters_sent.store(false, Ordering::Relaxed);
+            return Err(err);
+        }
+
+        Ok(())
+    }
+
+    /// Gracefully shut down the TDLib client
+    pub async fn shutdown(&mut self) {
+        // Close TDLib client if started (must happen before stopping receive loop)
+        let client_id = *self.client_id.lock().await;
+        if let Some(client_id) = client_id {
+            // Request TDLib to close with a timeout - don't block forever
+            let close_future = tdlib_rs::functions::close(client_id);
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), close_future).await;
+        }
+        *self.client_id.lock().await = None;
+
+        // Signal the receive loop to stop
+        self.shutdown.store(true, Ordering::Relaxed);
+        *self.authenticated.lock().await = false;
+        self.tdlib_parameters_sent.store(false, Ordering::Relaxed);
+
+        // Wait for the receive loop thread to terminate so no TDLib calls outlive shutdown.
+        let receive_handle = { self.receive_handle.lock().await.take() };
+        if let Some(handle) = receive_handle {
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = handle.join();
+            })
+            .await;
+        }
+    }
+
+    pub async fn start(&mut self) -> Result<()> {
+        use tdlib_rs::enums::AuthorizationState;
+
+        let client_id = self.ensure_client_initialized().await?;
 
         // Subscribe to updates before triggering TDLib
         let mut receiver = self.update_sender.subscribe();
@@ -167,25 +227,7 @@ impl TdLibClient {
                     if let tdlib_rs::enums::Update::AuthorizationState(state) = update {
                         match state.authorization_state {
                             AuthorizationState::WaitTdlibParameters => {
-                                tdlib_rs::functions::set_tdlib_parameters(
-                                    false,
-                                    self.data_dir.join("db").to_string_lossy().to_string(),
-                                    self.data_dir.join("files").to_string_lossy().to_string(),
-                                    String::new(),
-                                    true,
-                                    true,
-                                    true,
-                                    false,
-                                    self.api_id,
-                                    self.api_hash.clone(),
-                                    "en".to_string(),
-                                    "CLI".to_string(),
-                                    "1.0".to_string(),
-                                    env!("CARGO_PKG_VERSION").to_string(),
-                                    client_id,
-                                )
-                                .await
-                                .map_err(|e| TgError::TdLib(e.message))?;
+                                self.ensure_tdlib_parameters(client_id).await?;
                             }
                             AuthorizationState::Ready => {
                                 *self.authenticated.lock().await = true;
@@ -994,12 +1036,7 @@ impl TelegramClient for TdLibClient {
         use std::io::{self, BufRead, Write};
         use tdlib_rs::enums::AuthorizationState;
 
-        // Initialize client if needed (this starts the receive loop)
-        if self.client_id.lock().await.is_none() {
-            self.start().await?;
-        }
-
-        let client_id = self.get_client_id().await?;
+        let client_id = self.ensure_client_initialized().await?;
 
         // Subscribe to updates from the background receive loop
         let mut receiver = self.update_sender.subscribe();
@@ -1008,31 +1045,72 @@ impl TelegramClient for TdLibClient {
         // Send a simple request to trigger the update flow.
         let _ = tdlib_rs::functions::get_option("version".to_string(), client_id).await;
 
+        // Handle current state immediately to avoid hanging when already authorized.
+        if let Ok(state) = tdlib_rs::functions::get_authorization_state(client_id).await {
+            match state {
+                AuthorizationState::WaitTdlibParameters => {
+                    self.ensure_tdlib_parameters(client_id).await?;
+                }
+                AuthorizationState::WaitPhoneNumber => {
+                    let phone = phone.ok_or_else(|| {
+                        TgError::Other(
+                            "Phone number required. Run: tg auth --phone +1234567890".to_string(),
+                        )
+                    })?;
+                    println!("Sending phone number...");
+                    tdlib_rs::functions::set_authentication_phone_number(
+                        phone.to_string(),
+                        None,
+                        client_id,
+                    )
+                    .await
+                    .map_err(|e| TgError::AuthFailed(e.message))?;
+                }
+                AuthorizationState::WaitCode(_) => {
+                    println!("A verification code was sent to your Telegram app.");
+                    print!("Enter the code from Telegram: ");
+                    io::stdout().flush().ok();
+                    let code = io::stdin()
+                        .lock()
+                        .lines()
+                        .next()
+                        .ok_or_else(|| TgError::Other("Failed to read code".to_string()))?
+                        .map_err(|e| TgError::Other(e.to_string()))?;
+                    tdlib_rs::functions::check_authentication_code(code, client_id)
+                        .await
+                        .map_err(|e| TgError::AuthFailed(e.message))?;
+                }
+                AuthorizationState::WaitPassword(_) => {
+                    print!("Enter 2FA password: ");
+                    io::stdout().flush().ok();
+                    let password = io::stdin()
+                        .lock()
+                        .lines()
+                        .next()
+                        .ok_or_else(|| TgError::Other("Failed to read password".to_string()))?
+                        .map_err(|e| TgError::Other(e.to_string()))?;
+                    tdlib_rs::functions::check_authentication_password(password, client_id)
+                        .await
+                        .map_err(|e| TgError::AuthFailed(e.message))?;
+                }
+                AuthorizationState::Ready => {
+                    *self.authenticated.lock().await = true;
+                    return Ok(());
+                }
+                AuthorizationState::Closed => {
+                    return Err(TgError::AuthFailed("Session closed".to_string()));
+                }
+                _ => {}
+            }
+        }
+
         loop {
             match receiver.recv().await {
                 Ok(update) => {
                     if let tdlib_rs::enums::Update::AuthorizationState(state) = update {
                         match state.authorization_state {
                             AuthorizationState::WaitTdlibParameters => {
-                                tdlib_rs::functions::set_tdlib_parameters(
-                                    false,
-                                    self.data_dir.join("db").to_string_lossy().to_string(),
-                                    self.data_dir.join("files").to_string_lossy().to_string(),
-                                    String::new(),
-                                    true,
-                                    true,
-                                    true,
-                                    false,
-                                    self.api_id,
-                                    self.api_hash.clone(),
-                                    "en".to_string(),
-                                    "CLI".to_string(),
-                                    "1.0".to_string(),
-                                    env!("CARGO_PKG_VERSION").to_string(),
-                                    client_id,
-                                )
-                                .await
-                                .map_err(|e| TgError::TdLib(e.message))?;
+                                self.ensure_tdlib_parameters(client_id).await?;
                             }
                             AuthorizationState::WaitPhoneNumber => {
                                 let phone = phone.ok_or_else(|| {
@@ -1085,7 +1163,6 @@ impl TelegramClient for TdLibClient {
                             }
                             AuthorizationState::Ready => {
                                 *self.authenticated.lock().await = true;
-                                println!("Authenticated successfully!");
                                 return Ok(());
                             }
                             AuthorizationState::Closed => {
@@ -2613,8 +2690,30 @@ mod tests {
         client.shutdown().await;
         let elapsed = start.elapsed();
 
-        // Should complete within 3 seconds (close timeout is 2s + 200ms sleep)
+        // Should complete within 3 seconds for a fresh client with no receive thread.
         assert!(elapsed < Duration::from_secs(3));
         assert!(client.shutdown.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_receive_thread_handle() {
+        let mut client = TdLibClient::new(12345, "test_hash".to_string()).unwrap();
+
+        let shutdown_flag = client.shutdown.clone();
+        let exited = Arc::new(AtomicBool::new(false));
+        let exited_clone = exited.clone();
+
+        let handle = std::thread::spawn(move || {
+            while !shutdown_flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            exited_clone.store(true, Ordering::Relaxed);
+        });
+
+        *client.receive_handle.lock().await = Some(handle);
+        client.shutdown().await;
+
+        assert!(exited.load(Ordering::Relaxed));
+        assert!(client.receive_handle.lock().await.is_none());
     }
 }

@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::path::Path;
 use std::process::ExitCode;
 
 use tg::cli::{Cli, Command};
@@ -6,7 +7,7 @@ use tg::client::TdLibClient;
 use tg::commands::{
     chats, download, groups, mark_read, mark_unread, messages, search, send, unread,
 };
-use tg::credentials::{self, CredentialSource};
+use tg::credentials::{self, ApiCredentials};
 use tg::error::{Result, TgError};
 use tg::output::{
     DownloadStatus, OutputFormat, print_chats_table, print_contacts_table, print_error, print_list,
@@ -30,27 +31,104 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
     let is_auth = matches!(&command, Command::Auth(_));
     let data_dir = credentials::tg_data_dir();
 
-    let (api_credentials, credential_source) = if is_auth {
-        credentials::load_credentials_for_auth(&data_dir)?
+    let api_credentials = if is_auth {
+        credentials::load_credentials_for_auth(&data_dir)?.0
     } else {
-        (
-            credentials::load_credentials_for_non_auth(&data_dir)?,
-            CredentialSource::Stored,
-        )
+        credentials::load_credentials_for_non_auth(&data_dir)?
     };
 
-    let mut client = TdLibClient::new(api_credentials.api_id, api_credentials.api_hash.clone())?;
+    let pre_auth_storage = if is_auth {
+        Some(check_auth_storage(&data_dir, &api_credentials))
+    } else {
+        None
+    };
+    let should_run_auth_flow = pre_auth_storage
+        .map(|status| !status.all_stored())
+        .unwrap_or(true);
 
-    let result = run_command(&mut client, command, format).await;
+    let mut client = TdLibClient::new(api_credentials.api_id, api_credentials.api_hash.clone())?;
+    let result = if is_auth && !should_run_auth_flow {
+        Ok(())
+    } else {
+        run_command(&mut client, command, format).await
+    };
 
     // Always shut down the client gracefully
     client.shutdown().await;
 
-    if is_auth && result.is_ok() && credential_source == CredentialSource::Env {
+    if is_auth {
+        result?;
+
+        if !should_run_auth_flow {
+            println!("Already authenticated.");
+            return Ok(());
+        }
+
+        // Keep credentials alongside session data after successful auth.
         credentials::save_credentials(&api_credentials, &data_dir)?;
+        let post_auth_storage = check_auth_storage(&data_dir, &api_credentials);
+        if !post_auth_storage.all_stored() {
+            return Err(TgError::Other(
+                "Authentication completed but failed to persist API credentials/session data"
+                    .to_string(),
+            ));
+        }
+
+        println!("Authenticated successfully!");
+        return Ok(());
     }
 
     result
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AuthStorageStatus {
+    api_id_stored: bool,
+    api_hash_stored: bool,
+    session_stored: bool,
+}
+
+impl AuthStorageStatus {
+    fn all_stored(self) -> bool {
+        self.api_id_stored && self.api_hash_stored && self.session_stored
+    }
+}
+
+fn check_auth_storage(data_dir: &Path, expected: &ApiCredentials) -> AuthStorageStatus {
+    let mut api_id_stored = false;
+    let mut api_hash_stored = false;
+
+    let creds_path = credentials::credentials_file_path(data_dir);
+    if let Ok(raw) = std::fs::read_to_string(creds_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+            api_id_stored = json
+                .get("api_id")
+                .and_then(|v| v.as_i64())
+                .map(|id| id == expected.api_id as i64)
+                .unwrap_or(false);
+            api_hash_stored = json
+                .get("api_hash")
+                .and_then(|v| v.as_str())
+                .map(|hash| hash == expected.api_hash)
+                .unwrap_or(false);
+        }
+    }
+
+    let session_stored =
+        dir_has_entries(&data_dir.join("db")) || dir_has_entries(&data_dir.join("files"));
+
+    AuthStorageStatus {
+        api_id_stored,
+        api_hash_stored,
+        session_stored,
+    }
+}
+
+fn dir_has_entries(path: &Path) -> bool {
+    match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_some(),
+        Err(_) => false,
+    }
 }
 
 async fn run_command(
