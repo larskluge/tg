@@ -1,10 +1,7 @@
 use crate::client::TelegramClient;
 use crate::error::Result;
 
-pub async fn authenticate<C: TelegramClient>(
-    client: &mut C,
-    phone: Option<&str>,
-) -> Result<()> {
+pub async fn authenticate<C: TelegramClient>(client: &mut C, phone: Option<&str>) -> Result<()> {
     client.authenticate(phone).await
 }
 

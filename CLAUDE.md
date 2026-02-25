@@ -53,6 +53,8 @@ tg send "John Doe" -m "Hello!"
 tg send --id 123456789 -m "Hello!"
 tg send --group "Family" -m "Hi all!"
 tg messages "John Doe" [--limit 20]
+tg messages --chat -1001666847309 [--limit 20]
+tg download --chat -1001666847309 --message 42 [--output-dir .] [--priority 16]
 tg search "John"
 tg mark-read "John Doe"
 tg mark-unread --id 123456789

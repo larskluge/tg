@@ -53,8 +53,7 @@ mod tests {
     #[tokio::test]
     async fn send_to_unknown_contact() {
         let client = MockClient::default();
-        let result =
-            send_message(&client, SendTarget::Name("Unknown".to_string()), "Hello").await;
+        let result = send_message(&client, SendTarget::Name("Unknown".to_string()), "Hello").await;
         assert!(matches!(result, Err(TgError::ContactNotFound(_))));
     }
 }

@@ -4,11 +4,13 @@ use std::process::ExitCode;
 
 use tg::cli::{Cli, Command};
 use tg::client::TdLibClient;
-use tg::commands::{chats, groups, mark_read, mark_unread, messages, search, send, unread};
+use tg::commands::{
+    chats, download, groups, mark_read, mark_unread, messages, search, send, unread,
+};
 use tg::error::{Result, TgError};
 use tg::output::{
-    print_chats_table, print_contacts_table, print_error, print_list, print_output, print_success,
-    OutputFormat,
+    DownloadStatus, OutputFormat, print_chats_table, print_contacts_table, print_error, print_list,
+    print_messages_table, print_output, print_success,
 };
 
 #[tokio::main]
@@ -30,8 +32,8 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
         .parse()
         .map_err(|_| TgError::Other("TG_API_ID must be a number".to_string()))?;
 
-    let api_hash = env::var("TG_API_HASH")
-        .map_err(|_| TgError::EnvVarMissing("TG_API_HASH".to_string()))?;
+    let api_hash =
+        env::var("TG_API_HASH").map_err(|_| TgError::EnvVarMissing("TG_API_HASH".to_string()))?;
 
     let mut client = TdLibClient::new(api_id, api_hash)?;
 
@@ -43,7 +45,11 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
     result
 }
 
-async fn run_command(client: &mut TdLibClient, command: Command, format: OutputFormat) -> Result<()> {
+async fn run_command(
+    client: &mut TdLibClient,
+    command: Command,
+    format: OutputFormat,
+) -> Result<()> {
     match command {
         Command::Auth(args) => {
             tg::auth::authenticate(client, args.phone.as_deref()).await?;
@@ -101,14 +107,42 @@ async fn run_command(client: &mut TdLibClient, command: Command, format: OutputF
 
         Command::Messages(args) => {
             client.start().await?;
-            let target = if let Some(id) = args.id {
+            let target = if let Some(id) = args.chat {
                 messages::ChatTarget::Id(id)
             } else {
                 messages::ChatTarget::Name(args.name.unwrap())
             };
 
             let msgs = messages::get_messages(client, target, args.limit).await?;
-            print_list(format, &msgs);
+            match format {
+                OutputFormat::Json => print_list(format, &msgs),
+                OutputFormat::Plain => print_messages_table(&msgs),
+            }
+        }
+
+        Command::Download(args) => {
+            client.start().await?;
+            let report = download::download_message_media(
+                client,
+                args.chat,
+                args.message,
+                args.output_dir,
+                args.priority,
+            )
+            .await?;
+            print_output(format, &report);
+
+            match report.status {
+                DownloadStatus::NoDownloadableMedia => {
+                    return Err(TgError::Other(
+                        "Selected message has no downloadable media".to_string(),
+                    ));
+                }
+                DownloadStatus::Failed => {
+                    return Err(TgError::Other("One or more downloads failed".to_string()));
+                }
+                _ => {}
+            }
         }
 
         Command::MarkRead(args) => {

@@ -18,6 +18,7 @@ dirs = "6"
 comfy-table = "7"
 terminal_size = "0.3"
 unicode-width = "0.2"
+chrono = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

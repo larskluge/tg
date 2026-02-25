@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "tg")]
@@ -31,6 +32,9 @@ pub enum Command {
 
     /// Read messages from a chat
     Messages(MessagesArgs),
+
+    /// Download media from a single message
+    Download(DownloadArgs),
 
     /// Mark a chat as read
     MarkRead(MarkReadArgs),
@@ -92,16 +96,35 @@ pub struct UnreadArgs {
 #[derive(Parser, Debug)]
 pub struct MessagesArgs {
     /// Contact or group name
-    #[arg(required_unless_present = "id")]
+    #[arg(required_unless_present = "chat")]
     pub name: Option<String>,
 
     /// Chat ID
     #[arg(long, allow_hyphen_values = true)]
-    pub id: Option<i64>,
+    pub chat: Option<i64>,
 
     /// Maximum number of messages to read
     #[arg(long, default_value = "20")]
     pub limit: i32,
+}
+
+#[derive(Parser, Debug)]
+pub struct DownloadArgs {
+    /// Chat ID (required). Supports negative IDs for supergroups/channels.
+    #[arg(long, allow_hyphen_values = true)]
+    pub chat: i64,
+
+    /// Message ID to download media from
+    #[arg(long, allow_hyphen_values = true)]
+    pub message: i64,
+
+    /// Directory to save downloaded files to
+    #[arg(long, default_value = ".")]
+    pub output_dir: PathBuf,
+
+    /// Download priority (1-32). Higher values are downloaded sooner when multiple downloads are queued.
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(i32).range(1..=32))]
+    pub priority: i32,
 }
 
 #[derive(Parser, Debug)]
@@ -182,7 +205,14 @@ mod tests {
 
     #[test]
     fn parse_send_to_group() {
-        let cli = Cli::parse_from(["tg", "send", "--group", "Family Chat", "-m", "Hello everyone!"]);
+        let cli = Cli::parse_from([
+            "tg",
+            "send",
+            "--group",
+            "Family Chat",
+            "-m",
+            "Hello everyone!",
+        ]);
         match cli.command {
             Command::Send(args) => {
                 assert_eq!(args.name, None);
@@ -243,7 +273,7 @@ mod tests {
         match cli.command {
             Command::Messages(args) => {
                 assert_eq!(args.name, Some("John Doe".to_string()));
-                assert_eq!(args.id, None);
+                assert_eq!(args.chat, None);
                 assert_eq!(args.limit, 20);
             }
             _ => panic!("Expected Messages command"),
@@ -252,15 +282,118 @@ mod tests {
 
     #[test]
     fn parse_messages_by_id() {
-        let cli = Cli::parse_from(["tg", "messages", "--id", "123456789", "--limit", "50"]);
+        let cli = Cli::parse_from(["tg", "messages", "--chat", "123456789", "--limit", "50"]);
         match cli.command {
             Command::Messages(args) => {
                 assert_eq!(args.name, None);
-                assert_eq!(args.id, Some(123456789));
+                assert_eq!(args.chat, Some(123456789));
                 assert_eq!(args.limit, 50);
             }
             _ => panic!("Expected Messages command"),
         }
+    }
+
+    #[test]
+    fn parse_download_defaults() {
+        let cli = Cli::parse_from(["tg", "download", "--chat", "123456789", "--message", "42"]);
+        match cli.command {
+            Command::Download(args) => {
+                assert_eq!(args.chat, 123456789);
+                assert_eq!(args.message, 42);
+                assert_eq!(args.output_dir, PathBuf::from("."));
+                assert_eq!(args.priority, 16);
+            }
+            _ => panic!("Expected Download command"),
+        }
+    }
+
+    #[test]
+    fn parse_download_negative_chat_id() {
+        let cli = Cli::parse_from([
+            "tg",
+            "download",
+            "--chat",
+            "-1001666847309",
+            "--message",
+            "42",
+        ]);
+        match cli.command {
+            Command::Download(args) => {
+                assert_eq!(args.chat, -1001666847309);
+                assert_eq!(args.message, 42);
+            }
+            _ => panic!("Expected Download command"),
+        }
+    }
+
+    #[test]
+    fn parse_download_custom_args() {
+        let cli = Cli::parse_from([
+            "tg",
+            "download",
+            "--chat",
+            "123456789",
+            "--message",
+            "42",
+            "--output-dir",
+            "/tmp/tg-downloads",
+            "--priority",
+            "32",
+        ]);
+        match cli.command {
+            Command::Download(args) => {
+                assert_eq!(args.chat, 123456789);
+                assert_eq!(args.message, 42);
+                assert_eq!(args.output_dir, PathBuf::from("/tmp/tg-downloads"));
+                assert_eq!(args.priority, 32);
+            }
+            _ => panic!("Expected Download command"),
+        }
+    }
+
+    #[test]
+    fn parse_download_rejects_low_priority() {
+        let cli = Cli::try_parse_from([
+            "tg",
+            "download",
+            "--chat",
+            "123456789",
+            "--message",
+            "42",
+            "--priority",
+            "0",
+        ]);
+        assert!(cli.is_err());
+    }
+
+    #[test]
+    fn parse_download_rejects_high_priority() {
+        let cli = Cli::try_parse_from([
+            "tg",
+            "download",
+            "--chat",
+            "123456789",
+            "--message",
+            "42",
+            "--priority",
+            "33",
+        ]);
+        assert!(cli.is_err());
+    }
+
+    #[test]
+    fn parse_download_rejects_repeated_message_flag() {
+        let cli = Cli::try_parse_from([
+            "tg",
+            "download",
+            "--chat",
+            "123456789",
+            "--message",
+            "42",
+            "--message",
+            "43",
+        ]);
+        assert!(cli.is_err());
     }
 
     #[test]
@@ -314,14 +447,20 @@ mod tests {
 
     #[test]
     fn parse_messages_by_negative_id() {
-        let cli = Cli::parse_from(["tg", "messages", "--id", "-1001666847309"]);
+        let cli = Cli::parse_from(["tg", "messages", "--chat", "-1001666847309"]);
         match cli.command {
             Command::Messages(args) => {
-                assert_eq!(args.id, Some(-1001666847309));
+                assert_eq!(args.chat, Some(-1001666847309));
                 assert_eq!(args.name, None);
             }
             _ => panic!("Expected Messages command"),
         }
+    }
+
+    #[test]
+    fn parse_messages_rejects_legacy_id_flag() {
+        let cli = Cli::try_parse_from(["tg", "messages", "--id", "123456789"]);
+        assert!(cli.is_err());
     }
 
     #[test]

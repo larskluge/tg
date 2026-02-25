@@ -1,14 +1,17 @@
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::os::raw::c_int;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 
 use crate::error::{Result, TgError};
-use crate::output::{ChatInfo, ContactInfo, MessageInfo, SendResult};
+use crate::output::{
+    ChatInfo, ContactInfo, DownloadReport, DownloadStatus, DownloadedFileResult,
+    MessageContentDetails, MessageFileRef, MessageInfo, SendResult,
+};
 
 // Direct FFI to TDLib's synchronous log functions (not exposed by tdlib-rs)
 #[link(name = "tdjson")]
@@ -26,10 +29,7 @@ fn set_tdlib_log_verbosity(level: i32) {
 
 #[async_trait]
 pub trait TelegramClient: Send + Sync {
-    async fn authenticate(
-        &mut self,
-        phone: Option<&str>,
-    ) -> Result<()>;
+    async fn authenticate(&mut self, phone: Option<&str>) -> Result<()>;
 
     async fn is_authenticated(&self) -> bool;
 
@@ -45,9 +45,21 @@ pub trait TelegramClient: Send + Sync {
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<SendResult>;
 
     async fn get_messages(&self, chat_id: i64, limit: i32) -> Result<Vec<MessageInfo>>;
+    async fn download_message_media(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        options: DownloadOptions,
+    ) -> Result<DownloadReport>;
 
     async fn mark_chat_as_read(&self, chat_id: i64) -> Result<()>;
     async fn mark_chat_as_unread(&self, chat_id: i64) -> Result<()>;
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadOptions {
+    pub output_dir: PathBuf,
+    pub priority: i32,
 }
 
 pub struct TdLibClient {
@@ -120,10 +132,7 @@ impl TdLibClient {
         if let Some(client_id) = *self.client_id.lock().await {
             // Request TDLib to close with a timeout - don't block forever
             let close_future = tdlib_rs::functions::close(client_id);
-            let _ = tokio::time::timeout(
-                tokio::time::Duration::from_secs(2),
-                close_future
-            ).await;
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(2), close_future).await;
         }
 
         // Signal the receive loop to stop
@@ -164,7 +173,10 @@ impl TdLibClient {
                                     self.data_dir.join("db").to_string_lossy().to_string(),
                                     self.data_dir.join("files").to_string_lossy().to_string(),
                                     String::new(),
-                                    true, true, true, false,
+                                    true,
+                                    true,
+                                    true,
+                                    false,
                                     self.api_id,
                                     self.api_hash.clone(),
                                     "en".to_string(),
@@ -184,7 +196,8 @@ impl TdLibClient {
                             | AuthorizationState::WaitCode(_)
                             | AuthorizationState::WaitPassword(_) => {
                                 return Err(TgError::AuthFailed(
-                                    "Not authenticated. Run `tg auth --phone <number>` first.".to_string()
+                                    "Not authenticated. Run `tg auth --phone <number>` first."
+                                        .to_string(),
                                 ));
                             }
                             AuthorizationState::Closed => {
@@ -385,6 +398,476 @@ fn unwrap_messages(msgs: tdlib_rs::enums::Messages) -> tdlib_rs::types::Messages
     }
 }
 
+// Helper to extract File fields from the enum
+fn unwrap_file(file: tdlib_rs::enums::File) -> tdlib_rs::types::File {
+    match file {
+        tdlib_rs::enums::File::File(f) => f,
+    }
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn format_duration(seconds: i32) -> String {
+    let minutes = seconds / 60;
+    let remaining = seconds % 60;
+    format!("{minutes}:{remaining:02}")
+}
+
+fn media_summary(summary: impl AsRef<str>) -> String {
+    format!("[{}]", summary.as_ref())
+}
+
+fn sticker_format_extension(format: &tdlib_rs::enums::StickerFormat) -> &'static str {
+    match format {
+        tdlib_rs::enums::StickerFormat::Webp => "webp",
+        tdlib_rs::enums::StickerFormat::Tgs => "tgs",
+        tdlib_rs::enums::StickerFormat::Webm => "webm",
+    }
+}
+
+fn sticker_format_name(format: &tdlib_rs::enums::StickerFormat) -> &'static str {
+    match format {
+        tdlib_rs::enums::StickerFormat::Webp => "webp",
+        tdlib_rs::enums::StickerFormat::Tgs => "tgs",
+        tdlib_rs::enums::StickerFormat::Webm => "webm",
+    }
+}
+
+fn best_photo_size(photo: &tdlib_rs::types::Photo) -> Option<&tdlib_rs::types::PhotoSize> {
+    photo.sizes.iter().max_by_key(|size| {
+        (
+            i64::from(size.width) * i64::from(size.height),
+            size.photo.size,
+            size.photo.expected_size,
+        )
+    })
+}
+
+fn message_file_ref(
+    file: &tdlib_rs::types::File,
+    is_primary: bool,
+    role: Option<&str>,
+    file_name: Option<String>,
+    mime_type: Option<String>,
+) -> MessageFileRef {
+    MessageFileRef {
+        file_id: file.id,
+        is_primary,
+        role: role.map(ToOwned::to_owned),
+        file_name,
+        mime_type,
+        size_bytes: file.size,
+        expected_size_bytes: file.expected_size,
+        local_path: non_empty(&file.local.path),
+        remote_id: non_empty(&file.remote.id),
+        remote_unique_id: non_empty(&file.remote.unique_id),
+        can_be_downloaded: file.local.can_be_downloaded,
+        is_downloaded: file.local.is_downloading_completed,
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedMessageData {
+    text: String,
+    content_type: Option<String>,
+    is_downloadable: bool,
+    download_files: Vec<MessageFileRef>,
+    content: Option<MessageContentDetails>,
+}
+
+fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedMessageData {
+    use tdlib_rs::enums::MessageContent;
+
+    match content {
+        MessageContent::MessageText(t) => {
+            let text = t.text.text.clone();
+            ExtractedMessageData {
+                text: if text.is_empty() {
+                    "[Text]".to_string()
+                } else {
+                    text.clone()
+                },
+                content_type: Some("text".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Text { text }),
+            }
+        }
+        MessageContent::MessagePhoto(p) => {
+            let caption = non_empty(&p.caption.text);
+            let best = best_photo_size(&p.photo);
+            let mut files = Vec::new();
+            let mut width = None;
+            let mut height = None;
+            if let Some(size) = best {
+                width = Some(size.width);
+                height = Some(size.height);
+                files.push(message_file_ref(
+                    &size.photo,
+                    true,
+                    Some("main"),
+                    None,
+                    Some("image/jpeg".to_string()),
+                ));
+            }
+            let text = if let Some(c) = &caption {
+                format!("Photo: {c}")
+            } else if let (Some(w), Some(h)) = (width, height) {
+                format!("Photo: {w}x{h}")
+            } else {
+                "Photo".to_string()
+            };
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("photo".to_string()),
+                is_downloadable: !files.is_empty(),
+                download_files: files,
+                content: Some(MessageContentDetails::Photo {
+                    width,
+                    height,
+                    caption,
+                    has_spoiler: p.has_spoiler,
+                    is_secret: p.is_secret,
+                }),
+            }
+        }
+        MessageContent::MessageVideo(v) => {
+            let caption = non_empty(&v.caption.text);
+            let text = if let Some(c) = &caption {
+                format!("Video: {c}")
+            } else {
+                format!(
+                    "Video: {}x{} {}",
+                    v.video.width,
+                    v.video.height,
+                    format_duration(v.video.duration)
+                )
+            };
+            let files = vec![message_file_ref(
+                &v.video.video,
+                true,
+                Some("main"),
+                non_empty(&v.video.file_name),
+                non_empty(&v.video.mime_type),
+            )];
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("video".to_string()),
+                is_downloadable: true,
+                download_files: files,
+                content: Some(MessageContentDetails::Video {
+                    width: v.video.width,
+                    height: v.video.height,
+                    duration_seconds: v.video.duration,
+                    caption,
+                    file_name: non_empty(&v.video.file_name),
+                    mime_type: non_empty(&v.video.mime_type),
+                    has_spoiler: v.has_spoiler,
+                    is_secret: v.is_secret,
+                    supports_streaming: v.video.supports_streaming,
+                }),
+            }
+        }
+        MessageContent::MessageDocument(d) => {
+            let caption = non_empty(&d.caption.text);
+            let display_name = non_empty(&d.document.file_name);
+            let text = match (&caption, &display_name) {
+                (Some(c), _) => format!("Document: {c}"),
+                (None, Some(name)) => format!("Document: {name}"),
+                _ => "Document".to_string(),
+            };
+            let files = vec![message_file_ref(
+                &d.document.document,
+                true,
+                Some("main"),
+                display_name.clone(),
+                non_empty(&d.document.mime_type),
+            )];
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("document".to_string()),
+                is_downloadable: true,
+                download_files: files,
+                content: Some(MessageContentDetails::Document {
+                    caption,
+                    file_name: display_name,
+                    mime_type: non_empty(&d.document.mime_type),
+                }),
+            }
+        }
+        MessageContent::MessageSticker(s) => {
+            let emoji = non_empty(&s.sticker.emoji);
+            let text = if let Some(e) = &emoji {
+                format!("Sticker: {e}")
+            } else {
+                "Sticker".to_string()
+            };
+            let files = vec![message_file_ref(
+                &s.sticker.sticker,
+                true,
+                Some("main"),
+                None,
+                None,
+            )];
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("sticker".to_string()),
+                is_downloadable: true,
+                download_files: files,
+                content: Some(MessageContentDetails::Sticker {
+                    emoji,
+                    width: s.sticker.width,
+                    height: s.sticker.height,
+                    format: format!("{:?}", s.sticker.format),
+                }),
+            }
+        }
+        MessageContent::MessageAudio(a) => {
+            let caption = non_empty(&a.caption.text);
+            let title = non_empty(&a.audio.title);
+            let performer = non_empty(&a.audio.performer);
+            let text_label = title
+                .clone()
+                .or_else(|| non_empty(&a.audio.file_name))
+                .unwrap_or_else(|| "Audio".to_string());
+            let text = format!(
+                "Audio: {} ({})",
+                text_label,
+                format_duration(a.audio.duration)
+            );
+            let files = vec![message_file_ref(
+                &a.audio.audio,
+                true,
+                Some("main"),
+                non_empty(&a.audio.file_name),
+                non_empty(&a.audio.mime_type),
+            )];
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("audio".to_string()),
+                is_downloadable: true,
+                download_files: files,
+                content: Some(MessageContentDetails::Audio {
+                    title,
+                    performer,
+                    duration_seconds: a.audio.duration,
+                    caption,
+                    file_name: non_empty(&a.audio.file_name),
+                    mime_type: non_empty(&a.audio.mime_type),
+                }),
+            }
+        }
+        MessageContent::MessageVoiceNote(v) => {
+            let caption = non_empty(&v.caption.text);
+            let text = format!("Voice: {}", format_duration(v.voice_note.duration));
+            let files = vec![message_file_ref(
+                &v.voice_note.voice,
+                true,
+                Some("main"),
+                None,
+                non_empty(&v.voice_note.mime_type),
+            )];
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("voice".to_string()),
+                is_downloadable: true,
+                download_files: files,
+                content: Some(MessageContentDetails::Voice {
+                    duration_seconds: v.voice_note.duration,
+                    caption,
+                    mime_type: non_empty(&v.voice_note.mime_type),
+                    is_listened: v.is_listened,
+                }),
+            }
+        }
+        MessageContent::MessageAnimation(a) => {
+            let caption = non_empty(&a.caption.text);
+            let text = format!(
+                "Animation: {}x{} {}",
+                a.animation.width,
+                a.animation.height,
+                format_duration(a.animation.duration)
+            );
+            let files = vec![message_file_ref(
+                &a.animation.animation,
+                true,
+                Some("main"),
+                non_empty(&a.animation.file_name),
+                non_empty(&a.animation.mime_type),
+            )];
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("animation".to_string()),
+                is_downloadable: true,
+                download_files: files,
+                content: Some(MessageContentDetails::Animation {
+                    width: a.animation.width,
+                    height: a.animation.height,
+                    duration_seconds: a.animation.duration,
+                    caption,
+                    file_name: non_empty(&a.animation.file_name),
+                    mime_type: non_empty(&a.animation.mime_type),
+                    has_spoiler: a.has_spoiler,
+                    is_secret: a.is_secret,
+                }),
+            }
+        }
+        MessageContent::MessageVideoNote(v) => {
+            let text = format!("Video note: {}", format_duration(v.video_note.duration));
+            let files = vec![message_file_ref(
+                &v.video_note.video,
+                true,
+                Some("main"),
+                None,
+                Some("video/mp4".to_string()),
+            )];
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("video_note".to_string()),
+                is_downloadable: true,
+                download_files: files,
+                content: Some(MessageContentDetails::VideoNote {
+                    duration_seconds: v.video_note.duration,
+                    length: v.video_note.length,
+                    is_viewed: v.is_viewed,
+                    is_secret: v.is_secret,
+                }),
+            }
+        }
+        MessageContent::MessageLocation(l) => {
+            let text = format!(
+                "Location: {:.5}, {:.5}",
+                l.location.latitude, l.location.longitude
+            );
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("location".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Location {
+                    latitude: l.location.latitude,
+                    longitude: l.location.longitude,
+                    horizontal_accuracy: l.location.horizontal_accuracy,
+                    live_period: l.live_period,
+                    expires_in: l.expires_in,
+                    heading: l.heading,
+                    proximity_alert_radius: l.proximity_alert_radius,
+                }),
+            }
+        }
+        MessageContent::MessageContact(c) => {
+            let full_name = if c.contact.last_name.is_empty() {
+                c.contact.first_name.clone()
+            } else {
+                format!("{} {}", c.contact.first_name, c.contact.last_name)
+            };
+            let text = format!("Contact: {} ({})", full_name, c.contact.phone_number);
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("contact".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Contact {
+                    phone_number: c.contact.phone_number.clone(),
+                    first_name: c.contact.first_name.clone(),
+                    last_name: non_empty(&c.contact.last_name),
+                    user_id: c.contact.user_id,
+                    vcard: non_empty(&c.contact.vcard),
+                }),
+            }
+        }
+        MessageContent::MessageAnimatedEmoji(e) => {
+            let mut files = Vec::new();
+            let mut custom_emoji_id = None;
+            let mut sticker_format = None;
+            let mut sticker_width = e.animated_emoji.sticker_width;
+            let mut sticker_height = e.animated_emoji.sticker_height;
+
+            if let Some(sticker) = &e.animated_emoji.sticker {
+                sticker_width = sticker.width;
+                sticker_height = sticker.height;
+                let format_name = sticker_format_name(&sticker.format);
+                sticker_format = Some(format_name.to_string());
+                let ext = sticker_format_extension(&sticker.format);
+                files.push(message_file_ref(
+                    &sticker.sticker,
+                    true,
+                    Some("main"),
+                    Some(format!("emoji.{ext}")),
+                    None,
+                ));
+
+                if let tdlib_rs::enums::StickerFullType::CustomEmoji(custom) = &sticker.full_type {
+                    custom_emoji_id = Some(custom.custom_emoji_id);
+                }
+            }
+
+            if let Some(sound) = &e.animated_emoji.sound {
+                files.push(message_file_ref(
+                    sound,
+                    files.is_empty(),
+                    Some("sound"),
+                    Some("emoji_sound.ogg".to_string()),
+                    Some("audio/ogg".to_string()),
+                ));
+            }
+
+            let emoji = non_empty(&e.emoji);
+            let emoji_text = emoji.clone().unwrap_or_else(|| "emoji".to_string());
+            let text = media_summary(format!("Emoji: {emoji_text}"));
+            ExtractedMessageData {
+                text,
+                content_type: Some("emoji".to_string()),
+                is_downloadable: !files.is_empty(),
+                download_files: files,
+                content: Some(MessageContentDetails::Emoji {
+                    emoji,
+                    sticker_width,
+                    sticker_height,
+                    fitzpatrick_type: e.animated_emoji.fitzpatrick_type,
+                    sticker_format,
+                    custom_emoji_id,
+                    has_sound: e.animated_emoji.sound.is_some(),
+                }),
+            }
+        }
+        MessageContent::MessagePoll(p) => {
+            let poll_type = match &p.poll.r#type {
+                tdlib_rs::enums::PollType::Regular(_) => "regular".to_string(),
+                tdlib_rs::enums::PollType::Quiz(_) => "quiz".to_string(),
+            };
+            let text = format!("Poll: {}", p.poll.question.text);
+            ExtractedMessageData {
+                text: media_summary(text),
+                content_type: Some("poll".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Poll {
+                    question: p.poll.question.text.clone(),
+                    option_count: p.poll.options.len(),
+                    total_voter_count: p.poll.total_voter_count,
+                    is_anonymous: p.poll.is_anonymous,
+                    is_closed: p.poll.is_closed,
+                    poll_type,
+                }),
+            }
+        }
+        _ => ExtractedMessageData {
+            text: "[Unsupported]".to_string(),
+            content_type: None,
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+        },
+    }
+}
+
 #[async_trait]
 trait MessageHistorySource: Send + Sync {
     /// Fetch a batch of messages for `chat_id` older than or at `from_message_id` (0 = latest).
@@ -460,13 +943,19 @@ impl MessageHistorySource for TdLibClient {
         let client_id = self.get_client_id().await?;
 
         let msgs_enum = tdlib_rs::functions::get_chat_history(
-            chat_id, from_message_id, 0, limit, false, client_id,
+            chat_id,
+            from_message_id,
+            0,
+            limit,
+            false,
+            client_id,
         )
         .await
         .map_err(|e| TgError::TdLib(e.message))?;
 
         let mut result = Vec::new();
         for msg in unwrap_messages(msgs_enum).messages.into_iter().flatten() {
+            let extracted = extract_message_data(&msg.content);
             let sender = match &msg.sender_id {
                 tdlib_rs::enums::MessageSender::User(u) => {
                     if let Ok(ue) = tdlib_rs::functions::get_user(u.user_id, client_id).await {
@@ -485,10 +974,15 @@ impl MessageHistorySource for TdLibClient {
             };
             result.push(MessageInfo {
                 id: msg.id,
+                chat_id: msg.chat_id,
                 sender,
-                text: extract_message_text(&msg.content).unwrap_or_default(),
+                text: extracted.text,
                 date: format_timestamp(msg.date),
                 is_outgoing: msg.is_outgoing,
+                content_type: extracted.content_type,
+                is_downloadable: extracted.is_downloadable,
+                download_files: extracted.download_files,
+                content: extracted.content,
             });
         }
         Ok(result)
@@ -497,10 +991,7 @@ impl MessageHistorySource for TdLibClient {
 
 #[async_trait]
 impl TelegramClient for TdLibClient {
-    async fn authenticate(
-        &mut self,
-        phone: Option<&str>,
-    ) -> Result<()> {
+    async fn authenticate(&mut self, phone: Option<&str>) -> Result<()> {
         use std::io::{self, BufRead, Write};
         use tdlib_rs::enums::AuthorizationState;
 
@@ -529,7 +1020,10 @@ impl TelegramClient for TdLibClient {
                                     self.data_dir.join("db").to_string_lossy().to_string(),
                                     self.data_dir.join("files").to_string_lossy().to_string(),
                                     String::new(),
-                                    true, true, true, false,
+                                    true,
+                                    true,
+                                    true,
+                                    false,
                                     self.api_id,
                                     self.api_hash.clone(),
                                     "en".to_string(),
@@ -565,7 +1059,9 @@ impl TelegramClient for TdLibClient {
                                     .lock()
                                     .lines()
                                     .next()
-                                    .ok_or_else(|| TgError::Other("Failed to read code".to_string()))?
+                                    .ok_or_else(|| {
+                                        TgError::Other("Failed to read code".to_string())
+                                    })?
                                     .map_err(|e| TgError::Other(e.to_string()))?;
                                 tdlib_rs::functions::check_authentication_code(code, client_id)
                                     .await
@@ -578,11 +1074,15 @@ impl TelegramClient for TdLibClient {
                                     .lock()
                                     .lines()
                                     .next()
-                                    .ok_or_else(|| TgError::Other("Failed to read password".to_string()))?
+                                    .ok_or_else(|| {
+                                        TgError::Other("Failed to read password".to_string())
+                                    })?
                                     .map_err(|e| TgError::Other(e.to_string()))?;
-                                tdlib_rs::functions::check_authentication_password(password, client_id)
-                                    .await
-                                    .map_err(|e| TgError::AuthFailed(e.message))?;
+                                tdlib_rs::functions::check_authentication_password(
+                                    password, client_id,
+                                )
+                                .await
+                                .map_err(|e| TgError::AuthFailed(e.message))?;
                             }
                             AuthorizationState::Ready => {
                                 *self.authenticated.lock().await = true;
@@ -608,10 +1108,8 @@ impl TelegramClient for TdLibClient {
     }
 
     async fn get_chats(&self, limit: i32) -> Result<Vec<ChatInfo>> {
-        self.collect_filtered_chats(limit, |chat| {
-            chat.chat_type == ChatTypeKind::Private
-        })
-        .await
+        self.collect_filtered_chats(limit, |chat| chat.chat_type == ChatTypeKind::Private)
+            .await
     }
 
     async fn get_groups(&self, limit: i32) -> Result<Vec<ChatInfo>> {
@@ -711,11 +1209,10 @@ impl TelegramClient for TdLibClient {
         // Subscribe to updates before sending
         let mut receiver = self.update_sender.subscribe();
 
-        let message_enum = tdlib_rs::functions::send_message(
-            chat_id, 0, None, None, content, client_id,
-        )
-        .await
-        .map_err(|e| TgError::TdLib(e.message))?;
+        let message_enum =
+            tdlib_rs::functions::send_message(chat_id, 0, None, None, content, client_id)
+                .await
+                .map_err(|e| TgError::TdLib(e.message))?;
 
         let message = unwrap_message(message_enum);
         let local_message_id = message.id;
@@ -735,24 +1232,22 @@ impl TelegramClient for TdLibClient {
             }
 
             match tokio::time::timeout(remaining, receiver.recv()).await {
-                Ok(Ok(update)) => {
-                    match update {
-                        Update::MessageSendSucceeded(msg_update) => {
-                            if msg_update.old_message_id == local_message_id {
-                                return Ok(SendResult {
-                                    message_id: msg_update.message.id,
-                                    chat_id: msg_update.message.chat_id,
-                                });
-                            }
+                Ok(Ok(update)) => match update {
+                    Update::MessageSendSucceeded(msg_update) => {
+                        if msg_update.old_message_id == local_message_id {
+                            return Ok(SendResult {
+                                message_id: msg_update.message.id,
+                                chat_id: msg_update.message.chat_id,
+                            });
                         }
-                        Update::MessageSendFailed(msg_update) => {
-                            if msg_update.old_message_id == local_message_id {
-                                return Err(TgError::TdLib(msg_update.error.message));
-                            }
-                        }
-                        _ => {}
                     }
-                }
+                    Update::MessageSendFailed(msg_update) => {
+                        if msg_update.old_message_id == local_message_id {
+                            return Err(TgError::TdLib(msg_update.error.message));
+                        }
+                    }
+                    _ => {}
+                },
                 Ok(Err(_)) => {
                     // Channel closed
                     break;
@@ -773,6 +1268,176 @@ impl TelegramClient for TdLibClient {
 
     async fn get_messages(&self, chat_id: i64, limit: i32) -> Result<Vec<MessageInfo>> {
         collect_messages_paginated(self, chat_id, limit).await
+    }
+
+    async fn download_message_media(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        options: DownloadOptions,
+    ) -> Result<DownloadReport> {
+        let client_id = self.get_client_id().await?;
+        let message_enum = tdlib_rs::functions::get_message(chat_id, message_id, client_id)
+            .await
+            .map_err(|e| TgError::TdLib(e.message))?;
+        let message = unwrap_message(message_enum);
+        let extracted = extract_message_data(&message.content);
+        let output_dir = ensure_output_dir(&options.output_dir)?;
+
+        if extracted.download_files.is_empty() {
+            return Ok(DownloadReport {
+                chat_id,
+                message_id,
+                status: DownloadStatus::NoDownloadableMedia,
+                output_dir: canonical_path_string(&output_dir),
+                content_type: extracted.content_type,
+                content: extracted.content,
+                files: vec![],
+            });
+        }
+
+        let mut file_results = Vec::new();
+        let mut any_failed = false;
+        let mut any_renamed = false;
+        let multi_file = extracted.download_files.len() > 1;
+
+        for (index, file_ref) in extracted.download_files.iter().enumerate() {
+            let downloaded = tdlib_rs::functions::download_file(
+                file_ref.file_id,
+                options.priority,
+                0,
+                0,
+                true,
+                client_id,
+            )
+            .await
+            .map_err(|e| TgError::TdLib(e.message));
+
+            let mut result = DownloadedFileResult {
+                file_id: file_ref.file_id,
+                is_primary: file_ref.is_primary,
+                status: DownloadStatus::Downloaded,
+                role: file_ref.role.clone(),
+                file_name: file_ref.file_name.clone(),
+                mime_type: file_ref.mime_type.clone(),
+                size_bytes: file_ref.size_bytes,
+                expected_size_bytes: file_ref.expected_size_bytes,
+                source_path: None,
+                saved_path: None,
+                note: None,
+            };
+
+            let file = match downloaded {
+                Ok(file_enum) => unwrap_file(file_enum),
+                Err(err) => {
+                    any_failed = true;
+                    result.status = DownloadStatus::Failed;
+                    result.note = Some(err.to_string());
+                    file_results.push(result);
+                    continue;
+                }
+            };
+
+            result.size_bytes = file.size;
+            result.expected_size_bytes = file.expected_size;
+            result.source_path =
+                non_empty(&file.local.path).map(|path| canonical_path_string(Path::new(&path)));
+
+            let source_path = match non_empty(&file.local.path) {
+                Some(path) => PathBuf::from(path),
+                None => {
+                    any_failed = true;
+                    result.status = DownloadStatus::Failed;
+                    result.note = Some("TDLib returned empty local file path".to_string());
+                    file_results.push(result);
+                    continue;
+                }
+            };
+
+            if !source_path.exists() {
+                any_failed = true;
+                result.status = DownloadStatus::Failed;
+                result.note = Some(format!(
+                    "Downloaded source file not found: {}",
+                    source_path.display()
+                ));
+                file_results.push(result);
+                continue;
+            }
+
+            let filename = build_download_filename(
+                chat_id,
+                message_id,
+                file_ref,
+                extracted.content_type.as_deref(),
+                multi_file,
+                index + 1,
+            );
+            let mut destination = output_dir.join(filename);
+
+            if destination.exists() {
+                match files_match_sha256(&source_path, &destination) {
+                    Ok(true) => {
+                        result.status = DownloadStatus::SkippedSameHash;
+                        result.saved_path = Some(canonical_path_string(&destination));
+                        result.note = Some("Existing file has matching SHA256".to_string());
+                        file_results.push(result);
+                        continue;
+                    }
+                    Ok(false) => {
+                        destination = next_available_path(&destination);
+                        any_renamed = true;
+                        result.status = DownloadStatus::RenamedConflict;
+                    }
+                    Err(err) => {
+                        any_failed = true;
+                        result.status = DownloadStatus::Failed;
+                        result.note = Some(format!("Failed to compare SHA256: {err}"));
+                        file_results.push(result);
+                        continue;
+                    }
+                }
+            }
+
+            if let Err(err) = std::fs::copy(&source_path, &destination) {
+                any_failed = true;
+                result.status = DownloadStatus::Failed;
+                result.note = Some(format!(
+                    "Failed to copy {} to {}: {}",
+                    source_path.display(),
+                    destination.display(),
+                    err
+                ));
+                file_results.push(result);
+                continue;
+            }
+
+            result.saved_path = Some(canonical_path_string(&destination));
+            file_results.push(result);
+        }
+
+        let status = if any_failed {
+            DownloadStatus::Failed
+        } else if any_renamed {
+            DownloadStatus::RenamedConflict
+        } else if file_results
+            .iter()
+            .all(|result| result.status == DownloadStatus::SkippedSameHash)
+        {
+            DownloadStatus::SkippedSameHash
+        } else {
+            DownloadStatus::Downloaded
+        };
+
+        Ok(DownloadReport {
+            chat_id,
+            message_id,
+            status,
+            output_dir: canonical_path_string(&output_dir),
+            content_type: extracted.content_type,
+            content: extracted.content,
+            files: file_results,
+        })
     }
 
     async fn mark_chat_as_read(&self, chat_id: i64) -> Result<()> {
@@ -810,38 +1475,196 @@ impl TelegramClient for TdLibClient {
 }
 
 fn extract_message_text(content: &tdlib_rs::enums::MessageContent) -> Option<String> {
-    use tdlib_rs::enums::MessageContent;
+    Some(extract_message_data(content).text)
+}
 
-    match content {
-        MessageContent::MessageText(t) => Some(t.text.text.clone()),
-        MessageContent::MessagePhoto(p) => Some(p.caption.text.clone()).filter(|s| !s.is_empty()),
-        MessageContent::MessageVideo(v) => Some(v.caption.text.clone()).filter(|s| !s.is_empty()),
-        MessageContent::MessageDocument(d) => Some(d.document.file_name.clone()),
-        MessageContent::MessageSticker(s) => Some(s.sticker.emoji.clone()),
-        _ => Some("[Media]".to_string()),
+fn ensure_output_dir(path: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(path)?;
+    if let Ok(canonical) = path.canonicalize() {
+        return Ok(canonical);
+    }
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(absolute)
+}
+
+fn canonical_path_string(path: &Path) -> String {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical.to_string_lossy().to_string();
+    }
+
+    if path.is_absolute() {
+        return path.to_string_lossy().to_string();
+    }
+
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path).to_string_lossy().to_string(),
+        Err(_) => path.to_string_lossy().to_string(),
     }
 }
 
-fn format_timestamp(timestamp: i32) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-
-    let datetime = UNIX_EPOCH + Duration::from_secs(timestamp as u64);
-    let now = std::time::SystemTime::now();
-
-    if let Ok(duration) = now.duration_since(datetime) {
-        let secs = duration.as_secs();
-        if secs < 60 {
-            "just now".to_string()
-        } else if secs < 3600 {
-            format!("{}m ago", secs / 60)
-        } else if secs < 86400 {
-            format!("{}h ago", secs / 3600)
-        } else {
-            format!("{}d ago", secs / 86400)
-        }
+fn sanitize_filename(name: &str) -> String {
+    let trimmed = name.trim();
+    let fallback = "download";
+    let source = if trimmed.is_empty() {
+        fallback
     } else {
-        "unknown".to_string()
+        trimmed
+    };
+    source
+        .chars()
+        .map(|ch| match ch {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ if ch.is_control() => '_',
+            _ => ch,
+        })
+        .collect::<String>()
+}
+
+fn mime_extension(mime: &str) -> Option<&'static str> {
+    match mime {
+        "image/jpeg" => Some("jpg"),
+        "image/png" => Some("png"),
+        "image/gif" => Some("gif"),
+        "video/mp4" => Some("mp4"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/ogg" => Some("ogg"),
+        "audio/mp4" => Some("m4a"),
+        "application/pdf" => Some("pdf"),
+        _ => None,
     }
+}
+
+fn content_type_extension(content_type: Option<&str>) -> Option<&'static str> {
+    match content_type {
+        Some("photo") => Some("jpg"),
+        Some("video") | Some("video_note") | Some("animation") => Some("mp4"),
+        Some("audio") => Some("mp3"),
+        Some("voice") => Some("ogg"),
+        Some("sticker") => Some("webp"),
+        _ => None,
+    }
+}
+
+fn build_download_filename(
+    chat_id: i64,
+    message_id: i64,
+    file_ref: &MessageFileRef,
+    content_type: Option<&str>,
+    multi_file: bool,
+    index: usize,
+) -> String {
+    let base_name = file_ref
+        .file_name
+        .as_deref()
+        .map(sanitize_filename)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("chat{chat_id}_message{message_id}_file{}", file_ref.file_id));
+
+    let path = Path::new(&base_name);
+    let mut stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| base_name.clone());
+    let mut ext = path
+        .extension()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty());
+
+    if multi_file {
+        if file_ref.is_primary {
+            stem.push_str("__primary");
+        } else {
+            stem.push_str(&format!("__file{index}"));
+        }
+    }
+
+    if ext.is_none() {
+        ext = file_ref
+            .mime_type
+            .as_deref()
+            .and_then(mime_extension)
+            .map(ToOwned::to_owned)
+            .or_else(|| content_type_extension(content_type).map(ToOwned::to_owned))
+            .or_else(|| Some("bin".to_string()));
+    }
+
+    format!("{stem}.{}", ext.unwrap_or_else(|| "bin".to_string()))
+}
+
+fn next_available_path(path: &Path) -> PathBuf {
+    if !path.exists() {
+        return path.to_path_buf();
+    }
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let ext = path.extension().map(|s| s.to_string_lossy().to_string());
+
+    let mut counter = 1u32;
+    loop {
+        let candidate_name = match &ext {
+            Some(ext) => format!("{stem} ({counter}).{ext}"),
+            None => format!("{stem} ({counter})"),
+        };
+        let candidate = parent.join(candidate_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+        counter = counter.saturating_add(1);
+    }
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use std::process::Command;
+
+    let output = Command::new("shasum")
+        .arg("-a")
+        .arg("256")
+        .arg(path)
+        .output();
+
+    let output = match output {
+        Ok(output) => output,
+        Err(_) => {
+            // Fallback for Linux environments where sha256sum is available.
+            Command::new("sha256sum").arg(path).output()?
+        }
+    };
+
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "failed to compute SHA256 for {}",
+            path.display()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hash = stdout
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| std::io::Error::other("invalid hash output"))?;
+    Ok(hash.to_string())
+}
+
+fn files_match_sha256(left: &Path, right: &Path) -> std::io::Result<bool> {
+    Ok(sha256_file(left)? == sha256_file(right)?)
+}
+
+fn format_timestamp(timestamp: i32) -> String {
+    use chrono::{DateTime, SecondsFormat, Utc};
+
+    DateTime::<Utc>::from_timestamp(timestamp as i64, 0)
+        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]
@@ -921,17 +1744,27 @@ pub mod mock {
                 messages: vec![
                     MessageInfo {
                         id: 1,
+                        chat_id: 1,
                         sender: "John Doe".to_string(),
                         text: "Hello!".to_string(),
                         date: "1h ago".to_string(),
                         is_outgoing: false,
+                        content_type: Some("text".to_string()),
+                        is_downloadable: false,
+                        download_files: vec![],
+                        content: None,
                     },
                     MessageInfo {
                         id: 2,
+                        chat_id: 1,
                         sender: "You".to_string(),
                         text: "Hi there!".to_string(),
                         date: "30m ago".to_string(),
                         is_outgoing: true,
+                        content_type: Some("text".to_string()),
+                        is_downloadable: false,
+                        download_files: vec![],
+                        content: None,
                     },
                 ],
             }
@@ -940,10 +1773,7 @@ pub mod mock {
 
     #[async_trait]
     impl TelegramClient for MockClient {
-        async fn authenticate(
-            &mut self,
-            phone: Option<&str>,
-        ) -> Result<()> {
+        async fn authenticate(&mut self, phone: Option<&str>) -> Result<()> {
             let state = *self.auth_state.lock().unwrap();
             match state {
                 AuthState::WaitPhone => {
@@ -1025,12 +1855,24 @@ pub mod mock {
         }
 
         async fn get_messages(&self, _chat_id: i64, limit: i32) -> Result<Vec<MessageInfo>> {
-            Ok(self
-                .messages
-                .iter()
-                .take(limit as usize)
-                .cloned()
-                .collect())
+            Ok(self.messages.iter().take(limit as usize).cloned().collect())
+        }
+
+        async fn download_message_media(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            options: DownloadOptions,
+        ) -> Result<DownloadReport> {
+            Ok(DownloadReport {
+                chat_id,
+                message_id,
+                status: DownloadStatus::NoDownloadableMedia,
+                output_dir: canonical_path_string(&options.output_dir),
+                content_type: None,
+                content: None,
+                files: vec![],
+            })
         }
 
         async fn mark_chat_as_read(&self, _chat_id: i64) -> Result<()> {
@@ -1047,9 +1889,328 @@ pub mod mock {
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+    use tempfile::tempdir;
+
+    fn formatted(text: &str) -> tdlib_rs::types::FormattedText {
+        tdlib_rs::types::FormattedText {
+            text: text.to_string(),
+            entities: vec![],
+        }
+    }
+
+    fn file(id: i32, path: &str) -> tdlib_rs::types::File {
+        tdlib_rs::types::File {
+            id,
+            size: 1234,
+            expected_size: 1234,
+            local: tdlib_rs::types::LocalFile {
+                path: path.to_string(),
+                can_be_downloaded: true,
+                is_downloading_completed: !path.is_empty(),
+                ..Default::default()
+            },
+            remote: tdlib_rs::types::RemoteFile {
+                id: format!("remote-{id}"),
+                unique_id: format!("unique-{id}"),
+                is_uploading_active: false,
+                is_uploading_completed: true,
+                uploaded_size: 1234,
+            },
+        }
+    }
+
+    #[test]
+    fn extract_audio_message_metadata() {
+        let content =
+            tdlib_rs::enums::MessageContent::MessageAudio(tdlib_rs::types::MessageAudio {
+                audio: tdlib_rs::types::Audio {
+                    duration: 90,
+                    title: "Song".to_string(),
+                    performer: "Artist".to_string(),
+                    file_name: "track.mp3".to_string(),
+                    mime_type: "audio/mpeg".to_string(),
+                    album_cover_minithumbnail: None,
+                    album_cover_thumbnail: None,
+                    external_album_covers: vec![],
+                    audio: file(1, "/tmp/track.mp3"),
+                },
+                caption: formatted("audio caption"),
+            });
+
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.content_type.as_deref(), Some("audio"));
+        assert!(extracted.is_downloadable);
+        assert_eq!(extracted.download_files.len(), 1);
+        assert!(extracted.text.starts_with("[Audio:"));
+        assert!(extracted.text.ends_with(']'));
+        assert_ne!(extracted.text, "[Media]");
+    }
+
+    #[test]
+    fn extract_voice_message_metadata() {
+        let content =
+            tdlib_rs::enums::MessageContent::MessageVoiceNote(tdlib_rs::types::MessageVoiceNote {
+                voice_note: tdlib_rs::types::VoiceNote {
+                    duration: 45,
+                    waveform: String::new(),
+                    mime_type: "audio/ogg".to_string(),
+                    speech_recognition_result: None,
+                    voice: file(2, "/tmp/voice.ogg"),
+                },
+                caption: formatted("voice caption"),
+                is_listened: false,
+            });
+
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.content_type.as_deref(), Some("voice"));
+        assert!(extracted.is_downloadable);
+        assert_eq!(extracted.download_files.len(), 1);
+        assert_ne!(extracted.text, "[Media]");
+    }
+
+    #[test]
+    fn extract_animation_message_metadata() {
+        let content =
+            tdlib_rs::enums::MessageContent::MessageAnimation(tdlib_rs::types::MessageAnimation {
+                animation: tdlib_rs::types::Animation {
+                    duration: 12,
+                    width: 640,
+                    height: 480,
+                    file_name: "anim.mp4".to_string(),
+                    mime_type: "video/mp4".to_string(),
+                    has_stickers: false,
+                    minithumbnail: None,
+                    thumbnail: None,
+                    animation: file(3, "/tmp/anim.mp4"),
+                },
+                caption: formatted(""),
+                has_spoiler: false,
+                is_secret: false,
+            });
+
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.content_type.as_deref(), Some("animation"));
+        assert!(extracted.is_downloadable);
+        assert!(extracted.text.contains("640x480"));
+        assert!(extracted.text.starts_with("[Animation:"));
+        assert!(extracted.text.ends_with(']'));
+        assert_ne!(extracted.text, "[Media]");
+    }
+
+    #[test]
+    fn extract_animated_emoji_message_metadata() {
+        let sticker = tdlib_rs::types::Sticker {
+            id: 10,
+            set_id: 20,
+            width: 128,
+            height: 128,
+            emoji: "😀".to_string(),
+            format: tdlib_rs::enums::StickerFormat::Webp,
+            full_type: tdlib_rs::enums::StickerFullType::CustomEmoji(
+                tdlib_rs::types::StickerFullTypeCustomEmoji {
+                    custom_emoji_id: 123456789,
+                    needs_repainting: false,
+                },
+            ),
+            outline: vec![],
+            thumbnail: None,
+            sticker: file(6, "/tmp/emoji.webp"),
+        };
+        let content = tdlib_rs::enums::MessageContent::MessageAnimatedEmoji(
+            tdlib_rs::types::MessageAnimatedEmoji {
+                animated_emoji: tdlib_rs::types::AnimatedEmoji {
+                    sticker: Some(sticker),
+                    sticker_width: 128,
+                    sticker_height: 128,
+                    fitzpatrick_type: 0,
+                    sound: Some(file(7, "/tmp/emoji.ogg")),
+                },
+                emoji: "😀".to_string(),
+            },
+        );
+
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.content_type.as_deref(), Some("emoji"));
+        assert!(extracted.is_downloadable);
+        assert_eq!(extracted.download_files.len(), 2);
+        assert!(extracted.text.starts_with("[Emoji:"));
+        assert!(extracted.text.ends_with(']'));
+        assert_ne!(extracted.text, "[Unsupported]");
+    }
+
+    #[test]
+    fn extract_location_contact_and_poll_metadata() {
+        let location =
+            tdlib_rs::enums::MessageContent::MessageLocation(tdlib_rs::types::MessageLocation {
+                location: tdlib_rs::types::Location {
+                    latitude: 37.7749,
+                    longitude: -122.4194,
+                    horizontal_accuracy: 10.0,
+                },
+                live_period: 0,
+                expires_in: 0,
+                heading: 0,
+                proximity_alert_radius: 0,
+            });
+        let location_extracted = extract_message_data(&location);
+        assert_eq!(location_extracted.content_type.as_deref(), Some("location"));
+        assert!(!location_extracted.is_downloadable);
+        assert!(location_extracted.download_files.is_empty());
+
+        let contact =
+            tdlib_rs::enums::MessageContent::MessageContact(tdlib_rs::types::MessageContact {
+                contact: tdlib_rs::types::Contact {
+                    phone_number: "+15555550123".to_string(),
+                    first_name: "Jane".to_string(),
+                    last_name: "Doe".to_string(),
+                    vcard: String::new(),
+                    user_id: 99,
+                },
+            });
+        let contact_extracted = extract_message_data(&contact);
+        assert_eq!(contact_extracted.content_type.as_deref(), Some("contact"));
+        assert!(!contact_extracted.is_downloadable);
+
+        let poll = tdlib_rs::enums::MessageContent::MessagePoll(tdlib_rs::types::MessagePoll {
+            poll: tdlib_rs::types::Poll {
+                id: 1,
+                question: formatted("Best option?"),
+                options: vec![tdlib_rs::types::PollOption {
+                    text: formatted("A"),
+                    voter_count: 1,
+                    vote_percentage: 100,
+                    is_chosen: true,
+                    is_being_chosen: false,
+                }],
+                total_voter_count: 1,
+                recent_voter_ids: vec![],
+                is_anonymous: true,
+                r#type: tdlib_rs::enums::PollType::Regular(tdlib_rs::types::PollTypeRegular {
+                    allow_multiple_answers: false,
+                }),
+                open_period: 0,
+                close_date: 0,
+                is_closed: false,
+            },
+        });
+        let poll_extracted = extract_message_data(&poll);
+        assert_eq!(poll_extracted.content_type.as_deref(), Some("poll"));
+        assert!(!poll_extracted.is_downloadable);
+        assert!(poll_extracted.text.starts_with("[Poll:"));
+        assert!(poll_extracted.text.ends_with(']'));
+    }
+
+    #[test]
+    fn extract_photo_uses_best_variant_for_download() {
+        let content =
+            tdlib_rs::enums::MessageContent::MessagePhoto(tdlib_rs::types::MessagePhoto {
+                photo: tdlib_rs::types::Photo {
+                    has_stickers: false,
+                    minithumbnail: None,
+                    sizes: vec![
+                        tdlib_rs::types::PhotoSize {
+                            r#type: "s".to_string(),
+                            photo: file(10, "/tmp/s.jpg"),
+                            width: 320,
+                            height: 240,
+                            progressive_sizes: vec![],
+                        },
+                        tdlib_rs::types::PhotoSize {
+                            r#type: "x".to_string(),
+                            photo: file(11, "/tmp/x.jpg"),
+                            width: 1920,
+                            height: 1080,
+                            progressive_sizes: vec![],
+                        },
+                    ],
+                },
+                caption: formatted(""),
+                has_spoiler: false,
+                is_secret: false,
+            });
+
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.download_files.len(), 1);
+        assert_eq!(extracted.download_files[0].file_id, 11);
+        assert!(extracted.text.starts_with("[Photo:"));
+        assert!(extracted.text.ends_with(']'));
+    }
+
+    #[test]
+    fn format_timestamp_returns_iso_utc() {
+        assert_eq!(format_timestamp(0), "1970-01-01T00:00:00Z");
+        let ts = format_timestamp(1_700_000_000);
+        assert!(ts.contains('T'));
+        assert!(ts.ends_with('Z'));
+    }
+
+    #[test]
+    fn build_filename_marks_primary_for_multiple_files() {
+        let primary = MessageFileRef {
+            file_id: 1,
+            is_primary: true,
+            role: Some("main".to_string()),
+            file_name: Some("clip.mp4".to_string()),
+            mime_type: Some("video/mp4".to_string()),
+            size_bytes: 1,
+            expected_size_bytes: 1,
+            local_path: None,
+            remote_id: None,
+            remote_unique_id: None,
+            can_be_downloaded: true,
+            is_downloaded: true,
+        };
+        let secondary = MessageFileRef {
+            file_id: 2,
+            is_primary: false,
+            role: Some("alt".to_string()),
+            file_name: Some("clip.mp4".to_string()),
+            mime_type: Some("video/mp4".to_string()),
+            size_bytes: 1,
+            expected_size_bytes: 1,
+            local_path: None,
+            remote_id: None,
+            remote_unique_id: None,
+            can_be_downloaded: true,
+            is_downloaded: true,
+        };
+
+        let p = build_download_filename(1, 2, &primary, Some("video"), true, 1);
+        let s = build_download_filename(1, 2, &secondary, Some("video"), true, 2);
+        assert!(p.contains("__primary"));
+        assert!(s.contains("__file2"));
+    }
+
+    #[test]
+    fn next_available_path_adds_numbered_suffix() {
+        let tmp = tempdir().unwrap();
+        let original = tmp.path().join("file.txt");
+        std::fs::write(&original, "a").unwrap();
+
+        let candidate = next_available_path(&original);
+        assert_eq!(
+            candidate.file_name().unwrap().to_string_lossy(),
+            "file (1).txt"
+        );
+    }
+
+    #[test]
+    fn file_hash_comparison_detects_equal_and_different() {
+        let tmp = tempdir().unwrap();
+        let first = tmp.path().join("a.bin");
+        let second = tmp.path().join("b.bin");
+        let third = tmp.path().join("c.bin");
+
+        std::fs::write(&first, b"same").unwrap();
+        std::fs::write(&second, b"same").unwrap();
+        std::fs::write(&third, b"different").unwrap();
+
+        assert!(files_match_sha256(&first, &second).unwrap());
+        assert!(!files_match_sha256(&first, &third).unwrap());
+    }
 
     struct TestChatSource {
         chat_ids: Vec<i64>,
@@ -1119,14 +2280,15 @@ mod tests {
         chats.insert(10, chat_snapshot(10, "Group", 0, ChatTypeKind::BasicGroup));
         chats.insert(11, chat_snapshot(11, "Unread A", 2, ChatTypeKind::Private));
         chats.insert(12, chat_snapshot(12, "Read", 0, ChatTypeKind::Private));
-        chats.insert(13, chat_snapshot(13, "Unread B", 1, ChatTypeKind::Supergroup));
+        chats.insert(
+            13,
+            chat_snapshot(13, "Unread B", 1, ChatTypeKind::Supergroup),
+        );
 
         let source = TestChatSource { chat_ids, chats };
-        let result = collect_filtered_chats_from_source(&source, 5, |chat| {
-            chat.unread_count > 0
-        })
-        .await
-        .unwrap();
+        let result = collect_filtered_chats_from_source(&source, 5, |chat| chat.unread_count > 0)
+            .await
+            .unwrap();
 
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|c| c.unread_count > 0));
@@ -1139,8 +2301,9 @@ mod tests {
             chats: HashMap::new(),
         };
 
-        let result =
-            collect_filtered_chats_from_source(&source, 0, |_| true).await.unwrap();
+        let result = collect_filtered_chats_from_source(&source, 0, |_| true)
+            .await
+            .unwrap();
         assert!(result.is_empty());
     }
 
@@ -1149,10 +2312,15 @@ mod tests {
     fn msg(id: i64) -> MessageInfo {
         MessageInfo {
             id,
+            chat_id: 1,
             sender: "Alice".to_string(),
             text: format!("msg {id}"),
             date: "1h ago".to_string(),
             is_outgoing: false,
+            content_type: Some("text".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
         }
     }
 
@@ -1199,14 +2367,13 @@ mod tests {
     #[tokio::test]
     async fn collect_messages_paginates_across_batches() {
         // TDLib returns 1 message per call; need 3 total.
-        let source = TestMessageSource::new(vec![
-            vec![msg(10)],
-            vec![msg(9)],
-            vec![msg(8)],
-        ]);
+        let source = TestMessageSource::new(vec![vec![msg(10)], vec![msg(9)], vec![msg(8)]]);
         let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
         assert_eq!(result.len(), 3);
-        assert_eq!(result.iter().map(|m| m.id).collect::<Vec<_>>(), vec![10, 9, 8]);
+        assert_eq!(
+            result.iter().map(|m| m.id).collect::<Vec<_>>(),
+            vec![10, 9, 8]
+        );
     }
 
     #[tokio::test]
@@ -1220,11 +2387,7 @@ mod tests {
     #[tokio::test]
     async fn collect_messages_retries_on_empty_then_succeeds() {
         // First two calls return empty (TDLib syncing), third returns data.
-        let source = TestMessageSource::new(vec![
-            vec![],
-            vec![],
-            vec![msg(1), msg(2), msg(3)],
-        ]);
+        let source = TestMessageSource::new(vec![vec![], vec![], vec![msg(1), msg(2), msg(3)]]);
         let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
         assert_eq!(result.len(), 3);
     }
@@ -1240,10 +2403,7 @@ mod tests {
     #[tokio::test]
     async fn collect_messages_deduplicates_across_pages() {
         // Second batch repeats an ID from the first (can happen at page boundary).
-        let source = TestMessageSource::new(vec![
-            vec![msg(3), msg(2)],
-            vec![msg(2), msg(1)],
-        ]);
+        let source = TestMessageSource::new(vec![vec![msg(3), msg(2)], vec![msg(2), msg(1)]]);
         let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
         let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![3, 2, 1]);
