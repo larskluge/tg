@@ -199,7 +199,9 @@ async fn run_command(
                 messages::ChatTarget::Name(args.name.unwrap())
             };
 
-            let msgs = messages::get_messages(client, target, args.limit).await?;
+            let msgs =
+                messages::get_messages(client, target, args.limit, args.since_utc.as_deref())
+                    .await?;
             match format {
                 OutputFormat::Json => print_list(format, &msgs),
                 OutputFormat::Plain => print_messages_table(&msgs),

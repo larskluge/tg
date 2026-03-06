@@ -45,7 +45,21 @@ pub trait TelegramClient: Send + Sync {
 
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<SendResult>;
 
-    async fn get_messages(&self, chat_id: i64, limit: i32) -> Result<Vec<MessageInfo>>;
+    async fn get_messages(
+        &self,
+        chat_id: i64,
+        limit: i32,
+        until_message_id: Option<i64>,
+    ) -> Result<Vec<MessageInfo>>;
+
+    /// Find the last message sent at or before `timestamp` (Unix UTC seconds).
+    /// Returns `Ok(Some(message_id))` or `Ok(None)` if no such message exists.
+    async fn get_boundary_message_id(
+        &self,
+        chat_id: i64,
+        timestamp: i32,
+    ) -> Result<Option<i64>>;
+
     async fn download_message_media(
         &self,
         chat_id: i64,
@@ -947,6 +961,7 @@ async fn collect_messages_paginated<S: MessageHistorySource>(
     source: &S,
     chat_id: i64,
     limit: i32,
+    until_message_id: Option<i64>,
 ) -> Result<Vec<MessageInfo>> {
     let mut result = Vec::new();
     let mut from_message_id: i64 = 0;
@@ -976,11 +991,22 @@ async fn collect_messages_paginated<S: MessageHistorySource>(
         empty_attempts = 0;
         from_message_id = msgs.last().unwrap().id;
 
+        let mut hit_boundary = false;
         for msg in msgs {
+            if let Some(boundary_id) = until_message_id
+                && msg.id <= boundary_id
+            {
+                hit_boundary = true;
+                break;
+            }
             result.push(msg);
             if result.len() >= limit as usize {
                 break;
             }
+        }
+
+        if hit_boundary {
+            break;
         }
     }
 
@@ -1364,8 +1390,32 @@ impl TelegramClient for TdLibClient {
         })
     }
 
-    async fn get_messages(&self, chat_id: i64, limit: i32) -> Result<Vec<MessageInfo>> {
-        collect_messages_paginated(self, chat_id, limit).await
+    async fn get_messages(
+        &self,
+        chat_id: i64,
+        limit: i32,
+        until_message_id: Option<i64>,
+    ) -> Result<Vec<MessageInfo>> {
+        collect_messages_paginated(self, chat_id, limit, until_message_id).await
+    }
+
+    async fn get_boundary_message_id(
+        &self,
+        chat_id: i64,
+        timestamp: i32,
+    ) -> Result<Option<i64>> {
+        let client_id = self.get_client_id().await?;
+        match tdlib_rs::functions::get_chat_message_by_date(chat_id, timestamp, client_id).await {
+            Ok(msg_enum) => {
+                let msg = unwrap_message(msg_enum);
+                if msg.id == 0 {
+                    Ok(None)
+                } else {
+                    Ok(Some(msg.id))
+                }
+            }
+            Err(_) => Ok(None),
+        }
     }
 
     async fn download_message_media(
@@ -1952,8 +2002,34 @@ pub mod mock {
             })
         }
 
-        async fn get_messages(&self, _chat_id: i64, limit: i32) -> Result<Vec<MessageInfo>> {
-            Ok(self.messages.iter().take(limit as usize).cloned().collect())
+        async fn get_messages(
+            &self,
+            _chat_id: i64,
+            limit: i32,
+            until_message_id: Option<i64>,
+        ) -> Result<Vec<MessageInfo>> {
+            let msgs: Vec<_> = self
+                .messages
+                .iter()
+                .filter(|m| {
+                    if let Some(boundary) = until_message_id {
+                        m.id > boundary
+                    } else {
+                        true
+                    }
+                })
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Ok(msgs)
+        }
+
+        async fn get_boundary_message_id(
+            &self,
+            _chat_id: i64,
+            _timestamp: i32,
+        ) -> Result<Option<i64>> {
+            Ok(None)
         }
 
         async fn download_message_media(
@@ -2456,7 +2532,7 @@ mod tests {
     async fn collect_messages_returns_exact_limit() {
         // Single batch has exactly `limit` messages.
         let source = TestMessageSource::new(vec![vec![msg(3), msg(2), msg(1)]]);
-        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        let result = collect_messages_paginated(&source, 0, 3, None).await.unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].id, 3);
         assert_eq!(result[2].id, 1);
@@ -2466,7 +2542,7 @@ mod tests {
     async fn collect_messages_paginates_across_batches() {
         // TDLib returns 1 message per call; need 3 total.
         let source = TestMessageSource::new(vec![vec![msg(10)], vec![msg(9)], vec![msg(8)]]);
-        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        let result = collect_messages_paginated(&source, 0, 3, None).await.unwrap();
         assert_eq!(result.len(), 3);
         assert_eq!(
             result.iter().map(|m| m.id).collect::<Vec<_>>(),
@@ -2478,7 +2554,7 @@ mod tests {
     async fn collect_messages_stops_at_limit_even_with_extra() {
         // Batch has more messages than limit; should stop at limit.
         let source = TestMessageSource::new(vec![vec![msg(5), msg(4), msg(3), msg(2), msg(1)]]);
-        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        let result = collect_messages_paginated(&source, 0, 3, None).await.unwrap();
         assert_eq!(result.len(), 3);
     }
 
@@ -2486,7 +2562,7 @@ mod tests {
     async fn collect_messages_retries_on_empty_then_succeeds() {
         // First two calls return empty (TDLib syncing), third returns data.
         let source = TestMessageSource::new(vec![vec![], vec![], vec![msg(1), msg(2), msg(3)]]);
-        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        let result = collect_messages_paginated(&source, 0, 3, None).await.unwrap();
         assert_eq!(result.len(), 3);
     }
 
@@ -2494,7 +2570,7 @@ mod tests {
     async fn collect_messages_returns_partial_when_exhausted() {
         // Only 2 messages exist but limit is 5; should return 2.
         let source = TestMessageSource::new(vec![vec![msg(2), msg(1)]]);
-        let result = collect_messages_paginated(&source, 0, 5).await.unwrap();
+        let result = collect_messages_paginated(&source, 0, 5, None).await.unwrap();
         assert_eq!(result.len(), 2);
     }
 
@@ -2502,9 +2578,61 @@ mod tests {
     async fn collect_messages_deduplicates_across_pages() {
         // Second batch repeats an ID from the first (can happen at page boundary).
         let source = TestMessageSource::new(vec![vec![msg(3), msg(2)], vec![msg(2), msg(1)]]);
-        let result = collect_messages_paginated(&source, 0, 3).await.unwrap();
+        let result = collect_messages_paginated(&source, 0, 3, None).await.unwrap();
         let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
         assert_eq!(ids, vec![3, 2, 1]);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_stops_at_boundary_id() {
+        // Messages 10, 9, 8, 7, 6 — boundary at 7 means only 10, 9, 8 returned.
+        let source = TestMessageSource::new(vec![vec![
+            msg(10),
+            msg(9),
+            msg(8),
+            msg(7),
+            msg(6),
+        ]]);
+        let result = collect_messages_paginated(&source, 0, 10, Some(7)).await.unwrap();
+        let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![10, 9, 8]);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_boundary_and_limit_combined() {
+        // Limit 2, boundary at 5. Messages: 10, 9, 8, 7, 6, 5.
+        let source = TestMessageSource::new(vec![vec![
+            msg(10),
+            msg(9),
+            msg(8),
+            msg(7),
+            msg(6),
+            msg(5),
+        ]]);
+        // Limit kicks in before boundary.
+        let result = collect_messages_paginated(&source, 0, 2, Some(5)).await.unwrap();
+        let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![10, 9]);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_boundary_across_batches() {
+        // First batch: 10, 9. Second batch: 8, 7, 6. Boundary at 7.
+        let source = TestMessageSource::new(vec![
+            vec![msg(10), msg(9)],
+            vec![msg(8), msg(7), msg(6)],
+        ]);
+        let result = collect_messages_paginated(&source, 0, 10, Some(7)).await.unwrap();
+        let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![10, 9, 8]);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_boundary_above_all_returns_empty() {
+        // All messages have id <= boundary.
+        let source = TestMessageSource::new(vec![vec![msg(3), msg(2), msg(1)]]);
+        let result = collect_messages_paginated(&source, 0, 10, Some(5)).await.unwrap();
+        assert!(result.is_empty());
     }
 
     #[test]

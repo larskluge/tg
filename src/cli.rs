@@ -110,6 +110,10 @@ pub struct MessagesArgs {
     /// Maximum number of messages to read
     #[arg(long, default_value = "20")]
     pub limit: i32,
+
+    /// Only include messages since this UTC date (YYYY-MM-DD)
+    #[arg(long)]
+    pub since_utc: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -478,6 +482,57 @@ mod tests {
             Command::Messages(args) => {
                 assert_eq!(args.chat, Some(-1001666847309));
                 assert_eq!(args.name, None);
+            }
+            _ => panic!("Expected Messages command"),
+        }
+    }
+
+    #[test]
+    fn parse_messages_with_since_utc() {
+        let cli = Cli::parse_from([
+            "tg",
+            "messages",
+            "--chat",
+            "123456789",
+            "--since-utc",
+            "2026-03-01",
+        ]);
+        match cli.command {
+            Command::Messages(args) => {
+                assert_eq!(args.since_utc, Some("2026-03-01".to_string()));
+                assert_eq!(args.limit, 20);
+            }
+            _ => panic!("Expected Messages command"),
+        }
+    }
+
+    #[test]
+    fn parse_messages_with_since_utc_and_limit() {
+        let cli = Cli::parse_from([
+            "tg",
+            "messages",
+            "--chat",
+            "123456789",
+            "--since-utc",
+            "2026-03-01",
+            "--limit",
+            "5",
+        ]);
+        match cli.command {
+            Command::Messages(args) => {
+                assert_eq!(args.since_utc, Some("2026-03-01".to_string()));
+                assert_eq!(args.limit, 5);
+            }
+            _ => panic!("Expected Messages command"),
+        }
+    }
+
+    #[test]
+    fn parse_messages_without_since_utc() {
+        let cli = Cli::parse_from(["tg", "messages", "John Doe"]);
+        match cli.command {
+            Command::Messages(args) => {
+                assert_eq!(args.since_utc, None);
             }
             _ => panic!("Expected Messages command"),
         }
