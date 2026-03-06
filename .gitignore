@@ -1,5 +1,6 @@
 /target/
 /_links/
+.claude/
 
 # Environment
 .env
