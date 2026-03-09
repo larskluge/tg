@@ -32,7 +32,10 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
     let data_dir = credentials::tg_data_dir();
 
     let api_credentials = if is_auth {
-        credentials::load_credentials_for_auth(&data_dir)?.0
+        match credentials::try_load_credentials_for_auth(&data_dir) {
+            Some((creds, _)) => creds,
+            None => credentials::prompt_credentials()?,
+        }
     } else {
         credentials::load_credentials_for_non_auth(&data_dir)?
     };
@@ -137,8 +140,8 @@ async fn run_command(
     format: OutputFormat,
 ) -> Result<()> {
     match command {
-        Command::Auth(args) => {
-            tg::auth::authenticate(client, args.phone.as_deref()).await?;
+        Command::Auth(_) => {
+            tg::auth::authenticate(client).await?;
         }
 
         Command::Chats(args) => {

@@ -30,7 +30,7 @@ fn set_tdlib_log_verbosity(level: i32) {
 
 #[async_trait]
 pub trait TelegramClient: Send + Sync {
-    async fn authenticate(&mut self, phone: Option<&str>) -> Result<()>;
+    async fn authenticate(&mut self) -> Result<()>;
 
     async fn is_authenticated(&self) -> bool;
 
@@ -273,7 +273,7 @@ impl TdLibClient {
                             | AuthorizationState::WaitCode(_)
                             | AuthorizationState::WaitPassword(_) => {
                                 return Err(TgError::AuthFailed(
-                                    "Not authenticated. Run `tg auth --phone <number>` first."
+                                    "Not authenticated. Run `tg auth` first."
                                         .to_string(),
                                 ));
                             }
@@ -1080,9 +1080,11 @@ impl MessageHistorySource for TdLibClient {
 
 #[async_trait]
 impl TelegramClient for TdLibClient {
-    async fn authenticate(&mut self, phone: Option<&str>) -> Result<()> {
+    async fn authenticate(&mut self) -> Result<()> {
         use std::io::{self, BufRead, Write};
         use tdlib_rs::enums::AuthorizationState;
+
+        let phone = std::env::var("TG_PHONE").ok();
 
         let client_id = self.ensure_client_initialized().await?;
 
@@ -1100,14 +1102,26 @@ impl TelegramClient for TdLibClient {
                     self.ensure_tdlib_parameters(client_id).await?;
                 }
                 AuthorizationState::WaitPhoneNumber => {
-                    let phone = phone.ok_or_else(|| {
-                        TgError::Other(
-                            "Phone number required. Run: tg auth --phone +1234567890".to_string(),
-                        )
-                    })?;
+                    let phone_number = match &phone {
+                        Some(p) => p.clone(),
+                        None => {
+                            print!("Enter phone number (E.164 format, e.g. +1234567890): ");
+                            io::stdout().flush().ok();
+                            io::stdin()
+                                .lock()
+                                .lines()
+                                .next()
+                                .ok_or_else(|| {
+                                    TgError::Other("Failed to read phone number".to_string())
+                                })?
+                                .map_err(|e| TgError::Other(e.to_string()))?
+                                .trim()
+                                .to_string()
+                        }
+                    };
                     println!("Sending phone number...");
                     tdlib_rs::functions::set_authentication_phone_number(
-                        phone.to_string(),
+                        phone_number,
                         None,
                         client_id,
                     )
@@ -1161,15 +1175,28 @@ impl TelegramClient for TdLibClient {
                                 self.ensure_tdlib_parameters(client_id).await?;
                             }
                             AuthorizationState::WaitPhoneNumber => {
-                                let phone = phone.ok_or_else(|| {
-                                    TgError::Other(
-                                        "Phone number required. Run: tg auth --phone +1234567890"
-                                            .to_string(),
-                                    )
-                                })?;
+                                let phone_number = match &phone {
+                                    Some(p) => p.clone(),
+                                    None => {
+                                        print!("Enter phone number (E.164 format, e.g. +1234567890): ");
+                                        io::stdout().flush().ok();
+                                        io::stdin()
+                                            .lock()
+                                            .lines()
+                                            .next()
+                                            .ok_or_else(|| {
+                                                TgError::Other(
+                                                    "Failed to read phone number".to_string(),
+                                                )
+                                            })?
+                                            .map_err(|e| TgError::Other(e.to_string()))?
+                                            .trim()
+                                            .to_string()
+                                    }
+                                };
                                 println!("Sending phone number...");
                                 tdlib_rs::functions::set_authentication_phone_number(
-                                    phone.to_string(),
+                                    phone_number,
                                     None,
                                     client_id,
                                 )
@@ -1921,18 +1948,11 @@ pub mod mock {
 
     #[async_trait]
     impl TelegramClient for MockClient {
-        async fn authenticate(&mut self, phone: Option<&str>) -> Result<()> {
+        async fn authenticate(&mut self) -> Result<()> {
             let state = *self.auth_state.lock().unwrap();
             match state {
                 AuthState::WaitPhone => {
-                    if phone.is_none() {
-                        return Err(TgError::Other(
-                            "Phone number required. Run: tg auth --phone +1234567890".to_string(),
-                        ));
-                    }
                     *self.phone_sent.lock().unwrap() = true;
-                    // Simulate: after phone sent, move to WaitCode but return success
-                    // (in real impl, user would run `tg auth` again)
                     Ok(())
                 }
                 AuthState::WaitCode | AuthState::WaitPassword => {

@@ -54,13 +54,51 @@ pub fn save_credentials(credentials: &ApiCredentials, data_dir: &Path) -> Result
     Ok(())
 }
 
+pub fn prompt_credentials() -> Result<ApiCredentials> {
+    use std::io::{self, BufRead, Write};
+
+    print!("Enter API ID (from my.telegram.org): ");
+    io::stdout().flush().ok();
+    let api_id_raw = io::stdin()
+        .lock()
+        .lines()
+        .next()
+        .ok_or_else(|| TgError::Other("Failed to read API ID".to_string()))?
+        .map_err(|e| TgError::Other(e.to_string()))?;
+    let api_id: i32 = api_id_raw
+        .trim()
+        .parse()
+        .map_err(|_| TgError::Other("API ID must be a number".to_string()))?;
+
+    print!("Enter API hash (from my.telegram.org): ");
+    io::stdout().flush().ok();
+    let api_hash = io::stdin()
+        .lock()
+        .lines()
+        .next()
+        .ok_or_else(|| TgError::Other("Failed to read API hash".to_string()))?
+        .map_err(|e| TgError::Other(e.to_string()))?
+        .trim()
+        .to_string();
+
+    if api_hash.is_empty() {
+        return Err(TgError::Other("API hash cannot be empty".to_string()));
+    }
+
+    Ok(ApiCredentials { api_id, api_hash })
+}
+
+pub fn try_load_credentials_for_auth(data_dir: &Path) -> Option<(ApiCredentials, CredentialSource)> {
+    load_credentials_for_auth(data_dir).ok()
+}
+
 fn load_credentials_from_disk(data_dir: &Path) -> Result<ApiCredentials> {
     let path = credentials_file_path(data_dir);
 
     let raw = std::fs::read_to_string(&path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             TgError::Other(format!(
-                "API credentials not found at {}. Run `tg auth --phone <number>` with TG_API_ID and TG_API_HASH set first.",
+                "API credentials not found at {}. Run `tg auth` first.",
                 path.display()
             ))
         } else {

@@ -17,8 +17,8 @@ pub struct Cli {
 pub enum Command {
     #[command(
         about = "Authenticate with Telegram",
-        long_about = "Authenticate with Telegram and create/update your local session.\n\nFor first-time login, provide a phone number with --phone. The command then prompts for the verification code, and for your 2FA password if your account has 2FA enabled.\n\nOutcome: on success, tg stores your authenticated session and API credentials in the OS data directory (<data_dir>/tg), typically ~/Library/Application Support/tg on macOS and ~/.local/share/tg on Linux, so later commands do not require TG_API_ID/TG_API_HASH in the environment.",
-        after_help = "Examples:\n  TG_API_ID=12345 TG_API_HASH=abcdef tg auth --phone +1234567890\n\nEnvironment:\n  TG_API_ID    Required for initial auth (or when re-authing with new credentials)\n  TG_API_HASH  Required for initial auth (or when re-authing with new credentials)"
+        long_about = "Authenticate with Telegram and create/update your local session.\n\nRun `tg auth` to start an interactive login flow. You will be prompted for:\n  1. API ID and API hash (from my.telegram.org) — unless already stored or set via TG_API_ID/TG_API_HASH\n  2. Phone number — unless set via TG_PHONE\n  3. Verification code sent to your Telegram app\n  4. 2FA password (if enabled on your account)\n\nOutcome: on success, tg stores your authenticated session and API credentials in the OS data directory (<data_dir>/tg), typically ~/Library/Application Support/tg on macOS and ~/.local/share/tg on Linux, so later commands do not require environment variables.",
+        after_help = "Examples:\n  tg auth\n  TG_API_ID=12345 TG_API_HASH=abcdef TG_PHONE=+1234567890 tg auth\n\nEnvironment (optional, will prompt if not set):\n  TG_API_ID    Telegram API ID from my.telegram.org\n  TG_API_HASH  Telegram API hash from my.telegram.org\n  TG_PHONE     Phone number in E.164 format (e.g. +1234567890)"
     )]
     Auth(AuthArgs),
 
@@ -51,11 +51,7 @@ pub enum Command {
 }
 
 #[derive(Parser, Debug)]
-pub struct AuthArgs {
-    /// Phone number (E.164 format, e.g. +1234567890)
-    #[arg(long)]
-    pub phone: Option<String>,
-}
+pub struct AuthArgs {}
 
 #[derive(Parser, Debug)]
 pub struct SendArgs {
@@ -174,14 +170,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_auth_with_phone() {
-        let cli = Cli::parse_from(["tg", "auth", "--phone", "+1234567890"]);
-        match cli.command {
-            Command::Auth(args) => {
-                assert_eq!(args.phone, Some("+1234567890".to_string()));
-            }
-            _ => panic!("Expected Auth command"),
-        }
+    fn parse_auth() {
+        let cli = Cli::parse_from(["tg", "auth"]);
+        assert!(matches!(cli.command, Command::Auth(_)));
     }
 
     #[test]
@@ -196,13 +187,13 @@ mod tests {
 
         let help = String::from_utf8(help_buf).expect("help should be valid utf-8");
 
-        assert!(help.contains("verification code"));
+        assert!(help.contains("Verification code"));
         assert!(help.contains("TG_API_ID"));
         assert!(help.contains("TG_API_HASH"));
         assert!(help.contains("Examples:"));
         assert!(help.contains("Outcome:"));
         assert!(help.contains("OS data directory"));
-        assert!(help.contains("do not require TG_API_ID/TG_API_HASH"));
+        assert!(help.contains("do not require environment variables"));
         assert!(!help.contains("[env:"));
     }
 
