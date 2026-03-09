@@ -34,22 +34,22 @@ target/
 
 ## Environment Variables
 
-`tg` reads two `TG_*` vars:
+`tg` reads three optional `TG_*` vars (all prompted interactively by `tg auth` if not set):
 
-- `TG_API_ID` (required for `tg auth` when credentials are not already stored)
-  - Telegram API ID from `my.telegram.org`
-  - Must parse as a number (`i32`)
-- `TG_API_HASH` (required for `tg auth` when credentials are not already stored)
-  - Telegram API hash from `my.telegram.org`
-Example setup:
+- `TG_API_ID` — Telegram API ID from `my.telegram.org` (must be a number)
+- `TG_API_HASH` — Telegram API hash from `my.telegram.org`
+- `TG_PHONE` — Phone number in E.164 format (e.g. `+1234567890`)
+
+Example setup (optional, for non-interactive use):
 
 ```bash
 export TG_API_ID=123456
 export TG_API_HASH=0123456789abcdef0123456789abcdef
+export TG_PHONE=+1234567890
 ```
 
 Notes:
-- `tg auth` prefers `TG_API_ID`/`TG_API_HASH` when set.
+- `tg auth` uses credentials from: env vars → stored credentials → interactive prompt (in that order).
 - On successful `tg auth`, `tg` persists API credentials under `dirs::data_dir()/tg/credentials.json`.
 - Non-auth commands (e.g. `tg groups`) read persisted credentials and do not require `TG_API_ID`/`TG_API_HASH`.
 
@@ -60,26 +60,28 @@ Session data is stored in `dirs::data_dir()/tg` (typically `~/Library/Applicatio
 Typical first-time auth:
 
 ```bash
-TG_API_ID=123456 TG_API_HASH=0123456789abcdef0123456789abcdef tg auth --phone +1234567890
+tg auth
 ```
 
 What happens during `tg auth`:
-1. Phone number is submitted from `--phone`.
-2. CLI prompts for the Telegram verification code.
-3. If 2FA is enabled, CLI prompts for the password.
-4. On success: `Authenticated successfully!`
+1. CLI prompts for API ID and API hash (unless available from env vars `TG_API_ID`/`TG_API_HASH` or stored credentials).
+2. CLI prompts for phone number (unless set via `TG_PHONE` env var).
+3. CLI prompts for the Telegram verification code.
+4. If 2FA is enabled, CLI prompts for the password.
+5. On success: `Authenticated successfully!`
 
 Outcome:
 - `tg` stores authenticated session state under `dirs::data_dir()/tg` (for example `~/Library/Application Support/tg` on macOS).
 - `tg` also stores API credentials in `dirs::data_dir()/tg/credentials.json`.
-- Most subsequent commands can use that saved session and saved credentials without re-running `tg auth` or setting `TG_API_ID`/`TG_API_HASH`.
+- Most subsequent commands can use that saved session and saved credentials without re-running `tg auth` or setting environment variables.
 
 If there is already a pending login state (for example waiting for code/password), run `tg auth` again to continue the prompts.
 
 ## CLI Examples
 
 ```bash
-TG_API_ID=123456 TG_API_HASH=0123456789abcdef0123456789abcdef tg auth --phone +1234567890
+tg auth
+TG_API_ID=123456 TG_API_HASH=0123456789abcdef0123456789abcdef TG_PHONE=+1234567890 tg auth
 tg chats [--limit 50] [--json]
 tg groups [--limit 50]
 tg unread
@@ -99,7 +101,7 @@ tg mark-unread --id 123456789
 Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 
 **Key modules:**
-- `cli.rs` - Clap-based CLI definitions; auth uses `--phone` for first-time login
+- `cli.rs` - Clap-based CLI definitions
 - `credentials.rs` - API credential loading/saving (`TG_API_ID`/`TG_API_HASH` and `credentials.json`)
 - `error.rs` - Custom error types using thiserror; use `TgError` variants and `Result<T>` alias
 - `client.rs` - TDLib client wrapper with `TelegramClient` trait for mocking
@@ -112,16 +114,10 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 
 ## Auth/Env Troubleshooting
 
-- `Environment variable TG_API_ID not set`
-  - Set `TG_API_ID` before initial `tg auth`.
-- `Environment variable TG_API_HASH not set`
-  - Set `TG_API_HASH` before initial `tg auth`.
-- `TG_API_ID must be a number`
-  - Use a numeric value only when running `tg auth`.
-- `API credentials not found at .../credentials.json`
-  - Run `tg auth --phone <number>` with `TG_API_ID` and `TG_API_HASH` set to create the credentials file.
-- `Phone number required. Run: tg auth --phone +1234567890`
-  - Provide `--phone` for initial phone submission.
+- `API ID must be a number`
+  - Enter a numeric value for the API ID prompt.
+- `API credentials not found at ...`
+  - Run `tg auth` to create the credentials file.
 - `Not authenticated. Run 'tg auth' first.`
   - Complete the auth flow, then rerun the command.
 
