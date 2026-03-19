@@ -41,6 +41,7 @@ pub async fn get_messages<C: TelegramClient>(
     target: ChatTarget,
     limit: i32,
     since_utc: Option<&str>,
+    oldest_first: bool,
 ) -> Result<MessagesResult> {
     let chat_id = match target {
         ChatTarget::Id(id) => id,
@@ -54,7 +55,17 @@ pub async fn get_messages<C: TelegramClient>(
         None
     };
 
-    let messages = client.get_messages(chat_id, limit, until_message_id).await?;
+    let messages = if oldest_first {
+        // Fetch all messages by using i32::MAX as the limit, then reverse
+        let mut all = client
+            .get_messages(chat_id, i32::MAX, until_message_id)
+            .await?;
+        all.reverse();
+        all.truncate(limit as usize);
+        all
+    } else {
+        client.get_messages(chat_id, limit, until_message_id).await?
+    };
     Ok(MessagesResult { chat_id, messages })
 }
 
@@ -108,7 +119,7 @@ mod tests {
     #[tokio::test]
     async fn get_messages_by_id() {
         let client = MockClient::default();
-        let result = get_messages(&client, ChatTarget::Id(1), 20, None)
+        let result = get_messages(&client, ChatTarget::Id(1), 20, None, false)
             .await
             .unwrap();
         assert_eq!(result.chat_id, 1);
@@ -118,7 +129,7 @@ mod tests {
     #[tokio::test]
     async fn get_messages_by_name() {
         let client = MockClient::default();
-        let result = get_messages(&client, ChatTarget::Name("John".to_string()), 20, None)
+        let result = get_messages(&client, ChatTarget::Name("John".to_string()), 20, None, false)
             .await
             .unwrap();
         assert_eq!(result.chat_id, 1);
@@ -128,7 +139,7 @@ mod tests {
     #[tokio::test]
     async fn get_messages_respects_limit() {
         let client = MockClient::default();
-        let result = get_messages(&client, ChatTarget::Id(1), 1, None)
+        let result = get_messages(&client, ChatTarget::Id(1), 1, None, false)
             .await
             .unwrap();
         assert_eq!(result.messages.len(), 1);
@@ -140,7 +151,7 @@ mod tests {
             messages: vec![],
             ..MockClient::default()
         };
-        let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-03-01"))
+        let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-03-01"), false)
             .await
             .unwrap();
         assert_eq!(result.chat_id, 1);
@@ -153,12 +164,49 @@ mod tests {
             inaccessible_chat_ids: vec![999],
             ..MockClient::default()
         };
-        let err = get_messages(&client, ChatTarget::Id(999), 20, None)
+        let err = get_messages(&client, ChatTarget::Id(999), 20, None, false)
             .await
             .unwrap_err();
         match err {
             TgError::ChatInaccessible(id) => assert_eq!(id, 999),
             other => panic!("Expected ChatInaccessible, got: {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn oldest_first_reverses_messages() {
+        let client = MockClient::default();
+        // Default mock returns messages as [id=1, id=2]; reversal gives [id=2, id=1]
+        let normal = get_messages(&client, ChatTarget::Id(1), 20, None, false)
+            .await
+            .unwrap();
+        let reversed = get_messages(&client, ChatTarget::Id(1), 20, None, true)
+            .await
+            .unwrap();
+        assert_eq!(reversed.messages.len(), normal.messages.len());
+        assert_eq!(reversed.messages[0].id, normal.messages[1].id);
+        assert_eq!(reversed.messages[1].id, normal.messages[0].id);
+    }
+
+    #[tokio::test]
+    async fn oldest_first_with_limit_caps_result() {
+        let client = MockClient::default();
+        // Default mock has 2 messages; oldest_first with limit=1 should return 1 message
+        let result = get_messages(&client, ChatTarget::Id(1), 1, None, true)
+            .await
+            .unwrap();
+        assert_eq!(result.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn oldest_first_empty_chat() {
+        let client = MockClient {
+            messages: vec![],
+            ..MockClient::default()
+        };
+        let result = get_messages(&client, ChatTarget::Id(1), 20, None, true)
+            .await
+            .unwrap();
+        assert!(result.messages.is_empty());
     }
 }
