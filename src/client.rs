@@ -1068,6 +1068,11 @@ impl MessageHistorySource for TdLibClient {
                 text: extracted.text,
                 date: format_timestamp(msg.date),
                 is_outgoing: msg.is_outgoing,
+                edit_date: if msg.edit_date == 0 {
+                    None
+                } else {
+                    Some(format_timestamp(msg.edit_date))
+                },
                 content_type: extracted.content_type,
                 is_downloadable: extracted.is_downloadable,
                 download_files: extracted.download_files,
@@ -1924,6 +1929,7 @@ pub mod mock {
                         text: "Hello!".to_string(),
                         date: "1h ago".to_string(),
                         is_outgoing: false,
+                        edit_date: None,
                         content_type: Some("text".to_string()),
                         is_downloadable: false,
                         download_files: vec![],
@@ -1936,6 +1942,7 @@ pub mod mock {
                         text: "Hi there!".to_string(),
                         date: "30m ago".to_string(),
                         is_outgoing: true,
+                        edit_date: None,
                         content_type: Some("text".to_string()),
                         is_downloadable: false,
                         download_files: vec![],
@@ -2511,6 +2518,7 @@ mod tests {
             text: format!("msg {id}"),
             date: "1h ago".to_string(),
             is_outgoing: false,
+            edit_date: None,
             content_type: Some("text".to_string()),
             is_downloadable: false,
             download_files: vec![],
