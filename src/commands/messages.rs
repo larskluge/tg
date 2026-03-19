@@ -19,12 +19,18 @@ pub fn parse_since_date(s: &str) -> Result<i32> {
         .map_err(|_| TgError::Other(format!("Date '{}' out of range for TDLib timestamp", s)))
 }
 
+#[derive(Debug)]
+pub struct MessagesResult {
+    pub chat_id: i64,
+    pub messages: Vec<MessageInfo>,
+}
+
 pub async fn get_messages<C: TelegramClient>(
     client: &C,
     target: ChatTarget,
     limit: i32,
     since_utc: Option<&str>,
-) -> Result<Vec<MessageInfo>> {
+) -> Result<MessagesResult> {
     let chat_id = match target {
         ChatTarget::Id(id) => id,
         ChatTarget::Name(name) => client.find_chat_by_name(&name).await?,
@@ -37,7 +43,8 @@ pub async fn get_messages<C: TelegramClient>(
         None
     };
 
-    client.get_messages(chat_id, limit, until_message_id).await
+    let messages = client.get_messages(chat_id, limit, until_message_id).await?;
+    Ok(MessagesResult { chat_id, messages })
 }
 
 #[cfg(test)]
@@ -68,27 +75,57 @@ mod tests {
     #[tokio::test]
     async fn get_messages_by_id() {
         let client = MockClient::default();
-        let messages = get_messages(&client, ChatTarget::Id(1), 20, None)
+        let result = get_messages(&client, ChatTarget::Id(1), 20, None)
             .await
             .unwrap();
-        assert_eq!(messages.len(), 2);
+        assert_eq!(result.chat_id, 1);
+        assert_eq!(result.messages.len(), 2);
     }
 
     #[tokio::test]
     async fn get_messages_by_name() {
         let client = MockClient::default();
-        let messages = get_messages(&client, ChatTarget::Name("John".to_string()), 20, None)
+        let result = get_messages(&client, ChatTarget::Name("John".to_string()), 20, None)
             .await
             .unwrap();
-        assert_eq!(messages.len(), 2);
+        assert_eq!(result.chat_id, 1);
+        assert_eq!(result.messages.len(), 2);
     }
 
     #[tokio::test]
     async fn get_messages_respects_limit() {
         let client = MockClient::default();
-        let messages = get_messages(&client, ChatTarget::Id(1), 1, None)
+        let result = get_messages(&client, ChatTarget::Id(1), 1, None)
             .await
             .unwrap();
-        assert_eq!(messages.len(), 1);
+        assert_eq!(result.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_messages_returns_ok_with_empty_vec() {
+        let client = MockClient {
+            messages: vec![],
+            ..MockClient::default()
+        };
+        let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-03-01"))
+            .await
+            .unwrap();
+        assert_eq!(result.chat_id, 1);
+        assert!(result.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn inaccessible_chat_returns_error() {
+        let client = MockClient {
+            inaccessible_chat_ids: vec![999],
+            ..MockClient::default()
+        };
+        let err = get_messages(&client, ChatTarget::Id(999), 20, None)
+            .await
+            .unwrap_err();
+        match err {
+            TgError::ChatInaccessible(id) => assert_eq!(id, 999),
+            other => panic!("Expected ChatInaccessible, got: {:?}", other),
+        }
     }
 }

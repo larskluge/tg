@@ -1040,7 +1040,21 @@ impl MessageHistorySource for TdLibClient {
             client_id,
         )
         .await
-        .map_err(|e| TgError::TdLib(e.message))?;
+        .map_err(|e| {
+            let msg = e.message.to_lowercase();
+            if msg.contains("not found")
+                || msg.contains("private")
+                || msg.contains("kicked")
+                || msg.contains("banned")
+                || msg.contains("restricted")
+                || msg.contains("deleted")
+                || msg.contains("deactivated")
+            {
+                TgError::ChatInaccessible(chat_id)
+            } else {
+                TgError::TdLib(e.message)
+            }
+        })?;
 
         let mut result = Vec::new();
         for msg in unwrap_messages(msgs_enum).messages.into_iter().flatten() {
@@ -1867,6 +1881,7 @@ pub mod mock {
         pub groups: Vec<ChatInfo>,
         pub contacts: Vec<ContactInfo>,
         pub messages: Vec<MessageInfo>,
+        pub inaccessible_chat_ids: Vec<i64>,
     }
 
     impl MockClient {
@@ -1921,6 +1936,7 @@ pub mod mock {
                         phone: None,
                     },
                 ],
+                inaccessible_chat_ids: vec![],
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -2031,10 +2047,13 @@ pub mod mock {
 
         async fn get_messages(
             &self,
-            _chat_id: i64,
+            chat_id: i64,
             limit: i32,
             until_message_id: Option<i64>,
         ) -> Result<Vec<MessageInfo>> {
+            if self.inaccessible_chat_ids.contains(&chat_id) {
+                return Err(TgError::ChatInaccessible(chat_id));
+            }
             let msgs: Vec<_> = self
                 .messages
                 .iter()
