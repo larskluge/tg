@@ -558,6 +558,19 @@ struct ExtractedMessageData {
     content: Option<MessageContentDetails>,
 }
 
+/// Extract the TDLib type name from a MessageContent variant using its Debug representation.
+/// E.g. `MessagePremiumGiftCode(...)` → `"messagePremiumGiftCode"`, `MessageUnsupported` → `"messageUnsupported"`.
+fn tdlib_type_name(content: &tdlib_rs::enums::MessageContent) -> String {
+    let debug = format!("{content:?}");
+    let variant = debug.split(['(', ' ']).next().unwrap_or(&debug);
+    // Convert PascalCase variant name to camelCase TDLib type name (lowercase first char)
+    let mut chars = variant.chars();
+    match chars.next() {
+        Some(c) => c.to_lowercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedMessageData {
     use tdlib_rs::enums::MessageContent;
 
@@ -935,13 +948,92 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 }),
             }
         }
-        _ => ExtractedMessageData {
-            text: "[Unsupported]".to_string(),
-            content_type: None,
+        MessageContent::MessageCall(c) => {
+            let discard_reason = match &c.discard_reason {
+                tdlib_rs::enums::CallDiscardReason::Empty => "unknown",
+                tdlib_rs::enums::CallDiscardReason::Missed => "missed",
+                tdlib_rs::enums::CallDiscardReason::Declined => "declined",
+                tdlib_rs::enums::CallDiscardReason::Disconnected => "disconnected",
+                tdlib_rs::enums::CallDiscardReason::HungUp => "hung_up",
+            }
+            .to_string();
+            let kind = if c.is_video { "Video call" } else { "Call" };
+            let text = if c.duration > 0 {
+                format!("{kind} ({discard_reason}, {}s)", c.duration)
+            } else {
+                format!("{kind} ({discard_reason})")
+            };
+            ExtractedMessageData {
+                text,
+                content_type: Some("call".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Call {
+                    is_video: c.is_video,
+                    discard_reason,
+                    duration_seconds: c.duration,
+                }),
+            }
+        }
+        MessageContent::MessageContactRegistered => ExtractedMessageData {
+            text: "Contact registered".to_string(),
+            content_type: Some("contact_registered".to_string()),
             is_downloadable: false,
             download_files: vec![],
-            content: None,
+            content: Some(MessageContentDetails::ContactRegistered {}),
         },
+        MessageContent::MessageVenue(v) => {
+            let text = format!("Venue: {}, {}", v.venue.title, v.venue.address);
+            ExtractedMessageData {
+                text,
+                content_type: Some("venue".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Venue {
+                    title: v.venue.title.clone(),
+                    address: v.venue.address.clone(),
+                    latitude: v.venue.location.latitude,
+                    longitude: v.venue.location.longitude,
+                    provider: non_empty(&v.venue.provider),
+                }),
+            }
+        }
+        MessageContent::MessagePinMessage(p) => ExtractedMessageData {
+            text: "Pinned a message".to_string(),
+            content_type: Some("pin_message".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::PinMessage {
+                pinned_message_id: p.message_id,
+            }),
+        },
+        MessageContent::MessageGiftedPremium(g) => {
+            let text = format!("Gifted Premium ({} months)", g.month_count);
+            ExtractedMessageData {
+                text,
+                content_type: Some("gifted_premium".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::GiftedPremium {
+                    gifter_user_id: g.gifter_user_id,
+                    currency: g.currency.clone(),
+                    amount: g.amount,
+                    month_count: g.month_count,
+                }),
+            }
+        }
+        other => {
+            let tdlib_type = tdlib_type_name(other);
+            ExtractedMessageData {
+                text: "[Unsupported]".to_string(),
+                content_type: Some("unsupported".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Unsupported {
+                    tdlib_type,
+                }),
+            }
+        }
     }
 }
 
@@ -2369,6 +2461,36 @@ mod tests {
         assert_eq!(extracted.download_files[0].file_id, 11);
         assert!(extracted.text.starts_with("[Photo:"));
         assert!(extracted.text.ends_with(']'));
+    }
+
+    #[test]
+    fn extract_unsupported_message_sets_content_type_and_tdlib_type() {
+        use tdlib_rs::enums::MessageContent;
+
+        // MessageUnsupported is a unit variant (no inner data)
+        let content = MessageContent::MessageUnsupported;
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.text, "[Unsupported]");
+        assert_eq!(extracted.content_type.as_deref(), Some("unsupported"));
+        assert!(!extracted.is_downloadable);
+        if let Some(MessageContentDetails::Unsupported { tdlib_type }) = &extracted.content {
+            assert_eq!(tdlib_type, "messageUnsupported");
+        } else {
+            panic!("expected Unsupported content details");
+        }
+    }
+
+    #[test]
+    fn tdlib_type_name_extracts_camel_case_name() {
+        use tdlib_rs::enums::MessageContent;
+
+        assert_eq!(
+            tdlib_type_name(&MessageContent::MessageUnsupported),
+            "messageUnsupported"
+        );
+        // A variant with data — the Debug format includes the inner struct
+        let dice = MessageContent::MessageExpiredPhoto;
+        assert_eq!(tdlib_type_name(&dice), "messageExpiredPhoto");
     }
 
     #[test]

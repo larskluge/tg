@@ -479,6 +479,31 @@ pub enum MessageContentDetails {
         is_closed: bool,
         poll_type: String,
     },
+    Call {
+        is_video: bool,
+        discard_reason: String,
+        duration_seconds: i32,
+    },
+    ContactRegistered {},
+    Venue {
+        title: String,
+        address: String,
+        latitude: f64,
+        longitude: f64,
+        provider: Option<String>,
+    },
+    PinMessage {
+        pinned_message_id: i64,
+    },
+    GiftedPremium {
+        gifter_user_id: i64,
+        currency: String,
+        amount: i64,
+        month_count: i32,
+    },
+    Unsupported {
+        tdlib_type: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
