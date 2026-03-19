@@ -7,14 +7,25 @@ pub enum ChatTarget {
     Name(String),
 }
 
-/// Parse a `YYYY-MM-DD` date string as start-of-day UTC and return the Unix timestamp (i32).
+/// Parse a date or datetime string and return the Unix timestamp (i32).
+///
+/// Accepts:
+/// - Full ISO 8601: `2026-03-18T09:34:05Z`
+/// - Date only: `2026-03-18` (treated as midnight UTC)
 pub fn parse_since_date(s: &str) -> Result<i32> {
-    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map_err(|_| TgError::Other(format!("Invalid date format '{}'. Expected YYYY-MM-DD", s)))?;
-    let dt = date
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| TgError::Other("Failed to construct datetime".to_string()))?;
-    let ts = dt.and_utc().timestamp();
+    let ts = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        dt.timestamp()
+    } else if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let dt = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| TgError::Other("Failed to construct datetime".to_string()))?;
+        dt.and_utc().timestamp()
+    } else {
+        return Err(TgError::Other(format!(
+            "Invalid date format '{}'. Expected YYYY-MM-DD or ISO 8601 (e.g. 2026-03-18T09:34:05Z)",
+            s
+        )));
+    };
     i32::try_from(ts)
         .map_err(|_| TgError::Other(format!("Date '{}' out of range for TDLib timestamp", s)))
 }
@@ -59,10 +70,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_since_date_iso8601() {
+        // 2026-03-18T09:34:05Z
+        let ts = parse_since_date("2026-03-18T09:34:05Z").unwrap();
+        assert_eq!(ts, 1773826445);
+    }
+
+    #[test]
+    fn parse_since_date_iso8601_with_offset() {
+        // 2026-03-18T09:34:05+00:00 is equivalent to Z
+        let ts = parse_since_date("2026-03-18T09:34:05+00:00").unwrap();
+        assert_eq!(ts, 1773826445);
+    }
+
+    #[test]
     fn parse_since_date_invalid_format() {
         assert!(parse_since_date("03-01-2026").is_err());
         assert!(parse_since_date("not-a-date").is_err());
         assert!(parse_since_date("2026/03/01").is_err());
+    }
+
+    #[test]
+    fn parse_since_date_invalid_error_message() {
+        let err = parse_since_date("bad-input").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bad-input"));
+        assert!(msg.contains("ISO 8601"));
     }
 
     #[tokio::test]

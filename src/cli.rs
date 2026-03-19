@@ -107,7 +107,7 @@ pub struct MessagesArgs {
     #[arg(long, default_value = "20")]
     pub limit: i32,
 
-    /// Only include messages since this UTC date (YYYY-MM-DD)
+    /// Only include messages since this UTC date (YYYY-MM-DD or ISO 8601, e.g. 2026-03-18T09:34:05Z)
     #[arg(long)]
     pub since_utc: Option<String>,
 }
