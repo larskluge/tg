@@ -202,12 +202,17 @@ async fn run_command(
                 messages::ChatTarget::Name(args.name.unwrap())
             };
 
-            let msgs =
+            let result =
                 messages::get_messages(client, target, args.limit, args.since_utc.as_deref())
                     .await?;
+            if result.messages.is_empty()
+                && let Some(ref since) = args.since_utc
+            {
+                eprintln!("No new messages in chat {} since {}", result.chat_id, since);
+            }
             match format {
-                OutputFormat::Json => print_list(format, &msgs),
-                OutputFormat::Plain => print_messages_table(&msgs),
+                OutputFormat::Json => print_list(format, &result.messages),
+                OutputFormat::Plain => print_messages_table(&result.messages),
             }
         }
 

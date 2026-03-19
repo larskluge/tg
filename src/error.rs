@@ -11,6 +11,9 @@ pub enum TgError {
     #[error("Chat not found: {0}")]
     ChatNotFound(String),
 
+    #[error("Chat {0} is inaccessible (group may be deleted or restricted)")]
+    ChatInaccessible(i64),
+
     #[error("Contact not found: {0}")]
     ContactNotFound(String),
 
