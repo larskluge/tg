@@ -910,6 +910,44 @@ mod tests {
     }
 
     #[test]
+    fn message_info_json_edit_date_none_is_omitted() {
+        let msg = MessageInfo {
+            id: 1,
+            chat_id: 123,
+            sender: "Alice".to_string(),
+            text: "Hello".to_string(),
+            date: "2024-01-01T00:00:00Z".to_string(),
+            is_outgoing: false,
+            edit_date: None,
+            content_type: None,
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("edit_date"));
+    }
+
+    #[test]
+    fn message_info_json_edit_date_some_is_included() {
+        let msg = MessageInfo {
+            id: 1,
+            chat_id: 123,
+            sender: "Alice".to_string(),
+            text: "Hello (edited)".to_string(),
+            date: "2024-01-01T00:00:00Z".to_string(),
+            is_outgoing: false,
+            edit_date: Some("2024-01-01T00:05:00Z".to_string()),
+            content_type: None,
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"edit_date\":\"2024-01-01T00:05:00Z\""));
+    }
+
+    #[test]
     fn send_result_plain_text() {
         let result = SendResult {
             message_id: 12345,

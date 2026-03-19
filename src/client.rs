@@ -2349,6 +2349,33 @@ mod tests {
     }
 
     #[test]
+    fn edit_date_zero_maps_to_none() {
+        let edit_date: i32 = 0;
+        let result: Option<String> = if edit_date == 0 {
+            None
+        } else {
+            Some(format_timestamp(edit_date))
+        };
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn edit_date_positive_maps_to_some_iso8601() {
+        let edit_date: i32 = 1_700_000_000;
+        let result: Option<String> = if edit_date == 0 {
+            None
+        } else {
+            Some(format_timestamp(edit_date))
+        };
+        assert!(result.is_some());
+        let date_str = result.unwrap();
+        // Should be a valid ISO 8601 / RFC 3339 string
+        assert!(date_str.contains('T'));
+        assert!(date_str.ends_with('Z'));
+        assert_eq!(date_str, "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
     fn build_filename_marks_primary_for_multiple_files() {
         let primary = MessageFileRef {
             file_id: 1,
