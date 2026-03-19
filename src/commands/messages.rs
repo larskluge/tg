@@ -199,6 +199,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn since_utc_is_inclusive() {
+        use crate::output::MessageInfo;
+        // Mock has messages with id=1 and id=2; set boundary to id=1
+        // Inclusive behavior: id=1 (boundary) AND id=2 (newer) should both be returned
+        let client = MockClient {
+            boundary_message_id: Some(1),
+            ..MockClient::default()
+        };
+        let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-01-01"), false)
+            .await
+            .unwrap();
+        assert!(
+            result.messages.iter().any(|m| m.id == 1),
+            "boundary message (id=1) should be included (inclusive)"
+        );
+        assert!(
+            result.messages.iter().any(|m| m.id == 2),
+            "newer message (id=2) should be included"
+        );
+    }
+
+    #[tokio::test]
     async fn oldest_first_empty_chat() {
         let client = MockClient {
             messages: vec![],
