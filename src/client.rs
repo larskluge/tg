@@ -994,12 +994,21 @@ async fn collect_messages_paginated<S: MessageHistorySource>(
         let mut hit_boundary = false;
         for msg in msgs {
             if let Some(boundary_id) = until_message_id
-                && msg.id <= boundary_id
+                && msg.id < boundary_id
             {
+                // msg is older than the boundary — stop without including it
                 hit_boundary = true;
                 break;
             }
+            let msg_id = msg.id;
             result.push(msg);
+            if let Some(boundary_id) = until_message_id
+                && msg_id == boundary_id
+            {
+                // msg is exactly at the boundary — include it, then stop
+                hit_boundary = true;
+                break;
+            }
             if result.len() >= limit as usize {
                 break;
             }
@@ -1882,6 +1891,8 @@ pub mod mock {
         pub contacts: Vec<ContactInfo>,
         pub messages: Vec<MessageInfo>,
         pub inaccessible_chat_ids: Vec<i64>,
+        /// When set, `get_boundary_message_id` returns this value
+        pub boundary_message_id: Option<i64>,
     }
 
     impl MockClient {
@@ -1937,6 +1948,7 @@ pub mod mock {
                     },
                 ],
                 inaccessible_chat_ids: vec![],
+                boundary_message_id: None,
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -2059,7 +2071,7 @@ pub mod mock {
                 .iter()
                 .filter(|m| {
                     if let Some(boundary) = until_message_id {
-                        m.id > boundary
+                        m.id >= boundary
                     } else {
                         true
                     }
@@ -2075,7 +2087,7 @@ pub mod mock {
             _chat_id: i64,
             _timestamp: i32,
         ) -> Result<Option<i64>> {
-            Ok(None)
+            Ok(self.boundary_message_id)
         }
 
         async fn download_message_media(
@@ -2659,7 +2671,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_messages_stops_at_boundary_id() {
-        // Messages 10, 9, 8, 7, 6 — boundary at 7 means only 10, 9, 8 returned.
+        // Messages 10, 9, 8, 7, 6 — boundary at 7 means 10, 9, 8, 7 returned (inclusive).
         let source = TestMessageSource::new(vec![vec![
             msg(10),
             msg(9),
@@ -2669,7 +2681,7 @@ mod tests {
         ]]);
         let result = collect_messages_paginated(&source, 0, 10, Some(7)).await.unwrap();
         let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
-        assert_eq!(ids, vec![10, 9, 8]);
+        assert_eq!(ids, vec![10, 9, 8, 7]);
     }
 
     #[tokio::test]
@@ -2691,22 +2703,41 @@ mod tests {
 
     #[tokio::test]
     async fn collect_messages_boundary_across_batches() {
-        // First batch: 10, 9. Second batch: 8, 7, 6. Boundary at 7.
+        // First batch: 10, 9. Second batch: 8, 7, 6. Boundary at 7 (inclusive).
         let source = TestMessageSource::new(vec![
             vec![msg(10), msg(9)],
             vec![msg(8), msg(7), msg(6)],
         ]);
         let result = collect_messages_paginated(&source, 0, 10, Some(7)).await.unwrap();
         let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
-        assert_eq!(ids, vec![10, 9, 8]);
+        assert_eq!(ids, vec![10, 9, 8, 7]);
     }
 
     #[tokio::test]
     async fn collect_messages_boundary_above_all_returns_empty() {
-        // All messages have id <= boundary.
+        // All messages have id < boundary — none included.
         let source = TestMessageSource::new(vec![vec![msg(3), msg(2), msg(1)]]);
         let result = collect_messages_paginated(&source, 0, 10, Some(5)).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_messages_boundary_is_inclusive_exact_match() {
+        // Boundary at id=7 — message 7 must appear in results (inclusive semantics).
+        // Simulates: messages at timestamps 10,9,8,7,6 and since_utc points to id=7.
+        let source = TestMessageSource::new(vec![vec![
+            msg(10),
+            msg(9),
+            msg(8),
+            msg(7), // <-- boundary: should be INCLUDED
+            msg(6),
+            msg(5),
+        ]]);
+        let result = collect_messages_paginated(&source, 0, 20, Some(7)).await.unwrap();
+        let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&7), "boundary message (id=7) must be included");
+        assert!(!ids.contains(&6), "message before boundary (id=6) must be excluded");
+        assert_eq!(ids, vec![10, 9, 8, 7]);
     }
 
     #[test]
