@@ -110,6 +110,10 @@ pub struct MessagesArgs {
     /// Only include messages since this UTC date (YYYY-MM-DD or ISO 8601, e.g. 2026-03-18T09:34:05Z)
     #[arg(long)]
     pub since_utc: Option<String>,
+
+    /// Return messages in chronological order (oldest first), fetching full history
+    #[arg(long)]
+    pub oldest_first: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -524,6 +528,48 @@ mod tests {
         match cli.command {
             Command::Messages(args) => {
                 assert_eq!(args.since_utc, None);
+            }
+            _ => panic!("Expected Messages command"),
+        }
+    }
+
+    #[test]
+    fn parse_messages_oldest_first() {
+        let cli = Cli::parse_from(["tg", "messages", "--chat", "123", "--oldest-first"]);
+        match cli.command {
+            Command::Messages(args) => {
+                assert!(args.oldest_first);
+            }
+            _ => panic!("Expected Messages command"),
+        }
+    }
+
+    #[test]
+    fn parse_messages_oldest_first_with_limit() {
+        let cli = Cli::parse_from([
+            "tg",
+            "messages",
+            "--chat",
+            "123",
+            "--oldest-first",
+            "--limit",
+            "1000",
+        ]);
+        match cli.command {
+            Command::Messages(args) => {
+                assert!(args.oldest_first);
+                assert_eq!(args.limit, 1000);
+            }
+            _ => panic!("Expected Messages command"),
+        }
+    }
+
+    #[test]
+    fn parse_messages_without_oldest_first() {
+        let cli = Cli::parse_from(["tg", "messages", "--chat", "123"]);
+        match cli.command {
+            Command::Messages(args) => {
+                assert!(!args.oldest_first);
             }
             _ => panic!("Expected Messages command"),
         }

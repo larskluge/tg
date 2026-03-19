@@ -202,9 +202,14 @@ async fn run_command(
                 messages::ChatTarget::Name(args.name.unwrap())
             };
 
-            let result =
-                messages::get_messages(client, target, args.limit, args.since_utc.as_deref())
-                    .await?;
+            let result = messages::get_messages(
+                client,
+                target,
+                args.limit,
+                args.since_utc.as_deref(),
+                args.oldest_first,
+            )
+            .await?;
             if result.messages.is_empty()
                 && let Some(ref since) = args.since_utc
             {
