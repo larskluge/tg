@@ -199,8 +199,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn since_utc_is_inclusive() {
-        use crate::output::MessageInfo;
+    async fn since_utc_date_only_is_inclusive() {
         // Mock has messages with id=1 and id=2; set boundary to id=1
         // Inclusive behavior: id=1 (boundary) AND id=2 (newer) should both be returned
         let client = MockClient {
@@ -213,6 +212,37 @@ mod tests {
         assert!(
             result.messages.iter().any(|m| m.id == 1),
             "boundary message (id=1) should be included (inclusive)"
+        );
+        assert!(
+            result.messages.iter().any(|m| m.id == 2),
+            "newer message (id=2) should be included"
+        );
+    }
+
+    #[tokio::test]
+    async fn since_utc_iso8601_with_time_is_inclusive() {
+        // Tests that a full ISO 8601 timestamp (with time component) is accepted
+        // and that the message at exactly that timestamp is included.
+        // The mock maps the parsed timestamp to boundary id=1 regardless of value,
+        // so this verifies both: (a) the full datetime string is parsed without error,
+        // and (b) the boundary message is included in results.
+        let client = MockClient {
+            boundary_message_id: Some(1),
+            ..MockClient::default()
+        };
+        // Full ISO 8601 with time — would fail in the old date-only parser
+        let result = get_messages(
+            &client,
+            ChatTarget::Id(1),
+            20,
+            Some("2026-03-18T09:34:05Z"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.messages.iter().any(|m| m.id == 1),
+            "boundary message (id=1) should be included with ISO 8601 timestamp"
         );
         assert!(
             result.messages.iter().any(|m| m.id == 2),

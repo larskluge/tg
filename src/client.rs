@@ -2715,10 +2715,29 @@ mod tests {
 
     #[tokio::test]
     async fn collect_messages_boundary_above_all_returns_empty() {
-        // All messages have id <= boundary.
+        // All messages have id < boundary — none included.
         let source = TestMessageSource::new(vec![vec![msg(3), msg(2), msg(1)]]);
         let result = collect_messages_paginated(&source, 0, 10, Some(5)).await.unwrap();
         assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_messages_boundary_is_inclusive_exact_match() {
+        // Boundary at id=7 — message 7 must appear in results (inclusive semantics).
+        // Simulates: messages at timestamps 10,9,8,7,6 and since_utc points to id=7.
+        let source = TestMessageSource::new(vec![vec![
+            msg(10),
+            msg(9),
+            msg(8),
+            msg(7), // <-- boundary: should be INCLUDED
+            msg(6),
+            msg(5),
+        ]]);
+        let result = collect_messages_paginated(&source, 0, 20, Some(7)).await.unwrap();
+        let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
+        assert!(ids.contains(&7), "boundary message (id=7) must be included");
+        assert!(!ids.contains(&6), "message before boundary (id=6) must be excluded");
+        assert_eq!(ids, vec![10, 9, 8, 7]);
     }
 
     #[test]
