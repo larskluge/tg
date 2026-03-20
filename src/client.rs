@@ -560,6 +560,7 @@ struct ExtractedMessageData {
 
 /// Extract the TDLib type name from a MessageContent variant using its Debug representation.
 /// E.g. `MessagePremiumGiftCode(...)` → `"messagePremiumGiftCode"`, `MessageUnsupported` → `"messageUnsupported"`.
+#[cfg(test)]
 fn tdlib_type_name(content: &tdlib_rs::enums::MessageContent) -> String {
     let debug = format!("{content:?}");
     let variant = debug.split(['(', ' ']).next().unwrap_or(&debug);
@@ -1022,8 +1023,476 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 }),
             }
         }
-        other => {
-            let tdlib_type = tdlib_type_name(other);
+        MessageContent::MessageDice(d) => {
+            let text = format!("Dice: {} (value: {})", d.emoji, d.value);
+            ExtractedMessageData {
+                text,
+                content_type: Some("dice".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Dice {
+                    emoji: d.emoji.clone(),
+                    value: d.value,
+                }),
+            }
+        }
+        MessageContent::MessageGame(g) => {
+            let text = format!("Game: {}", g.game.title);
+            ExtractedMessageData {
+                text,
+                content_type: Some("game".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Game {
+                    title: g.game.title.clone(),
+                    short_name: g.game.short_name.clone(),
+                    description: g.game.description.clone(),
+                }),
+            }
+        }
+        MessageContent::MessageStory(s) => {
+            let text = format!("Story from chat {}", s.story_sender_chat_id);
+            ExtractedMessageData {
+                text,
+                content_type: Some("story".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Story {
+                    story_sender_chat_id: s.story_sender_chat_id,
+                    story_id: s.story_id,
+                    via_mention: s.via_mention,
+                }),
+            }
+        }
+        MessageContent::MessageInvoice(inv) => {
+            let text = format!("Invoice: {} ({} {})", inv.title, inv.total_amount, inv.currency);
+            ExtractedMessageData {
+                text,
+                content_type: Some("invoice".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Invoice {
+                    title: inv.title.clone(),
+                    currency: inv.currency.clone(),
+                    total_amount: inv.total_amount,
+                    is_test: inv.is_test,
+                }),
+            }
+        }
+        MessageContent::MessageVideoChatScheduled(v) => ExtractedMessageData {
+            text: format!("Video chat scheduled (start: {})", v.start_date),
+            content_type: Some("video_chat_scheduled".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::VideoChatScheduled {
+                group_call_id: v.group_call_id,
+                start_date: v.start_date,
+            }),
+        },
+        MessageContent::MessageVideoChatStarted(v) => ExtractedMessageData {
+            text: "Video chat started".to_string(),
+            content_type: Some("video_chat_started".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::VideoChatStarted {
+                group_call_id: v.group_call_id,
+            }),
+        },
+        MessageContent::MessageVideoChatEnded(v) => ExtractedMessageData {
+            text: format!("Video chat ended ({}s)", v.duration),
+            content_type: Some("video_chat_ended".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::VideoChatEnded {
+                duration_seconds: v.duration,
+            }),
+        },
+        MessageContent::MessageInviteVideoChatParticipants(v) => ExtractedMessageData {
+            text: format!("Invited {} participants to video chat", v.user_ids.len()),
+            content_type: Some("invite_video_chat_participants".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::InviteVideoChatParticipants {
+                group_call_id: v.group_call_id,
+                user_ids: v.user_ids.clone(),
+            }),
+        },
+        MessageContent::MessageBasicGroupChatCreate(g) => ExtractedMessageData {
+            text: format!("Group created: {}", g.title),
+            content_type: Some("group_created".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::BasicGroupChatCreate {
+                title: g.title.clone(),
+                member_user_ids: g.member_user_ids.clone(),
+            }),
+        },
+        MessageContent::MessageSupergroupChatCreate(g) => ExtractedMessageData {
+            text: format!("Supergroup created: {}", g.title),
+            content_type: Some("supergroup_created".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::SupergroupChatCreate {
+                title: g.title.clone(),
+            }),
+        },
+        MessageContent::MessageChatChangeTitle(t) => ExtractedMessageData {
+            text: format!("Chat title changed to: {}", t.title),
+            content_type: Some("chat_change_title".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatChangeTitle {
+                title: t.title.clone(),
+            }),
+        },
+        MessageContent::MessageChatChangePhoto(_) => ExtractedMessageData {
+            text: "Chat photo changed".to_string(),
+            content_type: Some("chat_change_photo".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatChangePhoto {}),
+        },
+        MessageContent::MessageChatDeletePhoto => ExtractedMessageData {
+            text: "Chat photo deleted".to_string(),
+            content_type: Some("chat_delete_photo".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatDeletePhoto {}),
+        },
+        MessageContent::MessageChatAddMembers(m) => ExtractedMessageData {
+            text: format!("Members added: {:?}", m.member_user_ids),
+            content_type: Some("members_added".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatAddMembers {
+                member_user_ids: m.member_user_ids.clone(),
+            }),
+        },
+        MessageContent::MessageChatJoinByLink => ExtractedMessageData {
+            text: "Joined by invite link".to_string(),
+            content_type: Some("chat_join_by_link".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatJoinByLink {}),
+        },
+        MessageContent::MessageChatJoinByRequest => ExtractedMessageData {
+            text: "Joined by request".to_string(),
+            content_type: Some("chat_join_by_request".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatJoinByRequest {}),
+        },
+        MessageContent::MessageChatDeleteMember(m) => ExtractedMessageData {
+            text: format!("Member removed: {}", m.user_id),
+            content_type: Some("chat_delete_member".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatDeleteMember {
+                user_id: m.user_id,
+            }),
+        },
+        MessageContent::MessageChatUpgradeTo(u) => ExtractedMessageData {
+            text: format!("Upgraded to supergroup {}", u.supergroup_id),
+            content_type: Some("chat_upgrade_to".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatUpgradeTo {
+                supergroup_id: u.supergroup_id,
+            }),
+        },
+        MessageContent::MessageChatUpgradeFrom(u) => ExtractedMessageData {
+            text: format!("Upgraded from basic group: {}", u.title),
+            content_type: Some("chat_upgrade_from".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatUpgradeFrom {
+                title: u.title.clone(),
+                basic_group_id: u.basic_group_id,
+            }),
+        },
+        MessageContent::MessageScreenshotTaken => ExtractedMessageData {
+            text: "Screenshot taken".to_string(),
+            content_type: Some("screenshot_taken".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ScreenshotTaken {}),
+        },
+        MessageContent::MessageChatSetBackground(b) => ExtractedMessageData {
+            text: "Chat background changed".to_string(),
+            content_type: Some("chat_set_background".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatSetBackground {
+                old_background_message_id: b.old_background_message_id,
+                only_for_self: b.only_for_self,
+            }),
+        },
+        MessageContent::MessageChatSetTheme(t) => ExtractedMessageData {
+            text: if t.theme_name.is_empty() {
+                "Chat theme reset".to_string()
+            } else {
+                format!("Chat theme set to: {}", t.theme_name)
+            },
+            content_type: Some("chat_set_theme".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatSetTheme {
+                theme_name: t.theme_name.clone(),
+            }),
+        },
+        MessageContent::MessageChatSetMessageAutoDeleteTime(t) => ExtractedMessageData {
+            text: if t.message_auto_delete_time == 0 {
+                "Auto-delete timer disabled".to_string()
+            } else {
+                format!("Auto-delete timer set to {}s", t.message_auto_delete_time)
+            },
+            content_type: Some("chat_set_message_auto_delete_time".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatSetMessageAutoDeleteTime {
+                message_auto_delete_time: t.message_auto_delete_time,
+                from_user_id: t.from_user_id,
+            }),
+        },
+        MessageContent::MessageChatBoost(b) => ExtractedMessageData {
+            text: format!("Chat boosted ({} boosts)", b.boost_count),
+            content_type: Some("chat_boost".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatBoost {
+                boost_count: b.boost_count,
+            }),
+        },
+        MessageContent::MessageForumTopicCreated(t) => ExtractedMessageData {
+            text: format!("Forum topic created: {}", t.name),
+            content_type: Some("forum_topic_created".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ForumTopicCreated {
+                name: t.name.clone(),
+            }),
+        },
+        MessageContent::MessageForumTopicEdited(t) => ExtractedMessageData {
+            text: if t.name.is_empty() {
+                "Forum topic edited".to_string()
+            } else {
+                format!("Forum topic renamed to: {}", t.name)
+            },
+            content_type: Some("forum_topic_edited".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ForumTopicEdited {
+                name: t.name.clone(),
+                edit_icon_custom_emoji_id: t.edit_icon_custom_emoji_id,
+                icon_custom_emoji_id: t.icon_custom_emoji_id,
+            }),
+        },
+        MessageContent::MessageForumTopicIsClosedToggled(t) => ExtractedMessageData {
+            text: if t.is_closed {
+                "Forum topic closed".to_string()
+            } else {
+                "Forum topic reopened".to_string()
+            },
+            content_type: Some("forum_topic_is_closed_toggled".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ForumTopicIsClosedToggled {
+                is_closed: t.is_closed,
+            }),
+        },
+        MessageContent::MessageForumTopicIsHiddenToggled(t) => ExtractedMessageData {
+            text: if t.is_hidden {
+                "Forum topic hidden".to_string()
+            } else {
+                "Forum topic unhidden".to_string()
+            },
+            content_type: Some("forum_topic_is_hidden_toggled".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ForumTopicIsHiddenToggled {
+                is_hidden: t.is_hidden,
+            }),
+        },
+        MessageContent::MessageSuggestProfilePhoto(_) => ExtractedMessageData {
+            text: "Profile photo suggested".to_string(),
+            content_type: Some("suggest_profile_photo".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::SuggestProfilePhoto {}),
+        },
+        MessageContent::MessageCustomServiceAction(a) => ExtractedMessageData {
+            text: a.text.clone(),
+            content_type: Some("custom_service_action".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::CustomServiceAction {
+                text: a.text.clone(),
+            }),
+        },
+        MessageContent::MessageGameScore(g) => ExtractedMessageData {
+            text: format!("Game score: {}", g.score),
+            content_type: Some("game_score".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::GameScore {
+                game_message_id: g.game_message_id,
+                game_id: g.game_id,
+                score: g.score,
+            }),
+        },
+        MessageContent::MessagePaymentSuccessful(p) => ExtractedMessageData {
+            text: format!("Payment: {} {}", p.total_amount, p.currency),
+            content_type: Some("payment_successful".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::PaymentSuccessful {
+                invoice_chat_id: p.invoice_chat_id,
+                invoice_message_id: p.invoice_message_id,
+                currency: p.currency.clone(),
+                total_amount: p.total_amount,
+                is_recurring: p.is_recurring,
+                invoice_name: non_empty(&p.invoice_name),
+            }),
+        },
+        MessageContent::MessagePremiumGiftCode(g) => ExtractedMessageData {
+            text: format!("Premium gift code ({} months)", g.month_count),
+            content_type: Some("premium_gift_code".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::PremiumGiftCode {
+                is_from_giveaway: g.is_from_giveaway,
+                is_unclaimed: g.is_unclaimed,
+                currency: g.currency.clone(),
+                amount: g.amount,
+                month_count: g.month_count,
+                code: g.code.clone(),
+            }),
+        },
+        MessageContent::MessagePremiumGiveawayCreated => ExtractedMessageData {
+            text: "Premium giveaway created".to_string(),
+            content_type: Some("premium_giveaway_created".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::PremiumGiveawayCreated {}),
+        },
+        MessageContent::MessagePremiumGiveaway(g) => ExtractedMessageData {
+            text: format!(
+                "Premium giveaway ({} winners, {} months)",
+                g.winner_count, g.month_count
+            ),
+            content_type: Some("premium_giveaway".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::PremiumGiveaway {
+                winner_count: g.winner_count,
+                month_count: g.month_count,
+            }),
+        },
+        MessageContent::MessagePremiumGiveawayCompleted(g) => ExtractedMessageData {
+            text: format!("Premium giveaway completed ({} winners)", g.winner_count),
+            content_type: Some("premium_giveaway_completed".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::PremiumGiveawayCompleted {
+                giveaway_message_id: g.giveaway_message_id,
+                winner_count: g.winner_count,
+                unclaimed_prize_count: g.unclaimed_prize_count,
+            }),
+        },
+        MessageContent::MessagePremiumGiveawayWinners(g) => ExtractedMessageData {
+            text: format!("Premium giveaway winners ({} winners)", g.winner_count),
+            content_type: Some("premium_giveaway_winners".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::PremiumGiveawayWinners {
+                boosted_chat_id: g.boosted_chat_id,
+                giveaway_message_id: g.giveaway_message_id,
+                winner_count: g.winner_count,
+                winner_user_ids: g.winner_user_ids.clone(),
+                unclaimed_prize_count: g.unclaimed_prize_count,
+                month_count: g.month_count,
+            }),
+        },
+        MessageContent::MessageUsersShared(u) => ExtractedMessageData {
+            text: format!("Users shared ({} users)", u.users.len()),
+            content_type: Some("users_shared".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::UsersShared {
+                button_id: u.button_id,
+            }),
+        },
+        MessageContent::MessageChatShared(c) => ExtractedMessageData {
+            text: "Chat shared".to_string(),
+            content_type: Some("chat_shared".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatShared {
+                button_id: c.button_id,
+            }),
+        },
+        MessageContent::MessageBotWriteAccessAllowed(_) => ExtractedMessageData {
+            text: "Bot write access allowed".to_string(),
+            content_type: Some("bot_write_access_allowed".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::BotWriteAccessAllowed {}),
+        },
+        MessageContent::MessageWebAppDataSent(w) => ExtractedMessageData {
+            text: format!("Web app data sent: {}", w.button_text),
+            content_type: Some("web_app_data_sent".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::WebAppDataSent {
+                button_text: w.button_text.clone(),
+            }),
+        },
+        MessageContent::MessagePassportDataSent(_) => ExtractedMessageData {
+            text: "Passport data sent".to_string(),
+            content_type: Some("passport_data_sent".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::PassportDataSent {}),
+        },
+        MessageContent::MessageProximityAlertTriggered(p) => ExtractedMessageData {
+            text: format!("Proximity alert ({}m)", p.distance),
+            content_type: Some("proximity_alert_triggered".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ProximityAlertTriggered {
+                distance: p.distance,
+            }),
+        },
+        MessageContent::MessageExpiredPhoto => ExtractedMessageData {
+            text: "Expired photo".to_string(),
+            content_type: Some("expired_photo".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ExpiredPhoto {}),
+        },
+        MessageContent::MessageExpiredVideo => ExtractedMessageData {
+            text: "Expired video".to_string(),
+            content_type: Some("expired_video".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ExpiredVideo {}),
+        },
+        MessageContent::MessageExpiredVideoNote => ExtractedMessageData {
+            text: "Expired video note".to_string(),
+            content_type: Some("expired_video_note".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ExpiredVideoNote {}),
+        },
+        MessageContent::MessageExpiredVoiceNote => ExtractedMessageData {
+            text: "Expired voice note".to_string(),
+            content_type: Some("expired_voice_note".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ExpiredVoiceNote {}),
+        },
+        MessageContent::MessageUnsupported => {
+            let tdlib_type = "messageUnsupported".to_string();
             ExtractedMessageData {
                 text: "[Unsupported]".to_string(),
                 content_type: Some("unsupported".to_string()),
@@ -2491,6 +2960,86 @@ mod tests {
         // A variant with data — the Debug format includes the inner struct
         let dice = MessageContent::MessageExpiredPhoto;
         assert_eq!(tdlib_type_name(&dice), "messageExpiredPhoto");
+    }
+
+    #[test]
+    fn extract_basic_group_chat_create() {
+        use tdlib_rs::enums::MessageContent;
+
+        let content =
+            MessageContent::MessageBasicGroupChatCreate(tdlib_rs::types::MessageBasicGroupChatCreate {
+                title: "My Group".to_string(),
+                member_user_ids: vec![100, 200, 300],
+            });
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.content_type.as_deref(), Some("group_created"));
+        assert_eq!(extracted.text, "Group created: My Group");
+        assert!(!extracted.is_downloadable);
+        if let Some(MessageContentDetails::BasicGroupChatCreate {
+            title,
+            member_user_ids,
+        }) = &extracted.content
+        {
+            assert_eq!(title, "My Group");
+            assert_eq!(member_user_ids, &vec![100, 200, 300]);
+        } else {
+            panic!("expected BasicGroupChatCreate content details");
+        }
+    }
+
+    #[test]
+    fn extract_chat_add_members() {
+        use tdlib_rs::enums::MessageContent;
+
+        let content =
+            MessageContent::MessageChatAddMembers(tdlib_rs::types::MessageChatAddMembers {
+                member_user_ids: vec![42, 99],
+            });
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.content_type.as_deref(), Some("members_added"));
+        assert!(extracted.text.contains("42"));
+        assert!(extracted.text.contains("99"));
+        assert!(!extracted.is_downloadable);
+        if let Some(MessageContentDetails::ChatAddMembers { member_user_ids }) = &extracted.content
+        {
+            assert_eq!(member_user_ids, &vec![42, 99]);
+        } else {
+            panic!("expected ChatAddMembers content details");
+        }
+    }
+
+    #[test]
+    fn extract_expired_photo() {
+        use tdlib_rs::enums::MessageContent;
+
+        let content = MessageContent::MessageExpiredPhoto;
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.content_type.as_deref(), Some("expired_photo"));
+        assert_eq!(extracted.text, "Expired photo");
+        assert!(!extracted.is_downloadable);
+    }
+
+    #[test]
+    fn extract_dice_message() {
+        use tdlib_rs::enums::MessageContent;
+
+        let content = MessageContent::MessageDice(tdlib_rs::types::MessageDice {
+            initial_state: None,
+            final_state: None,
+            emoji: "🎲".to_string(),
+            value: 5,
+            success_animation_frame_number: 0,
+        });
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.content_type.as_deref(), Some("dice"));
+        assert!(extracted.text.contains("🎲"));
+        assert!(extracted.text.contains("5"));
+        if let Some(MessageContentDetails::Dice { emoji, value }) = &extracted.content {
+            assert_eq!(emoji, "🎲");
+            assert_eq!(*value, 5);
+        } else {
+            panic!("expected Dice content details");
+        }
     }
 
     #[test]
