@@ -88,7 +88,9 @@ pub fn prompt_credentials() -> Result<ApiCredentials> {
     Ok(ApiCredentials { api_id, api_hash })
 }
 
-pub fn try_load_credentials_for_auth(data_dir: &Path) -> Option<(ApiCredentials, CredentialSource)> {
+pub fn try_load_credentials_for_auth(
+    data_dir: &Path,
+) -> Option<(ApiCredentials, CredentialSource)> {
     load_credentials_for_auth(data_dir).ok()
 }
 

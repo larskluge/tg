@@ -1,4 +1,4 @@
-use crate::client::TelegramClient;
+use crate::client::{BoundaryResult, TelegramClient};
 use crate::error::{Result, TgError};
 use crate::output::MessageInfo;
 
@@ -50,7 +50,16 @@ pub async fn get_messages<C: TelegramClient>(
 
     let until_message_id = if let Some(date_str) = since_utc {
         let timestamp = parse_since_date(date_str)?;
-        client.get_boundary_message_id(chat_id, timestamp).await?
+        match client.get_boundary_message_id(chat_id, timestamp).await? {
+            BoundaryResult::Empty => {
+                return Ok(MessagesResult {
+                    chat_id,
+                    messages: vec![],
+                });
+            }
+            BoundaryResult::BoundAt(id) => Some(id),
+            BoundaryResult::None => None,
+        }
     } else {
         None
     };
@@ -64,8 +73,11 @@ pub async fn get_messages<C: TelegramClient>(
         all.truncate(limit as usize);
         all
     } else {
-        client.get_messages(chat_id, limit, until_message_id).await?
+        client
+            .get_messages(chat_id, limit, until_message_id)
+            .await?
     };
+
     Ok(MessagesResult { chat_id, messages })
 }
 
@@ -129,9 +141,15 @@ mod tests {
     #[tokio::test]
     async fn get_messages_by_name() {
         let client = MockClient::default();
-        let result = get_messages(&client, ChatTarget::Name("John".to_string()), 20, None, false)
-            .await
-            .unwrap();
+        let result = get_messages(
+            &client,
+            ChatTarget::Name("John".to_string()),
+            20,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(result.chat_id, 1);
         assert_eq!(result.messages.len(), 2);
     }
@@ -199,11 +217,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn since_utc_future_date_returns_empty() {
+        // When since_utc is in the future, BoundaryResult::Empty short-circuits
+        // and returns an empty result without fetching messages at all.
+        let client = MockClient {
+            boundary_result: BoundaryResult::Empty,
+            ..MockClient::default()
+        };
+        let result = get_messages(
+            &client,
+            ChatTarget::Id(1),
+            20,
+            Some("2026-03-20T00:00:00Z"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.messages.is_empty(),
+            "BoundaryResult::Empty should short-circuit to empty result"
+        );
+    }
+
+    #[tokio::test]
     async fn since_utc_date_only_is_inclusive() {
         // Mock has messages with id=1 and id=2; set boundary to id=1
         // Inclusive behavior: id=1 (boundary) AND id=2 (newer) should both be returned
         let client = MockClient {
-            boundary_message_id: Some(1),
+            boundary_result: BoundaryResult::BoundAt(1),
             ..MockClient::default()
         };
         let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-01-01"), false)
@@ -227,7 +268,7 @@ mod tests {
         // so this verifies both: (a) the full datetime string is parsed without error,
         // and (b) the boundary message is included in results.
         let client = MockClient {
-            boundary_message_id: Some(1),
+            boundary_result: BoundaryResult::BoundAt(1),
             ..MockClient::default()
         };
         // Full ISO 8601 with time — would fail in the old date-only parser
