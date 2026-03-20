@@ -55,7 +55,15 @@ pub async fn get_messages<C: TelegramClient>(
         None
     };
 
-    let messages = if oldest_first {
+    // Parse since_utc timestamp for post-filtering (TDLib's get_chat_message_by_date
+    // returns the nearest message even if it's before the requested timestamp).
+    let since_timestamp: Option<i32> = if let Some(date_str) = since_utc {
+        Some(parse_since_date(date_str)?)
+    } else {
+        None
+    };
+
+    let mut messages = if oldest_first {
         // Fetch all messages by using i32::MAX as the limit, then reverse
         let mut all = client
             .get_messages(chat_id, i32::MAX, until_message_id)
@@ -66,6 +74,18 @@ pub async fn get_messages<C: TelegramClient>(
     } else {
         client.get_messages(chat_id, limit, until_message_id).await?
     };
+
+    // Post-filter: remove any messages whose date is before since_utc.
+    // This handles the case where TDLib returned a boundary message that is
+    // older than the requested timestamp (e.g. --since-utc is a future date).
+    if let Some(cutoff_ts) = since_timestamp {
+        messages.retain(|m| {
+            chrono::DateTime::parse_from_rfc3339(&m.date)
+                .map(|dt| dt.timestamp() >= cutoff_ts as i64)
+                .unwrap_or(true) // keep if unparseable
+        });
+    }
+
     Ok(MessagesResult { chat_id, messages })
 }
 
@@ -196,6 +216,48 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.messages.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn since_utc_future_date_returns_empty() {
+        // When since_utc is in the future, no messages should be returned.
+        // Mock's messages have date strings from the default fixture ("1h ago", "30m ago")
+        // which won't parse as rfc3339 — but a far-future cutoff should filter them.
+        // Use a mock with real ISO dates to test the post-filter properly.
+        use crate::output::MessageInfo;
+        let old_msg = MessageInfo {
+            id: 1,
+            chat_id: 1,
+            sender: "Alice".to_string(),
+            text: "old".to_string(),
+            date: "2026-03-10T06:30:47Z".to_string(),
+            is_outgoing: false,
+            edit_date: None,
+            content_type: Some("text".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+        };
+        let client = MockClient {
+            messages: vec![old_msg],
+            boundary_message_id: Some(1),
+            ..MockClient::default()
+        };
+        // since_utc is well after the only message — should return empty
+        let result = get_messages(
+            &client,
+            ChatTarget::Id(1),
+            20,
+            Some("2026-03-20T00:00:00Z"),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            result.messages.is_empty(),
+            "future since_utc should return empty, got: {:?}",
+            result.messages.iter().map(|m| &m.date).collect::<Vec<_>>()
+        );
     }
 
     #[tokio::test]
