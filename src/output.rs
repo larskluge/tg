@@ -501,6 +501,157 @@ pub enum MessageContentDetails {
         amount: i64,
         month_count: i32,
     },
+    Dice {
+        emoji: String,
+        value: i32,
+    },
+    Game {
+        title: String,
+        short_name: String,
+        description: String,
+    },
+    Story {
+        story_sender_chat_id: i64,
+        story_id: i32,
+        via_mention: bool,
+    },
+    Invoice {
+        title: String,
+        currency: String,
+        total_amount: i64,
+        is_test: bool,
+    },
+    VideoChatScheduled {
+        group_call_id: i32,
+        start_date: i32,
+    },
+    VideoChatStarted {
+        group_call_id: i32,
+    },
+    VideoChatEnded {
+        duration_seconds: i32,
+    },
+    InviteVideoChatParticipants {
+        group_call_id: i32,
+        user_ids: Vec<i64>,
+    },
+    BasicGroupChatCreate {
+        title: String,
+        member_user_ids: Vec<i64>,
+    },
+    SupergroupChatCreate {
+        title: String,
+    },
+    ChatChangeTitle {
+        title: String,
+    },
+    ChatChangePhoto {},
+    ChatDeletePhoto {},
+    ChatAddMembers {
+        member_user_ids: Vec<i64>,
+    },
+    ChatJoinByLink {},
+    ChatJoinByRequest {},
+    ChatDeleteMember {
+        user_id: i64,
+    },
+    ChatUpgradeTo {
+        supergroup_id: i64,
+    },
+    ChatUpgradeFrom {
+        title: String,
+        basic_group_id: i64,
+    },
+    ScreenshotTaken {},
+    ChatSetBackground {
+        old_background_message_id: i64,
+        only_for_self: bool,
+    },
+    ChatSetTheme {
+        theme_name: String,
+    },
+    ChatSetMessageAutoDeleteTime {
+        message_auto_delete_time: i32,
+        from_user_id: i64,
+    },
+    ChatBoost {
+        boost_count: i32,
+    },
+    ForumTopicCreated {
+        name: String,
+    },
+    ForumTopicEdited {
+        name: String,
+        edit_icon_custom_emoji_id: bool,
+        icon_custom_emoji_id: i64,
+    },
+    ForumTopicIsClosedToggled {
+        is_closed: bool,
+    },
+    ForumTopicIsHiddenToggled {
+        is_hidden: bool,
+    },
+    SuggestProfilePhoto {},
+    CustomServiceAction {
+        text: String,
+    },
+    GameScore {
+        game_message_id: i64,
+        game_id: i64,
+        score: i32,
+    },
+    PaymentSuccessful {
+        invoice_chat_id: i64,
+        invoice_message_id: i64,
+        currency: String,
+        total_amount: i64,
+        is_recurring: bool,
+        invoice_name: Option<String>,
+    },
+    PremiumGiftCode {
+        is_from_giveaway: bool,
+        is_unclaimed: bool,
+        currency: String,
+        amount: i64,
+        month_count: i32,
+        code: String,
+    },
+    PremiumGiveaway {
+        winner_count: i32,
+        month_count: i32,
+    },
+    PremiumGiveawayCompleted {
+        giveaway_message_id: i64,
+        winner_count: i32,
+        unclaimed_prize_count: i32,
+    },
+    PremiumGiveawayCreated {},
+    PremiumGiveawayWinners {
+        boosted_chat_id: i64,
+        giveaway_message_id: i64,
+        winner_count: i32,
+        winner_user_ids: Vec<i64>,
+        unclaimed_prize_count: i32,
+        month_count: i32,
+    },
+    UsersShared {
+        button_id: i32,
+    },
+    ChatShared {
+        button_id: i32,
+    },
+    BotWriteAccessAllowed {},
+    WebAppDataSent {
+        button_text: String,
+    },
+    PassportDataSent {},
+    ProximityAlertTriggered {
+        distance: i32,
+    },
+    ExpiredPhoto {},
+    ExpiredVideo {},
+    ExpiredVideoNote {},
+    ExpiredVoiceNote {},
     Unsupported {
         tdlib_type: String,
     },
