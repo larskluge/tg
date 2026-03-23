@@ -2,6 +2,10 @@ use crate::client::{BoundaryResult, TelegramClient};
 use crate::error::{Result, TgError};
 use crate::output::MessageInfo;
 
+/// Milliseconds to wait after a cache warm-up call before querying TDLib.
+/// Gives TDLib time to process incoming network updates triggered by the warm-up.
+const CACHE_WARM_UP_DELAY_MS: u64 = 500;
+
 pub enum ChatTarget {
     Id(i64),
     Name(String),
@@ -49,10 +53,13 @@ pub async fn get_messages<C: TelegramClient>(
     };
 
     // When --since-utc is used, TDLib's local cache may be stale.
-    // A warm-up call forces TDLib to sync with the server.
+    // A warm-up call forces TDLib to contact the server before the boundary lookup.
+    // The result is intentionally discarded — this is a best-effort sync trigger.
+    // Only needed for --since-utc; unconditional warm-up is not necessary for plain
+    // message fetches which already retry on empty results.
     if since_utc.is_some() {
         let _ = client.get_messages(chat_id, 1, None).await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(CACHE_WARM_UP_DELAY_MS)).await;
     }
 
     let until_message_id = if let Some(date_str) = since_utc {
@@ -308,5 +315,38 @@ mod tests {
             .await
             .unwrap();
         assert!(result.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn since_utc_triggers_warm_up_call() {
+        // When --since-utc is used, get_messages should be called at least once
+        // for the cache warm-up before the actual boundary lookup.
+        let client = MockClient::default();
+        let call_count = client.get_messages_call_count.clone();
+
+        let _ = get_messages(&client, ChatTarget::Id(1), 20, Some("2020-01-01"), false).await;
+
+        let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count >= 2,
+            "expected at least 2 get_messages calls (1 warm-up + 1 actual), got {count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_since_utc_skips_warm_up() {
+        // Without --since-utc, no extra warm-up call should be made.
+        let client = MockClient::default();
+        let call_count = client.get_messages_call_count.clone();
+
+        let _ = get_messages(&client, ChatTarget::Id(1), 20, None, false).await;
+
+        let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        // Warm-up adds 1 extra; without it, only the real fetch calls happen
+        // The real fetch makes at least 1 call; warm-up would add an extra early call.
+        // We verify the first call isn't a limit=1 warm-up by checking no early single call.
+        // Simplest assertion: count should be the same as the baseline without warm-up.
+        // With 2 messages in MockClient and limit=20, exactly 1 get_messages call is made.
+        assert_eq!(count, 1, "without --since-utc, expected 1 get_messages call, got {count}");
     }
 }
