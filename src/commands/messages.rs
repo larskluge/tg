@@ -2,6 +2,13 @@ use crate::client::{BoundaryResult, TelegramClient};
 use crate::error::{Result, TgError};
 use crate::output::MessageInfo;
 
+/// How many times to retry `get_boundary_message_id` when TDLib returns `None`
+/// (i.e. `msg.id == 0`, indicating the local cache hasn't synced yet).
+const BOUNDARY_RETRY_MAX: usize = 5;
+/// Milliseconds to wait between boundary retries. Each attempt also triggers a
+/// `get_messages` call to nudge TDLib into fetching from the server.
+const BOUNDARY_RETRY_DELAY_MS: u64 = 300;
+
 pub enum ChatTarget {
     Id(i64),
     Name(String),
@@ -50,7 +57,20 @@ pub async fn get_messages<C: TelegramClient>(
 
     let until_message_id = if let Some(date_str) = since_utc {
         let timestamp = parse_since_date(date_str)?;
-        match client.get_boundary_message_id(chat_id, timestamp).await? {
+        // TDLib's local cache may be stale, causing `get_boundary_message_id` to return
+        // `None` (msg.id == 0) even when messages exist on the server. We retry up to
+        // BOUNDARY_RETRY_MAX times: each iteration nudges TDLib by fetching 1 message
+        // (triggering a server sync), then waits briefly before retrying the boundary lookup.
+        let mut boundary = client.get_boundary_message_id(chat_id, timestamp).await?;
+        for _ in 0..BOUNDARY_RETRY_MAX {
+            if !matches!(boundary, BoundaryResult::None) {
+                break;
+            }
+            let _ = client.get_messages(chat_id, 1, None).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(BOUNDARY_RETRY_DELAY_MS)).await;
+            boundary = client.get_boundary_message_id(chat_id, timestamp).await?;
+        }
+        match boundary {
             BoundaryResult::Empty => {
                 return Ok(MessagesResult {
                     chat_id,
@@ -301,5 +321,54 @@ mod tests {
             .await
             .unwrap();
         assert!(result.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn since_utc_no_retry_when_boundary_found() {
+        // When boundary is found immediately, no retry nudge calls should happen.
+        use crate::client::mock::MockClient;
+        let client = MockClient {
+            boundary_result: BoundaryResult::BoundAt(1),
+            ..MockClient::default()
+        };
+        let call_count = client.get_messages_call_count.clone();
+
+        let _ = get_messages(&client, ChatTarget::Id(1), 20, Some("2020-01-01"), false).await;
+
+        // Only the actual fetch call(s) — no retry nudges
+        let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(count, 1, "no retry nudges expected when boundary found immediately, got {count}");
+    }
+
+    #[tokio::test]
+    async fn since_utc_retries_when_boundary_none() {
+        // When boundary returns None (stale cache), the loop should nudge TDLib
+        // via get_messages calls until BOUNDARY_RETRY_MAX is exhausted.
+        let client = MockClient {
+            boundary_result: BoundaryResult::None,
+            ..MockClient::default()
+        };
+        let call_count = client.get_messages_call_count.clone();
+
+        let _ = get_messages(&client, ChatTarget::Id(1), 20, Some("2020-01-01"), false).await;
+
+        // Should have made BOUNDARY_RETRY_MAX nudge calls + 1 final actual fetch
+        let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            count >= BOUNDARY_RETRY_MAX,
+            "expected at least {BOUNDARY_RETRY_MAX} get_messages calls (retry nudges), got {count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_since_utc_skips_retry_loop() {
+        // Without --since-utc, no boundary lookup or retry nudges occur.
+        let client = MockClient::default();
+        let call_count = client.get_messages_call_count.clone();
+
+        let _ = get_messages(&client, ChatTarget::Id(1), 20, None, false).await;
+
+        let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(count, 1, "without --since-utc, expected exactly 1 get_messages call, got {count}");
     }
 }

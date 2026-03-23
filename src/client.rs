@@ -2467,6 +2467,8 @@ pub mod mock {
         pub inaccessible_chat_ids: Vec<i64>,
         /// Result returned by `get_boundary_message_id`
         pub boundary_result: BoundaryResult,
+        /// Tracks how many times `get_messages` has been called
+        pub get_messages_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockClient {
@@ -2523,6 +2525,7 @@ pub mod mock {
                 ],
                 inaccessible_chat_ids: vec![],
                 boundary_result: BoundaryResult::None,
+                get_messages_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -2637,6 +2640,7 @@ pub mod mock {
             limit: i32,
             until_message_id: Option<i64>,
         ) -> Result<Vec<MessageInfo>> {
+            self.get_messages_call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.inaccessible_chat_ids.contains(&chat_id) {
                 return Err(TgError::ChatInaccessible(chat_id));
             }
