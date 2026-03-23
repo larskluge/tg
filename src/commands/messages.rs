@@ -48,6 +48,13 @@ pub async fn get_messages<C: TelegramClient>(
         ChatTarget::Name(name) => client.find_chat_by_name(&name).await?,
     };
 
+    // When --since-utc is used, TDLib's local cache may be stale.
+    // A warm-up call forces TDLib to sync with the server.
+    if since_utc.is_some() {
+        let _ = client.get_messages(chat_id, 1, None).await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    }
+
     let until_message_id = if let Some(date_str) = since_utc {
         let timestamp = parse_since_date(date_str)?;
         match client.get_boundary_message_id(chat_id, timestamp).await? {
