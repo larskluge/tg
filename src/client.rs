@@ -100,6 +100,42 @@ pub struct TdLibClient {
     shutdown: Arc<AtomicBool>,
     /// Handle to the receive loop thread
     receive_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Saved from start() for deferred wait_for_sync()
+    sync_receiver: Option<broadcast::Receiver<tdlib_rs::enums::Update>>,
+    /// Whether ConnectionState::Ready was seen during auth
+    connection_ready: bool,
+}
+
+/// Wait for TDLib's connection to reach `ConnectionState::Ready`, indicating
+/// that the server sync (downloading updates received while offline) is complete.
+/// Returns immediately if `connection_ready` is already true.
+/// Times out after `timeout` duration if Ready never arrives.
+async fn wait_for_connection_sync(
+    mut receiver: broadcast::Receiver<tdlib_rs::enums::Update>,
+    connection_ready: bool,
+    timeout: std::time::Duration,
+) {
+    use tdlib_rs::enums::{ConnectionState, Update};
+
+    if connection_ready {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, receiver.recv()).await {
+            Ok(Ok(Update::ConnectionState(cs))) => {
+                if matches!(cs.state, ConnectionState::Ready) {
+                    break;
+                }
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
 }
 
 impl TdLibClient {
@@ -125,6 +161,8 @@ impl TdLibClient {
             update_sender,
             shutdown: Arc::new(AtomicBool::new(false)),
             receive_handle: Arc::new(Mutex::new(None)),
+            sync_receiver: None,
+            connection_ready: false,
         })
     }
 
@@ -266,7 +304,7 @@ impl TdLibClient {
         // Trigger TDLib to start sending updates
         let _ = tdlib_rs::functions::get_option("version".to_string(), client_id).await;
 
-        // Phase 1: Wait for authentication to complete
+        // Wait for authentication to complete
         let mut connection_ready = false;
         loop {
             match receiver.recv().await {
@@ -306,32 +344,31 @@ impl TdLibClient {
             }
         }
 
-        // Phase 2: Wait for TDLib to finish syncing updates from the server.
-        // After auth, TDLib downloads the "difference" (updates received while offline),
-        // transitioning through ConnectionState: Connecting → Updating → Ready.
-        // Without this wait, getChatHistory may return stale local data because TDLib
-        // hasn't processed the incoming updates yet.
-        if !connection_ready {
-            let timeout = tokio::time::Duration::from_secs(5);
-            let deadline = tokio::time::Instant::now() + timeout;
-            loop {
-                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                match tokio::time::timeout(remaining, receiver.recv()).await {
-                    Ok(Ok(Update::ConnectionState(cs))) => {
-                        if matches!(cs.state, ConnectionState::Ready) {
-                            break;
-                        }
-                    }
-                    Ok(Ok(_)) => {}
-                    Ok(Err(_)) | Err(_) => break,
-                }
-            }
-        }
+        // Save state for optional wait_for_sync() call
+        self.sync_receiver = Some(receiver);
+        self.connection_ready = connection_ready;
 
         Ok(())
+    }
+
+    /// Wait for TDLib to finish syncing updates from the server.
+    /// After auth, TDLib downloads the "difference" (updates received while offline),
+    /// transitioning through ConnectionState: Connecting → Updating → Ready.
+    /// Without this wait, getChatHistory may return stale local data because TDLib
+    /// hasn't processed the incoming updates yet.
+    ///
+    /// Only needed before commands that require a fully synced cache (e.g. --since-utc).
+    pub async fn wait_for_sync(&mut self) {
+        let receiver = match self.sync_receiver.take() {
+            Some(r) => r,
+            None => return,
+        };
+        wait_for_connection_sync(
+            receiver,
+            self.connection_ready,
+            tokio::time::Duration::from_secs(5),
+        )
+        .await;
     }
 
     async fn get_client_id(&self) -> Result<i32> {
@@ -3707,5 +3744,62 @@ mod tests {
 
         assert!(exited.load(Ordering::Relaxed));
         assert!(client.receive_handle.lock().await.is_none());
+    }
+
+    // --- wait_for_connection_sync tests ---
+
+    #[tokio::test]
+    async fn wait_for_sync_returns_immediately_when_already_ready() {
+        let (tx, rx) = broadcast::channel::<tdlib_rs::enums::Update>(16);
+        let start = tokio::time::Instant::now();
+        wait_for_connection_sync(rx, true, Duration::from_secs(5)).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(100), "should return immediately, took {elapsed:?}");
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn wait_for_sync_waits_for_connection_ready() {
+        use tdlib_rs::enums::{ConnectionState, Update};
+        let (tx, rx) = broadcast::channel::<Update>(16);
+
+        // Send ConnectionState::Ready after a short delay
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(Update::ConnectionState(
+                tdlib_rs::types::UpdateConnectionState {
+                    state: ConnectionState::Ready,
+                },
+            ));
+        });
+
+        let start = tokio::time::Instant::now();
+        wait_for_connection_sync(rx, false, Duration::from_secs(5)).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "should resolve quickly after Ready, took {elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn wait_for_sync_times_out_when_no_ready() {
+        let (tx, rx) = broadcast::channel::<tdlib_rs::enums::Update>(16);
+
+        // Send non-Ready updates to keep the receiver alive
+        tokio::spawn(async move {
+            for _ in 0..10 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let _ = tx.send(tdlib_rs::enums::Update::ConnectionState(
+                    tdlib_rs::types::UpdateConnectionState {
+                        state: tdlib_rs::enums::ConnectionState::Updating,
+                    },
+                ));
+            }
+        });
+
+        let timeout = Duration::from_millis(200);
+        let start = tokio::time::Instant::now();
+        wait_for_connection_sync(rx, false, timeout).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= timeout, "should wait at least the timeout duration, took {elapsed:?}");
+        assert!(elapsed < timeout + Duration::from_millis(200), "should not wait much longer than timeout, took {elapsed:?}");
     }
 }

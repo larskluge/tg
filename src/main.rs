@@ -196,6 +196,9 @@ async fn run_command(
 
         Command::Messages(args) => {
             client.start().await?;
+            if args.since_utc.is_some() {
+                client.wait_for_sync().await;
+            }
             let target = if let Some(id) = args.chat {
                 messages::ChatTarget::Id(id)
             } else {
