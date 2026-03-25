@@ -106,6 +106,9 @@ pub struct TdLibClient {
     connection_ready: bool,
 }
 
+/// Maximum seconds to wait for TDLib to finish syncing updates from the server.
+const SYNC_TIMEOUT_SECS: u64 = 5;
+
 /// Wait for TDLib's connection to reach `ConnectionState::Ready`, indicating
 /// that the server sync (downloading updates received while offline) is complete.
 /// Returns immediately if `connection_ready` is already true.
@@ -134,6 +137,11 @@ async fn wait_for_connection_sync(
                 }
             }
             Ok(Ok(_)) => {}
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
+                // Updates were dropped due to slow consumption, but the channel
+                // is still open — the Ready update may still arrive.
+                continue;
+            }
             Ok(Err(_)) | Err(_) => {
                 eprintln!("Warning: TDLib sync interrupted; results may be stale");
                 return;
@@ -370,7 +378,7 @@ impl TdLibClient {
         wait_for_connection_sync(
             receiver,
             self.connection_ready,
-            tokio::time::Duration::from_secs(5),
+            tokio::time::Duration::from_secs(SYNC_TIMEOUT_SECS),
         )
         .await;
     }

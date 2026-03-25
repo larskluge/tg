@@ -53,9 +53,9 @@ pub async fn get_messages<C: TelegramClient>(
         ChatTarget::Name(name) => client.find_chat_by_name(&name).await?,
     };
 
-    let until_message_id = if let Some(date_str) = since_utc {
-        let timestamp = parse_since_date(date_str)?;
+    let since_timestamp = since_utc.map(parse_since_date).transpose()?;
 
+    let until_message_id = if let Some(timestamp) = since_timestamp {
         // Warm up TDLib's local cache by fetching the latest message first. This
         // triggers getChatHistory(only_local=false), forcing TDLib to sync from the
         // server. Without this, getChatMessageByDate and subsequent getChatHistory
@@ -109,8 +109,7 @@ pub async fn get_messages<C: TelegramClient>(
     // When --since-utc was specified but the boundary lookup failed (stale index),
     // we fetched without a message-ID boundary. Filter by timestamp so callers
     // never receive messages older than the requested cutoff.
-    let messages = if let (Some(date_str), None) = (since_utc, until_message_id) {
-        let ts = parse_since_date(date_str)?;
+    let messages = if let (Some(ts), None) = (since_timestamp, until_message_id) {
         messages
             .into_iter()
             .filter(|m| m.timestamp >= ts)
@@ -342,6 +341,62 @@ mod tests {
             .await
             .unwrap();
         assert!(result.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn since_utc_empty_boundary_with_newer_warmup_falls_through() {
+        // When BoundaryResult::Empty but the warmup fetch found a message newer
+        // than the requested timestamp, the function should NOT short-circuit to
+        // empty. Instead it fetches without a boundary and filters by timestamp.
+        use crate::output::MessageInfo;
+        let newer_ts = 1772323200 + 3600; // 1h after 2026-03-01 00:00 UTC
+        let older_ts = 1772323200 - 3600; // 1h before
+        let client = MockClient {
+            boundary_result: BoundaryResult::Empty,
+            messages: vec![
+                MessageInfo {
+                    id: 10,
+                    chat_id: 1,
+                    sender: "Alice".to_string(),
+                    text: "new msg".to_string(),
+                    date: "1h ago".to_string(),
+                    timestamp: newer_ts,
+                    is_outgoing: false,
+                    edit_date: None,
+                    content_type: Some("text".to_string()),
+                    is_downloadable: false,
+                    download_files: vec![],
+                    content: None,
+                },
+                MessageInfo {
+                    id: 9,
+                    chat_id: 1,
+                    sender: "Alice".to_string(),
+                    text: "old msg".to_string(),
+                    date: "2h ago".to_string(),
+                    timestamp: older_ts,
+                    is_outgoing: false,
+                    edit_date: None,
+                    content_type: Some("text".to_string()),
+                    is_downloadable: false,
+                    download_files: vec![],
+                    content: None,
+                },
+            ],
+            ..MockClient::default()
+        };
+        let result = get_messages(
+            &client,
+            ChatTarget::Id(1),
+            20,
+            Some("2026-03-01"),
+            false,
+        )
+        .await
+        .unwrap();
+        // Should include the newer message, exclude the older one
+        assert_eq!(result.messages.len(), 1, "should filter to only messages >= since timestamp");
+        assert_eq!(result.messages[0].id, 10);
     }
 
     #[tokio::test]
