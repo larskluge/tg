@@ -2,11 +2,9 @@ use crate::client::{BoundaryResult, TelegramClient};
 use crate::error::{Result, TgError};
 use crate::output::MessageInfo;
 
-/// How many times to retry `get_boundary_message_id` when TDLib returns `None`
-/// (i.e. `msg.id == 0`, indicating the local cache hasn't synced yet).
-const BOUNDARY_RETRY_MAX: usize = 5;
-/// Milliseconds to wait between boundary retries. Each attempt also triggers a
-/// `get_messages` call to nudge TDLib into fetching from the server.
+/// Milliseconds to wait before a single retry of `get_boundary_message_id`.
+/// The warmup fetch and `wait_for_sync()` handle most sync cases, but
+/// TDLib's boundary index may still lag briefly — one retry covers that race.
 const BOUNDARY_RETRY_DELAY_MS: u64 = 300;
 
 pub enum ChatTarget {
@@ -69,10 +67,7 @@ pub async fn get_messages<C: TelegramClient>(
             .unwrap_or(false);
 
         let mut boundary = client.get_boundary_message_id(chat_id, timestamp).await?;
-        for _ in 0..BOUNDARY_RETRY_MAX {
-            if !matches!(boundary, BoundaryResult::None) {
-                break;
-            }
+        if matches!(boundary, BoundaryResult::None) {
             tokio::time::sleep(tokio::time::Duration::from_millis(BOUNDARY_RETRY_DELAY_MS)).await;
             boundary = client.get_boundary_message_id(chat_id, timestamp).await?;
         }
@@ -368,8 +363,8 @@ mod tests {
 
     #[tokio::test]
     async fn since_utc_retries_when_boundary_none() {
-        // When boundary returns None (stale cache), the loop should nudge TDLib
-        // via get_messages calls until BOUNDARY_RETRY_MAX is exhausted.
+        // When boundary returns None (stale cache), one retry is attempted
+        // but get_messages is only called for warm-up + the final actual fetch.
         let client = MockClient {
             boundary_result: BoundaryResult::None,
             ..MockClient::default()
@@ -378,12 +373,9 @@ mod tests {
 
         let _ = get_messages(&client, ChatTarget::Id(1), 20, Some("2020-01-01"), false).await;
 
-        // 1 warm-up fetch + 1 final actual fetch (retries no longer nudge via get_messages)
+        // 1 warm-up fetch + 1 actual fetch (boundary retry doesn't call get_messages)
         let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            count >= 2,
-            "expected at least 2 get_messages calls (warm-up + actual fetch), got {count}"
-        );
+        assert_eq!(count, 2, "expected 1 warm-up + 1 actual fetch, got {count}");
     }
 
     #[tokio::test]
