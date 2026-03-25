@@ -1692,6 +1692,7 @@ impl MessageHistorySource for TdLibClient {
                 sender,
                 text: extracted.text,
                 date: format_timestamp(msg.date),
+                timestamp: msg.date,
                 is_outgoing: msg.is_outgoing,
                 edit_date: if msg.edit_date == 0 {
                     None
@@ -2567,6 +2568,7 @@ pub mod mock {
                         sender: "John Doe".to_string(),
                         text: "Hello!".to_string(),
                         date: "1h ago".to_string(),
+                        timestamp: 0,
                         is_outgoing: false,
                         edit_date: None,
                         content_type: Some("text".to_string()),
@@ -2580,6 +2582,7 @@ pub mod mock {
                         sender: "You".to_string(),
                         text: "Hi there!".to_string(),
                         date: "30m ago".to_string(),
+                        timestamp: 0,
                         is_outgoing: true,
                         edit_date: None,
                         content_type: Some("text".to_string()),
@@ -3297,6 +3300,7 @@ mod tests {
             sender: "Alice".to_string(),
             text: format!("msg {id}"),
             date: "1h ago".to_string(),
+            timestamp: 0,
             is_outgoing: false,
             edit_date: None,
             content_type: Some("text".to_string()),
