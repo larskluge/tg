@@ -256,7 +256,7 @@ impl TdLibClient {
     }
 
     pub async fn start(&mut self) -> Result<()> {
-        use tdlib_rs::enums::AuthorizationState;
+        use tdlib_rs::enums::{AuthorizationState, ConnectionState, Update};
 
         let client_id = self.ensure_client_initialized().await?;
 
@@ -266,18 +266,25 @@ impl TdLibClient {
         // Trigger TDLib to start sending updates
         let _ = tdlib_rs::functions::get_option("version".to_string(), client_id).await;
 
-        // Wait for TDLib to be ready (parameters set + authenticated)
+        // Phase 1: Wait for authentication to complete
+        let mut connection_ready = false;
         loop {
             match receiver.recv().await {
                 Ok(update) => {
-                    if let tdlib_rs::enums::Update::AuthorizationState(state) = update {
+                    // Track connection state updates that arrive during auth
+                    if let Update::ConnectionState(ref cs) = update {
+                        if matches!(cs.state, ConnectionState::Ready) {
+                            connection_ready = true;
+                        }
+                    }
+                    if let Update::AuthorizationState(state) = update {
                         match state.authorization_state {
                             AuthorizationState::WaitTdlibParameters => {
                                 self.ensure_tdlib_parameters(client_id).await?;
                             }
                             AuthorizationState::Ready => {
                                 *self.authenticated.lock().await = true;
-                                return Ok(());
+                                break;
                             }
                             AuthorizationState::WaitPhoneNumber
                             | AuthorizationState::WaitCode(_)
@@ -298,6 +305,33 @@ impl TdLibClient {
                 }
             }
         }
+
+        // Phase 2: Wait for TDLib to finish syncing updates from the server.
+        // After auth, TDLib downloads the "difference" (updates received while offline),
+        // transitioning through ConnectionState: Connecting → Updating → Ready.
+        // Without this wait, getChatHistory may return stale local data because TDLib
+        // hasn't processed the incoming updates yet.
+        if !connection_ready {
+            let timeout = tokio::time::Duration::from_secs(5);
+            let deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                match tokio::time::timeout(remaining, receiver.recv()).await {
+                    Ok(Ok(Update::ConnectionState(cs))) => {
+                        if matches!(cs.state, ConnectionState::Ready) {
+                            break;
+                        }
+                    }
+                    Ok(Ok(_)) => {}
+                    Ok(Err(_)) | Err(_) => break,
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn get_client_id(&self) -> Result<i32> {

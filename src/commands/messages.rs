@@ -57,25 +57,38 @@ pub async fn get_messages<C: TelegramClient>(
 
     let until_message_id = if let Some(date_str) = since_utc {
         let timestamp = parse_since_date(date_str)?;
-        // TDLib's local cache may be stale, causing `get_boundary_message_id` to return
-        // `None` (msg.id == 0) even when messages exist on the server. We retry up to
-        // BOUNDARY_RETRY_MAX times: each iteration nudges TDLib by fetching 1 message
-        // (triggering a server sync), then waits briefly before retrying the boundary lookup.
+
+        // Warm up TDLib's local cache by fetching the latest message first. This
+        // triggers getChatHistory(only_local=false), forcing TDLib to sync from the
+        // server. Without this, getChatMessageByDate and subsequent getChatHistory
+        // calls may return stale data from the local cache.
+        let warmup = client.get_messages(chat_id, 1, None).await?;
+        let warmup_has_newer = warmup
+            .first()
+            .map(|m| parse_since_date(&m.date).unwrap_or(0) > timestamp)
+            .unwrap_or(false);
+
         let mut boundary = client.get_boundary_message_id(chat_id, timestamp).await?;
         for _ in 0..BOUNDARY_RETRY_MAX {
             if !matches!(boundary, BoundaryResult::None) {
                 break;
             }
-            let _ = client.get_messages(chat_id, 1, None).await;
             tokio::time::sleep(tokio::time::Duration::from_millis(BOUNDARY_RETRY_DELAY_MS)).await;
             boundary = client.get_boundary_message_id(chat_id, timestamp).await?;
         }
         match boundary {
             BoundaryResult::Empty => {
-                return Ok(MessagesResult {
-                    chat_id,
-                    messages: vec![],
-                });
+                if warmup_has_newer {
+                    // getChatMessageByDate's index is stale but getChatHistory found
+                    // newer messages. Fetch without a boundary — the caller will
+                    // filter by timestamp.
+                    None
+                } else {
+                    return Ok(MessagesResult {
+                        chat_id,
+                        messages: vec![],
+                    });
+                }
             }
             BoundaryResult::BoundAt(id) => Some(id),
             BoundaryResult::None => None,
@@ -335,9 +348,9 @@ mod tests {
 
         let _ = get_messages(&client, ChatTarget::Id(1), 20, Some("2020-01-01"), false).await;
 
-        // Only the actual fetch call(s) — no retry nudges
+        // 1 warm-up fetch + 1 actual fetch — no retry nudges
         let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(count, 1, "no retry nudges expected when boundary found immediately, got {count}");
+        assert_eq!(count, 2, "expected 1 warm-up + 1 actual fetch when boundary found immediately, got {count}");
     }
 
     #[tokio::test]
@@ -352,11 +365,11 @@ mod tests {
 
         let _ = get_messages(&client, ChatTarget::Id(1), 20, Some("2020-01-01"), false).await;
 
-        // Should have made BOUNDARY_RETRY_MAX nudge calls + 1 final actual fetch
+        // 1 warm-up fetch + 1 final actual fetch (retries no longer nudge via get_messages)
         let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
         assert!(
-            count >= BOUNDARY_RETRY_MAX,
-            "expected at least {BOUNDARY_RETRY_MAX} get_messages calls (retry nudges), got {count}"
+            count >= 2,
+            "expected at least 2 get_messages calls (warm-up + actual fetch), got {count}"
         );
     }
 
