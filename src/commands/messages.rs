@@ -111,6 +111,19 @@ pub async fn get_messages<C: TelegramClient>(
             .await?
     };
 
+    // When --since-utc was specified but the boundary lookup failed (stale index),
+    // we fetched without a message-ID boundary. Filter by timestamp so callers
+    // never receive messages older than the requested cutoff.
+    let messages = if since_utc.is_some() && until_message_id.is_none() {
+        let ts = parse_since_date(since_utc.unwrap())?;
+        messages
+            .into_iter()
+            .filter(|m| parse_since_date(&m.date).unwrap_or(0) >= ts)
+            .collect()
+    } else {
+        messages
+    };
+
     Ok(MessagesResult { chat_id, messages })
 }
 
