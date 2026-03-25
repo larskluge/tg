@@ -124,16 +124,20 @@ async fn wait_for_connection_sync(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            break;
+            eprintln!("Warning: TDLib sync timed out after {}s; results may be stale", timeout.as_secs());
+            return;
         }
         match tokio::time::timeout(remaining, receiver.recv()).await {
             Ok(Ok(Update::ConnectionState(cs))) => {
                 if matches!(cs.state, ConnectionState::Ready) {
-                    break;
+                    return;
                 }
             }
             Ok(Ok(_)) => {}
-            Ok(Err(_)) | Err(_) => break,
+            Ok(Err(_)) | Err(_) => {
+                eprintln!("Warning: TDLib sync interrupted; results may be stale");
+                return;
+            }
         }
     }
 }
