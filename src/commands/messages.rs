@@ -357,6 +357,7 @@ mod tests {
                 MessageInfo {
                     id: 10,
                     chat_id: 1,
+                    sender_id: Some(300),
                     sender: "Alice".to_string(),
                     text: "new msg".to_string(),
                     date: "1h ago".to_string(),
@@ -371,6 +372,7 @@ mod tests {
                 MessageInfo {
                     id: 9,
                     chat_id: 1,
+                    sender_id: Some(300),
                     sender: "Alice".to_string(),
                     text: "old msg".to_string(),
                     date: "2h ago".to_string(),

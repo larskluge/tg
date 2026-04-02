@@ -1719,25 +1719,28 @@ impl MessageHistorySource for TdLibClient {
         let mut result = Vec::new();
         for msg in unwrap_messages(msgs_enum).messages.into_iter().flatten() {
             let extracted = extract_message_data(&msg.content);
-            let sender = match &msg.sender_id {
+            let (sender_id, sender) = match &msg.sender_id {
                 tdlib_rs::enums::MessageSender::User(u) => {
-                    if let Ok(ue) = tdlib_rs::functions::get_user(u.user_id, client_id).await {
+                    let name = if let Ok(ue) = tdlib_rs::functions::get_user(u.user_id, client_id).await {
                         get_user_full_name(&unwrap_user(ue))
                     } else {
                         "Unknown".to_string()
-                    }
+                    };
+                    (Some(u.user_id), name)
                 }
                 tdlib_rs::enums::MessageSender::Chat(c) => {
-                    if let Ok(ce) = tdlib_rs::functions::get_chat(c.chat_id, client_id).await {
+                    let name = if let Ok(ce) = tdlib_rs::functions::get_chat(c.chat_id, client_id).await {
                         unwrap_chat(ce).title
                     } else {
                         "Unknown".to_string()
-                    }
+                    };
+                    (None, name)
                 }
             };
             result.push(MessageInfo {
                 id: msg.id,
                 chat_id: msg.chat_id,
+                sender_id,
                 sender,
                 text: extracted.text,
                 date: format_timestamp(msg.date),
@@ -2614,6 +2617,7 @@ pub mod mock {
                     MessageInfo {
                         id: 1,
                         chat_id: 1,
+                        sender_id: Some(100),
                         sender: "John Doe".to_string(),
                         text: "Hello!".to_string(),
                         date: "1h ago".to_string(),
@@ -2628,6 +2632,7 @@ pub mod mock {
                     MessageInfo {
                         id: 2,
                         chat_id: 1,
+                        sender_id: Some(200),
                         sender: "You".to_string(),
                         text: "Hi there!".to_string(),
                         date: "30m ago".to_string(),
@@ -3346,6 +3351,7 @@ mod tests {
         MessageInfo {
             id,
             chat_id: 1,
+            sender_id: Some(300),
             sender: "Alice".to_string(),
             text: format!("msg {id}"),
             date: "1h ago".to_string(),

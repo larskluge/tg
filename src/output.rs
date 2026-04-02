@@ -352,7 +352,11 @@ fn messages_table_string(messages: &[MessageInfo]) -> String {
         let sender = if message.is_outgoing {
             "You".to_string()
         } else {
-            message.sender.clone()
+            if let Some(id) = message.sender_id {
+                format!("{} ({})", message.sender, id)
+            } else {
+                message.sender.clone()
+            }
         };
         table.add_row(vec![
             Cell::new(message.id),
@@ -683,6 +687,7 @@ pub struct MessageFileRef {
 pub struct MessageInfo {
     pub id: i64,
     pub chat_id: i64,
+    pub sender_id: Option<i64>,
     pub sender: String,
     pub text: String,
     pub date: String,
@@ -705,7 +710,11 @@ impl PlainText for MessageInfo {
         let sender = if self.is_outgoing {
             "You".blue().to_string()
         } else {
-            self.sender.green().to_string()
+            if let Some(id) = self.sender_id {
+                format!("{} ({})", self.sender.green(), id)
+            } else {
+                self.sender.green().to_string()
+            }
         };
         format!("[{}] {}: {}", self.date.dimmed(), sender, self.text)
     }
@@ -921,6 +930,7 @@ mod tests {
         let msg = MessageInfo {
             id: 1,
             chat_id: 123,
+            sender_id: Some(400),
             sender: "John".to_string(),
             text: "Hello!".to_string(),
             date: "2024-01-01 12:00".to_string(),
@@ -935,6 +945,7 @@ mod tests {
         let text = msg.to_plain_text();
         assert!(text.contains("2024-01-01 12:00"));
         assert!(text.contains("John"));
+        assert!(text.contains("(400)"));
         assert!(text.contains("Hello!"));
     }
 
@@ -943,6 +954,7 @@ mod tests {
         let msg = MessageInfo {
             id: 1,
             chat_id: 123,
+            sender_id: Some(500),
             sender: "Me".to_string(),
             text: "Hi there!".to_string(),
             date: "2024-01-01 12:00".to_string(),
@@ -964,6 +976,7 @@ mod tests {
         let msgs = vec![MessageInfo {
             id: 1,
             chat_id: 123,
+            sender_id: Some(400),
             sender: "John".to_string(),
             text: "[Photo: 720x1280]".to_string(),
             date: "2026-02-25T17:45:12Z".to_string(),
@@ -984,6 +997,7 @@ mod tests {
         let msgs = vec![MessageInfo {
             id: 42,
             chat_id: 123,
+            sender_id: Some(300),
             sender: "Alice".to_string(),
             text: "[Emoji: 😀]".to_string(),
             date: "2026-02-25T17:45:12Z".to_string(),
@@ -1003,7 +1017,7 @@ mod tests {
         assert!(table.contains("Message"));
         assert!(table.contains("42"));
         assert!(table.contains("2026-02-25T17:45:12Z"));
-        assert!(table.contains("Alice"));
+        assert!(table.contains("Alice (300)"));
         assert!(table.contains("[Emoji: 😀]"));
     }
 
@@ -1012,6 +1026,7 @@ mod tests {
         let msg = MessageInfo {
             id: 1,
             chat_id: 123,
+            sender_id: Some(300),
             sender: "Alice".to_string(),
             text: "Audio: Song".to_string(),
             date: "1h ago".to_string(),
@@ -1046,10 +1061,55 @@ mod tests {
 
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"chat_id\":123"));
+        assert!(json.contains("\"sender_id\":300"));
         assert!(json.contains("\"content_type\":\"audio\""));
         assert!(json.contains("\"is_downloadable\":true"));
         assert!(json.contains("\"download_files\""));
         assert!(json.contains("\"kind\":\"audio\""));
+    }
+
+    #[test]
+    fn anonymous_sender_has_null_sender_id_in_json() {
+        let msg = MessageInfo {
+            id: 1,
+            chat_id: -1001234567890,
+            sender_id: None,
+            sender: "Tech Channel".to_string(),
+            text: "Channel announcement".to_string(),
+            date: "2024-01-01 12:00".to_string(),
+            timestamp: 0,
+            is_outgoing: false,
+            edit_date: None,
+            content_type: None,
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"sender_id\":null"));
+        assert!(json.contains("\"sender\":\"Tech Channel\""));
+    }
+
+    #[test]
+    fn anonymous_sender_plain_text_omits_id() {
+        let msg = MessageInfo {
+            id: 1,
+            chat_id: -1001234567890,
+            sender_id: None,
+            sender: "Tech Channel".to_string(),
+            text: "Channel announcement".to_string(),
+            date: "2024-01-01 12:00".to_string(),
+            timestamp: 0,
+            is_outgoing: false,
+            edit_date: None,
+            content_type: None,
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+        };
+        let text = msg.to_plain_text();
+        assert!(text.contains("Tech Channel"));
+        assert!(!text.contains("("));
     }
 
     #[test]
@@ -1097,6 +1157,7 @@ mod tests {
         let msg = MessageInfo {
             id: 1,
             chat_id: 123,
+            sender_id: Some(300),
             sender: "Alice".to_string(),
             text: "Hello".to_string(),
             date: "2024-01-01T00:00:00Z".to_string(),
@@ -1117,6 +1178,7 @@ mod tests {
         let msg = MessageInfo {
             id: 1,
             chat_id: 123,
+            sender_id: Some(300),
             sender: "Alice".to_string(),
             text: "Hello (edited)".to_string(),
             date: "2024-01-01T00:00:00Z".to_string(),
