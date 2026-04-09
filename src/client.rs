@@ -353,6 +353,11 @@ impl TdLibClient {
                         }
                     }
                 }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Updates were dropped due to slow consumption during startup;
+                    // the auth state update we care about may still arrive.
+                    continue;
+                }
                 Err(e) => {
                     return Err(TgError::Other(format!("Update channel error: {}", e)));
                 }
@@ -2031,6 +2036,11 @@ impl TelegramClient for TdLibClient {
                             _ => {}
                         }
                     }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Updates were dropped due to slow consumption during auth;
+                    // the auth state update we care about may still arrive.
+                    continue;
                 }
                 Err(e) => {
                     return Err(TgError::Other(format!("Update channel error: {}", e)));
