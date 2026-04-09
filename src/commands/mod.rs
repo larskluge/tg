@@ -7,3 +7,4 @@ pub mod messages;
 pub mod search;
 pub mod send;
 pub mod unread;
+pub mod whoami;

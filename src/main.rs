@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use tg::cli::{Cli, Command};
 use tg::client::TdLibClient;
 use tg::commands::{
-    chats, download, groups, mark_read, mark_unread, messages, search, send, unread,
+    chats, download, groups, mark_read, mark_unread, messages, search, send, unread, whoami,
 };
 use tg::credentials::{self, ApiCredentials};
 use tg::error::{Result, TgError};
@@ -247,6 +247,12 @@ async fn run_command(
                 }
                 _ => {}
             }
+        }
+
+        Command::Whoami => {
+            client.start().await?;
+            let info = whoami::whoami(client).await?;
+            print_output(format, &info);
         }
 
         Command::MarkRead(args) => {

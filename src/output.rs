@@ -791,6 +791,36 @@ impl PlainText for DownloadReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct UserInfo {
+    pub id: i64,
+    pub first_name: String,
+    pub last_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phone: Option<String>,
+}
+
+impl PlainText for UserInfo {
+    fn to_plain_text(&self) -> String {
+        let mut parts = vec![format!("ID: {}", self.id)];
+        let name = if self.last_name.is_empty() {
+            self.first_name.clone()
+        } else {
+            format!("{} {}", self.first_name, self.last_name)
+        };
+        parts.push(format!("Name: {}", name));
+        if let Some(ref username) = self.username {
+            parts.push(format!("Username: @{}", username));
+        }
+        if let Some(ref phone) = self.phone {
+            parts.push(format!("Phone: {}", phone));
+        }
+        parts.join("\n")
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct SendResult {
     pub message_id: i64,
     pub chat_id: i64,

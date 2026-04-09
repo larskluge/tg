@@ -77,6 +77,8 @@ pub trait TelegramClient: Send + Sync {
         options: DownloadOptions,
     ) -> Result<DownloadReport>;
 
+    async fn get_me(&self) -> Result<crate::output::UserInfo>;
+
     async fn mark_chat_as_read(&self, chat_id: i64) -> Result<()>;
     async fn mark_chat_as_unread(&self, chat_id: i64) -> Result<()>;
 }
@@ -2304,6 +2306,27 @@ impl TelegramClient for TdLibClient {
         })
     }
 
+    async fn get_me(&self) -> Result<crate::output::UserInfo> {
+        let client_id = self.get_client_id().await?;
+        let user_enum = tdlib_rs::functions::get_me(client_id)
+            .await
+            .map_err(|e| TgError::TdLib(e.message))?;
+        let tdlib_rs::enums::User::User(user) = user_enum;
+        let username = user.usernames.map(|u| u.editable_username).filter(|u| !u.is_empty());
+        let phone = if user.phone_number.is_empty() {
+            None
+        } else {
+            Some(user.phone_number)
+        };
+        Ok(crate::output::UserInfo {
+            id: user.id,
+            first_name: user.first_name,
+            last_name: user.last_name,
+            username,
+            phone,
+        })
+    }
+
     async fn mark_chat_as_read(&self, chat_id: i64) -> Result<()> {
         let client_id = self.get_client_id().await?;
 
@@ -2773,6 +2796,16 @@ pub mod mock {
                 content_type: None,
                 content: None,
                 files: vec![],
+            })
+        }
+
+        async fn get_me(&self) -> Result<crate::output::UserInfo> {
+            Ok(crate::output::UserInfo {
+                id: 42,
+                first_name: "John".to_string(),
+                last_name: "Doe".to_string(),
+                username: Some("johndoe".to_string()),
+                phone: Some("+1234567890".to_string()),
             })
         }
 

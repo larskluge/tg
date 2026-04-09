@@ -48,6 +48,9 @@ pub enum Command {
 
     /// Search contacts by name
     Search(SearchArgs),
+
+    /// Show your Telegram user info (ID, name, username, phone)
+    Whoami,
 }
 
 #[derive(Parser, Debug)]
