@@ -4,11 +4,12 @@ use std::process::ExitCode;
 
 use tg::bot_api;
 use tg::cli::{Cli, Command};
-use tg::client::{TdLibClient, TelegramClient};
+use tg::client::TdLibClient;
 use tg::commands::{
     chats, download, groups, mark_read, mark_unread, messages, search, send, unread, whoami,
 };
 use tg::credentials::{self, ApiCredentials, BotEntry, CredentialsFile};
+use tg::resolve::{self, Recipient};
 use tg::error::{Result, TgError};
 use tg::output::{
     DownloadStatus, OutputFormat, SendResult, print_chats_table, print_contacts_table, print_error,
@@ -175,7 +176,16 @@ async fn run_bot_send(
     .clone();
 
     // Resolve the recipient
-    let chat_id = resolve_recipient(args, &creds_file, data_dir).await?;
+    let recipient = if let Some(ref to) = args.to {
+        Recipient::To(to.clone())
+    } else if let Some(id) = args.id {
+        Recipient::Id(id)
+    } else if let Some(ref group) = args.group {
+        Recipient::Group(group.clone())
+    } else {
+        Recipient::Name(args.name.clone().unwrap())
+    };
+    let chat_id = resolve::resolve_recipient(recipient, &creds_file, data_dir).await?;
 
     let message_id = bot_api::send_message(&bot.token, chat_id, &args.message).await?;
 
@@ -185,116 +195,6 @@ async fn run_bot_send(
     };
     print_output(format, &result);
     Ok(())
-}
-
-async fn resolve_recipient(
-    args: &tg::cli::SendArgs,
-    creds_file: &CredentialsFile,
-    data_dir: &std::path::Path,
-) -> Result<i64> {
-    // --to takes priority, then --id, then --group, then positional name
-    if let Some(ref to) = args.to {
-        // Try parsing as numeric ID first
-        if let Ok(id) = to.parse::<i64>() {
-            return Ok(id);
-        }
-        if to.starts_with('@') {
-            // @username: check stored credentials, then TDLib username search
-            if let Some(id) = creds_file.resolve_username(to) {
-                return Ok(id);
-            }
-            return resolve_username_via_tdlib(to, creds_file, data_dir).await;
-        }
-        // No @: search by display name via TDLib
-        let api_creds = creds_file.api_credentials();
-        if api_creds.api_id == 0 {
-            return Err(TgError::Other(format!(
-                "Cannot resolve \"{to}\". Run `tg auth` first or use a numeric ID."
-            )));
-        }
-        let mut client = TdLibClient::new(api_creds.api_id, api_creds.api_hash)?;
-        client.start().await?;
-        let chat_id = client.find_chat_by_name(to).await;
-        client.shutdown().await;
-        return chat_id;
-    }
-
-    if let Some(id) = args.id {
-        return Ok(id);
-    }
-
-    if let Some(ref group) = args.group {
-        // Groups need TDLib resolution
-        let api_creds = creds_file.api_credentials();
-        if api_creds.api_id == 0 {
-            return Err(TgError::Other(format!(
-                "Cannot resolve group \"{group}\". Run `tg auth` first or use a numeric ID."
-            )));
-        }
-        let mut client = TdLibClient::new(api_creds.api_id, api_creds.api_hash)?;
-        client.start().await?;
-        let chat_id = client.find_group_by_name(group).await;
-        client.shutdown().await;
-        return chat_id;
-    }
-
-    if let Some(ref name) = args.name {
-        // Try as @username first
-        if name.starts_with('@') {
-            if let Some(id) = creds_file.resolve_username(name) {
-                return Ok(id);
-            }
-            return resolve_username_via_tdlib(name, creds_file, data_dir).await;
-        }
-        // Name-based resolution needs TDLib
-        let api_creds = creds_file.api_credentials();
-        if api_creds.api_id == 0 {
-            return Err(TgError::Other(format!(
-                "Cannot resolve \"{name}\". Run `tg auth` first or use a numeric ID."
-            )));
-        }
-        let mut client = TdLibClient::new(api_creds.api_id, api_creds.api_hash)?;
-        client.start().await?;
-        let chat_id = client.find_chat_by_name(name).await;
-        client.shutdown().await;
-        return chat_id;
-    }
-
-    Err(TgError::Other(
-        "No recipient specified. Use --to, --id, --group, or a contact name.".to_string(),
-    ))
-}
-
-async fn resolve_username_via_tdlib(
-    username: &str,
-    creds_file: &CredentialsFile,
-    data_dir: &std::path::Path,
-) -> Result<i64> {
-    let api_creds = creds_file.api_credentials();
-    if api_creds.api_id == 0 {
-        return Err(TgError::Other(format!(
-            "Cannot resolve {username}. Run `tg auth` first or use a numeric ID."
-        )));
-    }
-
-    let mut client = TdLibClient::new(api_creds.api_id, api_creds.api_hash)?;
-    client.start().await?;
-
-    let needle = username.strip_prefix('@').unwrap_or(username);
-    let chat_id = client.find_chat_by_username(needle).await;
-    client.shutdown().await;
-
-    let chat_id = chat_id?;
-
-    // Cache the resolved contact
-    let mut updated_creds = credentials::load_credentials_file(data_dir)?;
-    updated_creds.upsert_known_contact(credentials::KnownContact {
-        id: chat_id,
-        username: needle.to_string(),
-    });
-    credentials::save_credentials_file(&updated_creds, data_dir)?;
-
-    Ok(chat_id)
 }
 
 #[derive(Clone, Copy, Debug)]

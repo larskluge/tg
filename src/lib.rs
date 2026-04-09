@@ -6,6 +6,7 @@ pub mod commands;
 pub mod credentials;
 pub mod error;
 pub mod output;
+pub mod resolve;
 
 pub use cli::{Cli, Command};
 pub use client::{TdLibClient, TelegramClient};

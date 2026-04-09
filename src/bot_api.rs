@@ -35,9 +35,15 @@ fn parse_response<T: serde::de::DeserializeOwned>(resp: TelegramResponse<T>) -> 
     }
 }
 
+fn http_client() -> reqwest::Client {
+    // Reuse via once_cell to avoid creating a new client (and connection pool) per call.
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new).clone()
+}
+
 pub async fn get_me(token: &str) -> Result<BotUser> {
-    let client = reqwest::Client::new();
-    let resp: TelegramResponse<BotUser> = client
+    let resp: TelegramResponse<BotUser> = http_client()
         .get(api_url(token, "getMe"))
         .send()
         .await
@@ -50,8 +56,7 @@ pub async fn get_me(token: &str) -> Result<BotUser> {
 }
 
 pub async fn send_message(token: &str, chat_id: i64, text: &str) -> Result<i64> {
-    let client = reqwest::Client::new();
-    let resp: TelegramResponse<SentMessage> = client
+    let resp: TelegramResponse<SentMessage> = http_client()
         .post(api_url(token, "sendMessage"))
         .json(&serde_json::json!({
             "chat_id": chat_id,

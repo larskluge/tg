@@ -87,7 +87,7 @@ tg send --id 123456789 -m "Hello!"
 tg send --to @username -m "Hello!"
 tg send --group "Family" -m "Hi all!"
 
-# Send as a bot
+# Send as a bot (plain text only, no Markdown/HTML formatting)
 tg send --as @mybot --to @someone -m "Hello from bot!"
 tg send --as @mybot --to 123456789 -m "Hello!"
 
