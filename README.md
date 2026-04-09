@@ -5,9 +5,10 @@ A modern CLI tool for interacting with Telegram, built in Rust using [TDLib](htt
 ## Features
 
 - **Authentication** — interactive login with phone number, verification code, and optional 2FA
+- **Bot support** — authenticate bots and send messages as a bot via the Telegram Bot HTTP API
 - **Chats & Groups** — list direct message chats, group chats, or unread conversations
 - **Messages** — read message history with date filtering (`--since-utc`)
-- **Send** — send messages to contacts or groups by name or chat ID
+- **Send** — send messages to contacts or groups by name, @username, or chat ID
 - **Search** — find contacts by name
 - **Download** — download media attachments from messages
 - **Mark read/unread** — manage read state of chats
@@ -57,6 +58,17 @@ export TG_PHONE=+1234567890
 tg auth
 ```
 
+### Bot authentication
+
+Authenticate a bot using its token from [@BotFather](https://t.me/BotFather):
+
+```bash
+tg auth bot
+tg auth bot --token 123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11
+```
+
+The token can also be set via `TG_BOT_TOKEN`. Bot credentials (username, ID, token) are stored alongside your user credentials.
+
 ## Usage
 
 ```bash
@@ -72,7 +84,12 @@ tg messages --chat -1001666847309 [--limit 20]
 # Send messages
 tg send "John Doe" -m "Hello!"
 tg send --id 123456789 -m "Hello!"
+tg send --to @username -m "Hello!"
 tg send --group "Family" -m "Hi all!"
+
+# Send as a bot
+tg send --as @mybot --to @someone -m "Hello from bot!"
+tg send --as @mybot --to 123456789 -m "Hello!"
 
 # Download media
 tg download --chat -1001666847309 --message 42 [--output-dir .] [--priority 16]
