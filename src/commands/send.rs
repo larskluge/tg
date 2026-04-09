@@ -25,6 +25,7 @@ pub async fn send_message<C: TelegramClient>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::TelegramClient;
     use crate::client::mock::MockClient;
     use crate::error::TgError;
 
@@ -55,5 +56,27 @@ mod tests {
         let client = MockClient::default();
         let result = send_message(&client, SendTarget::Name("Unknown".to_string()), "Hello").await;
         assert!(matches!(result, Err(TgError::ContactNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn find_chat_by_username_found() {
+        let client = MockClient::default();
+        // "johndoe" is in mock contacts with username
+        let result = client.find_chat_by_username("johndoe").await;
+        assert_eq!(result.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn find_chat_by_username_not_found() {
+        let client = MockClient::default();
+        let result = client.find_chat_by_username("nonexistent").await;
+        assert!(matches!(result, Err(TgError::ContactNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn find_chat_by_username_case_insensitive() {
+        let client = MockClient::default();
+        let result = client.find_chat_by_username("JohnDoe").await;
+        assert_eq!(result.unwrap(), 1);
     }
 }

@@ -52,6 +52,7 @@ pub trait TelegramClient: Send + Sync {
     async fn search_contacts(&self, query: &str) -> Result<Vec<ContactInfo>>;
 
     async fn find_chat_by_name(&self, name: &str) -> Result<i64>;
+    async fn find_chat_by_username(&self, username: &str) -> Result<i64>;
     async fn find_group_by_name(&self, name: &str) -> Result<i64>;
 
     async fn send_message(&self, chat_id: i64, text: &str) -> Result<SendResult>;
@@ -2006,6 +2007,16 @@ impl TelegramClient for TdLibClient {
             .ok_or_else(|| TgError::ContactNotFound(name.to_string()))
     }
 
+    async fn find_chat_by_username(&self, username: &str) -> Result<i64> {
+        let client_id = self.get_client_id().await?;
+        let chat_enum =
+            tdlib_rs::functions::search_public_chat(username.to_string(), client_id)
+                .await
+                .map_err(|e| TgError::ContactNotFound(format!("@{username}: {}", e.message)))?;
+        let chat = unwrap_chat(chat_enum);
+        Ok(chat.id)
+    }
+
     async fn find_group_by_name(&self, name: &str) -> Result<i64> {
         let client_id = self.get_client_id().await?;
 
@@ -2731,6 +2742,18 @@ pub mod mock {
                 .find(|c| c.name.to_lowercase().contains(&name.to_lowercase()))
                 .map(|c| c.id)
                 .ok_or_else(|| TgError::ContactNotFound(name.to_string()))
+        }
+
+        async fn find_chat_by_username(&self, username: &str) -> Result<i64> {
+            self.contacts
+                .iter()
+                .find(|c| {
+                    c.username
+                        .as_deref()
+                        .is_some_and(|u| u.eq_ignore_ascii_case(username))
+                })
+                .map(|c| c.id)
+                .ok_or_else(|| TgError::ContactNotFound(format!("@{username}")))
         }
 
         async fn find_group_by_name(&self, name: &str) -> Result<i64> {

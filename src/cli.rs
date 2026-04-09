@@ -54,12 +54,28 @@ pub enum Command {
 }
 
 #[derive(Parser, Debug)]
-pub struct AuthArgs {}
+pub struct AuthArgs {
+    #[command(subcommand)]
+    pub subcommand: Option<AuthSubcommand>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuthSubcommand {
+    /// Authenticate a bot with its token
+    Bot(AuthBotArgs),
+}
+
+#[derive(Parser, Debug)]
+pub struct AuthBotArgs {
+    /// Bot token from @BotFather (or set TG_BOT_TOKEN env var)
+    #[arg(long, env = "TG_BOT_TOKEN")]
+    pub token: Option<String>,
+}
 
 #[derive(Parser, Debug)]
 pub struct SendArgs {
-    /// Contact name (required unless --id or --group is provided)
-    #[arg(required_unless_present_any = ["id", "group"])]
+    /// Contact name (required unless --id, --to, or --group is provided)
+    #[arg(required_unless_present_any = ["id", "group", "to"])]
     pub name: Option<String>,
 
     /// Message text
@@ -69,6 +85,14 @@ pub struct SendArgs {
     /// Chat ID (for piping from search)
     #[arg(long, allow_hyphen_values = true)]
     pub id: Option<i64>,
+
+    /// Recipient by @username or numeric ID
+    #[arg(long)]
+    pub to: Option<String>,
+
+    /// Send as a bot (@username or numeric ID, must be authenticated via `tg auth-bot`)
+    #[arg(long = "as")]
+    pub send_as: Option<String>,
 
     /// Group name to send to
     #[arg(long)]
@@ -615,5 +639,89 @@ mod tests {
             }
             _ => panic!("Expected MarkUnread command"),
         }
+    }
+
+    #[test]
+    fn parse_auth_bot() {
+        let cli = Cli::parse_from(["tg", "auth", "bot"]);
+        match cli.command {
+            Command::Auth(args) => {
+                assert!(matches!(args.subcommand, Some(AuthSubcommand::Bot(_))));
+            }
+            _ => panic!("Expected Auth command"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_bot_with_token() {
+        let cli = Cli::parse_from(["tg", "auth", "bot", "--token", "123:ABC"]);
+        match cli.command {
+            Command::Auth(args) => match args.subcommand {
+                Some(AuthSubcommand::Bot(bot_args)) => {
+                    assert_eq!(bot_args.token, Some("123:ABC".to_string()));
+                }
+                _ => panic!("Expected Auth Bot subcommand"),
+            },
+            _ => panic!("Expected Auth command"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_without_subcommand() {
+        let cli = Cli::parse_from(["tg", "auth"]);
+        match cli.command {
+            Command::Auth(args) => {
+                assert!(args.subcommand.is_none());
+            }
+            _ => panic!("Expected Auth command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_with_as_and_to() {
+        let cli = Cli::parse_from([
+            "tg", "send", "--as", "@mybot", "--to", "@someone", "-m", "hello",
+        ]);
+        match cli.command {
+            Command::Send(args) => {
+                assert_eq!(args.send_as, Some("@mybot".to_string()));
+                assert_eq!(args.to, Some("@someone".to_string()));
+                assert_eq!(args.message, "hello");
+                assert_eq!(args.name, None);
+            }
+            _ => panic!("Expected Send command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_with_to_numeric() {
+        let cli = Cli::parse_from(["tg", "send", "--to", "123456", "-m", "hi"]);
+        match cli.command {
+            Command::Send(args) => {
+                assert_eq!(args.to, Some("123456".to_string()));
+                assert_eq!(args.send_as, None);
+                assert_eq!(args.name, None);
+            }
+            _ => panic!("Expected Send command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_with_to_name() {
+        let cli = Cli::parse_from(["tg", "send", "--to", "John Doe", "-m", "hi"]);
+        match cli.command {
+            Command::Send(args) => {
+                assert_eq!(args.to, Some("John Doe".to_string()));
+                assert_eq!(args.name, None);
+            }
+            _ => panic!("Expected Send command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_with_as_only_requires_to_or_id_or_name() {
+        // --as alone without a recipient should fail
+        let cli = Cli::try_parse_from(["tg", "send", "--as", "@mybot", "-m", "hi"]);
+        assert!(cli.is_err());
     }
 }
