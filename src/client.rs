@@ -655,7 +655,6 @@ struct ExtractedMessageData {
 
 /// Extract the TDLib type name from a MessageContent variant using its Debug representation.
 /// E.g. `MessagePremiumGiftCode(...)` → `"messagePremiumGiftCode"`, `MessageUnsupported` → `"messageUnsupported"`.
-#[cfg(test)]
 fn tdlib_type_name(content: &tdlib_rs::enums::MessageContent) -> String {
     let debug = format!("{content:?}");
     let variant = debug.split(['(', ' ']).next().unwrap_or(&debug);
@@ -1051,6 +1050,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 tdlib_rs::enums::CallDiscardReason::Declined => "declined",
                 tdlib_rs::enums::CallDiscardReason::Disconnected => "disconnected",
                 tdlib_rs::enums::CallDiscardReason::HungUp => "hung_up",
+                _ => "other",
             }
             .to_string();
             let kind = if c.is_video { "Video call" } else { "Call" };
@@ -1146,28 +1146,28 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }
         }
         MessageContent::MessageStory(s) => {
-            let text = format!("Story from chat {}", s.story_sender_chat_id);
+            let text = format!("Story from chat {}", s.story_poster_chat_id);
             ExtractedMessageData {
                 text,
                 content_type: Some("story".to_string()),
                 is_downloadable: false,
                 download_files: vec![],
                 content: Some(MessageContentDetails::Story {
-                    story_sender_chat_id: s.story_sender_chat_id,
+                    story_poster_chat_id: s.story_poster_chat_id,
                     story_id: s.story_id,
                     via_mention: s.via_mention,
                 }),
             }
         }
         MessageContent::MessageInvoice(inv) => {
-            let text = format!("Invoice: {} ({} {})", inv.title, inv.total_amount, inv.currency);
+            let text = format!("Invoice: {} ({} {})", inv.product_info.title, inv.total_amount, inv.currency);
             ExtractedMessageData {
                 text,
                 content_type: Some("invoice".to_string()),
                 is_downloadable: false,
                 download_files: vec![],
                 content: Some(MessageContentDetails::Invoice {
-                    title: inv.title.clone(),
+                    title: inv.product_info.title.clone(),
                     currency: inv.currency.clone(),
                     total_amount: inv.total_amount,
                     is_test: inv.is_test,
@@ -1323,16 +1323,15 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatSetTheme(t) => ExtractedMessageData {
-            text: if t.theme_name.is_empty() {
-                "Chat theme reset".to_string()
-            } else {
-                format!("Chat theme set to: {}", t.theme_name)
+            text: match &t.theme {
+                Some(_) => format!("Chat theme set to: {:?}", t.theme),
+                None => "Chat theme reset".to_string(),
             },
             content_type: Some("chat_set_theme".to_string()),
             is_downloadable: false,
             download_files: vec![],
             content: Some(MessageContentDetails::ChatSetTheme {
-                theme_name: t.theme_name.clone(),
+                theme: t.theme.as_ref().map(|th| format!("{th:?}")),
             }),
         },
         MessageContent::MessageChatSetMessageAutoDeleteTime(t) => ExtractedMessageData {
@@ -1463,49 +1462,44 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 code: g.code.clone(),
             }),
         },
-        MessageContent::MessagePremiumGiveawayCreated => ExtractedMessageData {
+        MessageContent::MessageGiveawayCreated(_) => ExtractedMessageData {
             text: "Premium giveaway created".to_string(),
             content_type: Some("premium_giveaway_created".to_string()),
             is_downloadable: false,
             download_files: vec![],
-            content: Some(MessageContentDetails::PremiumGiveawayCreated {}),
+            content: Some(MessageContentDetails::GiveawayCreated {}),
         },
-        MessageContent::MessagePremiumGiveaway(g) => ExtractedMessageData {
-            text: format!(
-                "Premium giveaway ({} winners, {} months)",
-                g.winner_count, g.month_count
-            ),
+        MessageContent::MessageGiveaway(g) => ExtractedMessageData {
+            text: format!("Premium giveaway ({} winners)", g.winner_count),
             content_type: Some("premium_giveaway".to_string()),
             is_downloadable: false,
             download_files: vec![],
-            content: Some(MessageContentDetails::PremiumGiveaway {
+            content: Some(MessageContentDetails::Giveaway {
                 winner_count: g.winner_count,
-                month_count: g.month_count,
             }),
         },
-        MessageContent::MessagePremiumGiveawayCompleted(g) => ExtractedMessageData {
+        MessageContent::MessageGiveawayCompleted(g) => ExtractedMessageData {
             text: format!("Premium giveaway completed ({} winners)", g.winner_count),
             content_type: Some("premium_giveaway_completed".to_string()),
             is_downloadable: false,
             download_files: vec![],
-            content: Some(MessageContentDetails::PremiumGiveawayCompleted {
+            content: Some(MessageContentDetails::GiveawayCompleted {
                 giveaway_message_id: g.giveaway_message_id,
                 winner_count: g.winner_count,
                 unclaimed_prize_count: g.unclaimed_prize_count,
             }),
         },
-        MessageContent::MessagePremiumGiveawayWinners(g) => ExtractedMessageData {
+        MessageContent::MessageGiveawayWinners(g) => ExtractedMessageData {
             text: format!("Premium giveaway winners ({} winners)", g.winner_count),
             content_type: Some("premium_giveaway_winners".to_string()),
             is_downloadable: false,
             download_files: vec![],
-            content: Some(MessageContentDetails::PremiumGiveawayWinners {
+            content: Some(MessageContentDetails::GiveawayWinners {
                 boosted_chat_id: g.boosted_chat_id,
                 giveaway_message_id: g.giveaway_message_id,
                 winner_count: g.winner_count,
                 winner_user_ids: g.winner_user_ids.clone(),
                 unclaimed_prize_count: g.unclaimed_prize_count,
-                month_count: g.month_count,
             }),
         },
         MessageContent::MessageUsersShared(u) => ExtractedMessageData {
@@ -1586,10 +1580,113 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             download_files: vec![],
             content: Some(MessageContentDetails::ExpiredVoiceNote {}),
         },
+        MessageContent::MessageGroupCall(g) => {
+            let kind = if g.is_video { "Video call" } else { "Group call" };
+            let text = if g.duration > 0 {
+                format!("{kind} ({} sec)", g.duration)
+            } else if g.was_missed {
+                format!("{kind} (missed)")
+            } else {
+                format!("{kind}")
+            };
+            ExtractedMessageData {
+                text,
+                content_type: Some("group_call".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::GroupCall {
+                    is_video: g.is_video,
+                    duration: g.duration,
+                }),
+            }
+        }
+        MessageContent::MessageGiftedStars(g) => ExtractedMessageData {
+            text: format!("Gifted {} stars", g.star_count),
+            content_type: Some("gifted_stars".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::GiftedStars {
+                gifter_user_id: g.gifter_user_id,
+                receiver_user_id: g.receiver_user_id,
+                star_count: g.star_count,
+            }),
+        },
+        MessageContent::MessagePaidMedia(p) => {
+            let caption = if p.caption.text.is_empty() {
+                None
+            } else {
+                Some(p.caption.text.clone())
+            };
+            ExtractedMessageData {
+                text: format!("Paid media ({} stars)", p.star_count),
+                content_type: Some("paid_media".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::PaidMedia {
+                    star_count: p.star_count,
+                    caption,
+                }),
+            }
+        }
+        MessageContent::MessageGift(_) => ExtractedMessageData {
+            text: "Gift".to_string(),
+            content_type: Some("gift".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::Gift {}),
+        },
+        MessageContent::MessageGiveawayPrizeStars(g) => ExtractedMessageData {
+            text: format!("Giveaway prize: {} stars", g.star_count),
+            content_type: Some("giveaway_prize_stars".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::GiveawayPrizeStars {
+                star_count: g.star_count,
+                giveaway_message_id: g.giveaway_message_id,
+            }),
+        },
+        MessageContent::MessageChatOwnerChanged(o) => ExtractedMessageData {
+            text: format!("Chat owner changed to user {}", o.new_owner_user_id),
+            content_type: Some("chat_owner_changed".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatOwnerChanged {
+                new_owner_user_id: o.new_owner_user_id,
+            }),
+        },
+        MessageContent::MessageChatOwnerLeft(o) => ExtractedMessageData {
+            text: "Chat owner left".to_string(),
+            content_type: Some("chat_owner_left".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::ChatOwnerLeft {
+                new_owner_user_id: o.new_owner_user_id,
+            }),
+        },
+        MessageContent::MessagePaymentRefunded(r) => ExtractedMessageData {
+            text: format!("Payment refunded ({} {})", r.total_amount, r.currency),
+            content_type: Some("payment_refunded".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: Some(MessageContentDetails::PaymentRefunded {
+                currency: r.currency.clone(),
+                total_amount: r.total_amount,
+            }),
+        },
         MessageContent::MessageUnsupported => {
             let tdlib_type = "messageUnsupported".to_string();
             ExtractedMessageData {
                 text: "[Unsupported]".to_string(),
+                content_type: Some("unsupported".to_string()),
+                is_downloadable: false,
+                download_files: vec![],
+                content: Some(MessageContentDetails::Unsupported { tdlib_type }),
+            }
+        }
+        other => {
+            let tdlib_type = tdlib_type_name(other);
+            ExtractedMessageData {
+                text: format!("[{}]", tdlib_type),
                 content_type: Some("unsupported".to_string()),
                 is_downloadable: false,
                 download_files: vec![],
@@ -2059,7 +2156,7 @@ impl TelegramClient for TdLibClient {
         let mut receiver = self.update_sender.subscribe();
 
         let message_enum =
-            tdlib_rs::functions::send_message(chat_id, 0, None, None, content, client_id)
+            tdlib_rs::functions::send_message(chat_id, None, None, None, content, client_id)
                 .await
                 .map_err(|e| TgError::TdLib(e.message))?;
 
@@ -2946,6 +3043,7 @@ mod tests {
                 caption: formatted(""),
                 has_spoiler: false,
                 is_secret: false,
+                show_caption_above_media: false,
             });
 
         let extracted = extract_message_data(&content);
@@ -2972,7 +3070,6 @@ mod tests {
                     needs_repainting: false,
                 },
             ),
-            outline: vec![],
             thumbnail: None,
             sticker: file(6, "/tmp/emoji.webp"),
         };
@@ -3087,6 +3184,7 @@ mod tests {
                 caption: formatted(""),
                 has_spoiler: false,
                 is_secret: false,
+                show_caption_above_media: false,
             });
 
         let extracted = extract_message_data(&content);

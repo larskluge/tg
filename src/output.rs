@@ -515,7 +515,7 @@ pub enum MessageContentDetails {
         description: String,
     },
     Story {
-        story_sender_chat_id: i64,
+        story_poster_chat_id: i64,
         story_id: i32,
         via_mention: bool,
     },
@@ -572,7 +572,7 @@ pub enum MessageContentDetails {
         only_for_self: bool,
     },
     ChatSetTheme {
-        theme_name: String,
+        theme: Option<String>,
     },
     ChatSetMessageAutoDeleteTime {
         message_auto_delete_time: i32,
@@ -620,23 +620,21 @@ pub enum MessageContentDetails {
         month_count: i32,
         code: String,
     },
-    PremiumGiveaway {
+    Giveaway {
         winner_count: i32,
-        month_count: i32,
     },
-    PremiumGiveawayCompleted {
+    GiveawayCompleted {
         giveaway_message_id: i64,
         winner_count: i32,
         unclaimed_prize_count: i32,
     },
-    PremiumGiveawayCreated {},
-    PremiumGiveawayWinners {
+    GiveawayCreated {},
+    GiveawayWinners {
         boosted_chat_id: i64,
         giveaway_message_id: i64,
         winner_count: i32,
         winner_user_ids: Vec<i64>,
         unclaimed_prize_count: i32,
-        month_count: i32,
     },
     UsersShared {
         button_id: i32,
@@ -656,6 +654,34 @@ pub enum MessageContentDetails {
     ExpiredVideo {},
     ExpiredVideoNote {},
     ExpiredVoiceNote {},
+    GroupCall {
+        is_video: bool,
+        duration: i32,
+    },
+    GiftedStars {
+        gifter_user_id: i64,
+        receiver_user_id: i64,
+        star_count: i64,
+    },
+    PaidMedia {
+        star_count: i64,
+        caption: Option<String>,
+    },
+    Gift {},
+    GiveawayPrizeStars {
+        star_count: i64,
+        giveaway_message_id: i64,
+    },
+    ChatOwnerChanged {
+        new_owner_user_id: i64,
+    },
+    ChatOwnerLeft {
+        new_owner_user_id: i64,
+    },
+    PaymentRefunded {
+        currency: String,
+        total_amount: i64,
+    },
     Unsupported {
         tdlib_type: String,
     },
