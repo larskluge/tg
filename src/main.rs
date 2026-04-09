@@ -169,7 +169,7 @@ async fn run_bot_send(
     }
     .ok_or_else(|| {
         TgError::Other(format!(
-            "Bot {send_as} not found. Run `tg auth-bot` first."
+            "Bot {send_as} not found. Run `tg auth bot` first."
         ))
     })?
     .clone();
@@ -207,6 +207,11 @@ async fn resolve_recipient(
         }
         // No @: search by display name via TDLib
         let api_creds = creds_file.api_credentials();
+        if api_creds.api_id == 0 {
+            return Err(TgError::Other(format!(
+                "Cannot resolve \"{to}\". Run `tg auth` first or use a numeric ID."
+            )));
+        }
         let mut client = TdLibClient::new(api_creds.api_id, api_creds.api_hash)?;
         client.start().await?;
         let chat_id = client.find_chat_by_name(to).await;
@@ -221,6 +226,11 @@ async fn resolve_recipient(
     if let Some(ref group) = args.group {
         // Groups need TDLib resolution
         let api_creds = creds_file.api_credentials();
+        if api_creds.api_id == 0 {
+            return Err(TgError::Other(format!(
+                "Cannot resolve group \"{group}\". Run `tg auth` first or use a numeric ID."
+            )));
+        }
         let mut client = TdLibClient::new(api_creds.api_id, api_creds.api_hash)?;
         client.start().await?;
         let chat_id = client.find_group_by_name(group).await;
@@ -238,6 +248,11 @@ async fn resolve_recipient(
         }
         // Name-based resolution needs TDLib
         let api_creds = creds_file.api_credentials();
+        if api_creds.api_id == 0 {
+            return Err(TgError::Other(format!(
+                "Cannot resolve \"{name}\". Run `tg auth` first or use a numeric ID."
+            )));
+        }
         let mut client = TdLibClient::new(api_creds.api_id, api_creds.api_hash)?;
         client.start().await?;
         let chat_id = client.find_chat_by_name(name).await;

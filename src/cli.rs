@@ -87,10 +87,10 @@ pub struct SendArgs {
     pub id: Option<i64>,
 
     /// Recipient by @username or numeric ID
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub to: Option<String>,
 
-    /// Send as a bot (@username or numeric ID, must be authenticated via `tg auth-bot`)
+    /// Send as a bot (@username or numeric ID, must be authenticated via `tg auth bot`)
     #[arg(long = "as")]
     pub send_as: Option<String>,
 
