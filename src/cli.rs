@@ -49,6 +49,9 @@ pub enum Command {
     /// Search contacts by name
     Search(SearchArgs),
 
+    /// Bulk-sync messages for multiple chats (reads chat_id:HWM map from stdin JSON)
+    Sync(SyncArgs),
+
     /// Show your Telegram user info (ID, name, username, phone)
     Whoami,
 }
@@ -188,6 +191,17 @@ pub struct MarkUnreadArgs {
 pub struct SearchArgs {
     /// Name to search for
     pub query: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct SyncArgs {
+    /// Override all HWMs with now minus N days (for reconciliation sweeps)
+    #[arg(long)]
+    pub reconcile_days: Option<u32>,
+
+    /// Maximum messages per chat
+    #[arg(long, default_value = "1000")]
+    pub limit: i32,
 }
 
 #[cfg(test)]
@@ -723,5 +737,39 @@ mod tests {
         // --as alone without a recipient should fail
         let cli = Cli::try_parse_from(["tg", "send", "--as", "@mybot", "-m", "hi"]);
         assert!(cli.is_err());
+    }
+
+    #[test]
+    fn parse_sync_defaults() {
+        let cli = Cli::parse_from(["tg", "sync"]);
+        match cli.command {
+            Command::Sync(args) => {
+                assert_eq!(args.limit, 1000);
+                assert!(args.reconcile_days.is_none());
+            }
+            _ => panic!("Expected Sync command"),
+        }
+    }
+
+    #[test]
+    fn parse_sync_with_reconcile_days() {
+        let cli = Cli::parse_from(["tg", "sync", "--reconcile-days", "7"]);
+        match cli.command {
+            Command::Sync(args) => {
+                assert_eq!(args.reconcile_days, Some(7));
+            }
+            _ => panic!("Expected Sync command"),
+        }
+    }
+
+    #[test]
+    fn parse_sync_with_limit() {
+        let cli = Cli::parse_from(["tg", "sync", "--limit", "500"]);
+        match cli.command {
+            Command::Sync(args) => {
+                assert_eq!(args.limit, 500);
+            }
+            _ => panic!("Expected Sync command"),
+        }
     }
 }

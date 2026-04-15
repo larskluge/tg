@@ -400,6 +400,10 @@ async fn run_command(
             mark_unread::mark_as_unread(client, target).await?;
             print_success("Chat marked as unread");
         }
+
+        Command::Sync(_args) => {
+            todo!("sync command not yet implemented")
+        }
     }
 
     Ok(())
