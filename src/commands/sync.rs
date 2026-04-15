@@ -28,6 +28,10 @@ pub fn parse_hwm_input(input: &str) -> std::result::Result<HashMap<i64, String>,
     Ok(result)
 }
 
+/// Bulk-sync messages for multiple chats within a single TDLib session.
+///
+/// For each chat in `hwm_map`, fetches messages newer than the HWM timestamp.
+/// If `reconcile_days` is set, all HWMs are overridden with `now - N days`.
 pub async fn sync_chats<C: TelegramClient>(
     client: &C,
     hwm_map: HashMap<i64, String>,
