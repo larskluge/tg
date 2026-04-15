@@ -274,4 +274,43 @@ mod tests {
             SyncResult::Messages(_) => panic!("expected error for invalid date"),
         }
     }
+
+    #[test]
+    fn sync_result_messages_serializes_as_array() {
+        let result = SyncResult::Messages(vec![make_message(1, 1, 1000)]);
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.is_array(), "Messages variant should serialize as JSON array");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn sync_result_empty_messages_serializes_as_empty_array() {
+        let result = SyncResult::Messages(vec![]);
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.is_array());
+        assert!(json.as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_result_error_serializes_as_object() {
+        let result = SyncResult::Error { error: "Chat not found".to_string() };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.is_object(), "Error variant should serialize as JSON object");
+        assert_eq!(json["error"], "Chat not found");
+    }
+
+    #[test]
+    fn full_sync_output_serializes_correctly() {
+        let mut results: HashMap<i64, SyncResult> = HashMap::new();
+        results.insert(123, SyncResult::Messages(vec![make_message(1, 123, 1000)]));
+        results.insert(456, SyncResult::Messages(vec![]));
+        results.insert(999, SyncResult::Error { error: "Not found".to_string() });
+
+        let json = serde_json::to_value(&results).unwrap();
+        assert!(json["123"].is_array());
+        assert_eq!(json["123"].as_array().unwrap().len(), 1);
+        assert!(json["456"].is_array());
+        assert!(json["456"].as_array().unwrap().is_empty());
+        assert_eq!(json["999"]["error"], "Not found");
+    }
 }
