@@ -1,4 +1,5 @@
 pub mod chats;
+pub mod sync;
 pub mod download;
 pub mod groups;
 pub mod mark_read;
