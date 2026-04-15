@@ -6,7 +6,7 @@ use tg::bot_api;
 use tg::cli::{Cli, Command};
 use tg::client::TdLibClient;
 use tg::commands::{
-    chats, download, groups, mark_read, mark_unread, messages, search, send, unread, whoami,
+    chats, download, groups, mark_read, mark_unread, messages, search, send, sync, unread, whoami,
 };
 use tg::credentials::{self, ApiCredentials, BotEntry, CredentialsFile};
 use tg::resolve::{self, Recipient};
@@ -401,8 +401,30 @@ async fn run_command(
             print_success("Chat marked as unread");
         }
 
-        Command::Sync(_args) => {
-            todo!("sync command not yet implemented")
+        Command::Sync(args) => {
+            client.start().await?;
+            client.wait_for_sync().await;
+
+            let input = {
+                use std::io::Read;
+                let mut buf = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut buf)
+                    .map_err(|e| TgError::Other(format!("Failed to read stdin: {e}")))?;
+                buf
+            };
+
+            let hwm_map = sync::parse_hwm_input(&input).map_err(|e| TgError::Other(e))?;
+            let results = sync::sync_chats(client, hwm_map, args.limit, args.reconcile_days).await;
+
+            let has_errors = results.values().any(|r| matches!(r, sync::SyncResult::Error { .. }));
+
+            // Always output JSON (machine-only command)
+            println!("{}", serde_json::to_string_pretty(&results).unwrap());
+
+            if has_errors {
+                return Err(TgError::Other("One or more chats failed to sync".to_string()));
+            }
         }
     }
 
