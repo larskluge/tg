@@ -140,11 +140,6 @@ async fn wait_for_connection_sync(
                 }
             }
             Ok(Ok(_)) => {}
-            Ok(Err(broadcast::error::RecvError::Lagged(_))) => {
-                // Updates were dropped due to slow consumption, but the channel
-                // is still open — the Ready update may still arrive.
-                continue;
-            }
             Ok(Err(_)) | Err(_) => {
                 eprintln!("Warning: TDLib sync interrupted; results may be stale");
                 return;
@@ -3983,5 +3978,115 @@ mod tests {
         let elapsed = start.elapsed();
         assert!(elapsed >= timeout, "should wait at least the timeout duration, took {elapsed:?}");
         assert!(elapsed < timeout + Duration::from_millis(200), "should not wait much longer than timeout, took {elapsed:?}");
+    }
+
+    /// Replicates the auth-wait recv loop pattern from start() to test
+    /// that Lagged errors are handled without aborting.
+    async fn auth_wait_loop(
+        mut receiver: broadcast::Receiver<tdlib_rs::enums::Update>,
+    ) -> std::result::Result<(), String> {
+        use tdlib_rs::enums::{AuthorizationState, Update};
+
+        loop {
+            match receiver.recv().await {
+                Ok(update) => {
+                    if let Update::AuthorizationState(state) = update {
+                        match state.authorization_state {
+                            AuthorizationState::Ready => return Ok(()),
+                            _ => {}
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(e) => {
+                    return Err(format!("Update channel error: {}", e));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn start_auth_loop_recovers_from_channel_lag() {
+        use tdlib_rs::enums::{AuthorizationState, Update};
+
+        // Small capacity to easily trigger Lagged
+        let (tx, rx) = broadcast::channel::<Update>(4);
+
+        tokio::spawn(async move {
+            // Overflow the channel — receiver will get Lagged on next recv
+            for _ in 0..8 {
+                let _ = tx.send(Update::ConnectionState(
+                    tdlib_rs::types::UpdateConnectionState {
+                        state: tdlib_rs::enums::ConnectionState::Updating,
+                    },
+                ));
+            }
+            // After lag, send the AuthorizationState::Ready the loop waits for
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(Update::AuthorizationState(
+                tdlib_rs::types::UpdateAuthorizationState {
+                    authorization_state: AuthorizationState::Ready,
+                },
+            ));
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), auth_wait_loop(rx)).await;
+        assert!(result.is_ok(), "should not timeout");
+        assert!(result.unwrap().is_ok(), "should not return Update channel error");
+    }
+
+    #[tokio::test]
+    async fn start_auth_loop_fails_on_lag_without_handling() {
+        use tdlib_rs::enums::{AuthorizationState, Update};
+
+        // Replicate the OLD (broken) pattern: Lagged falls through to Err(e)
+        async fn auth_wait_loop_no_lag_handling(
+            mut receiver: broadcast::Receiver<Update>,
+        ) -> std::result::Result<(), String> {
+            loop {
+                match receiver.recv().await {
+                    Ok(update) => {
+                        if let Update::AuthorizationState(state) = update {
+                            if matches!(state.authorization_state, AuthorizationState::Ready) {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    // No Lagged handler — this is the bug
+                    Err(e) => {
+                        return Err(format!("Update channel error: {}", e));
+                    }
+                }
+            }
+        }
+
+        let (tx, rx) = broadcast::channel::<Update>(4);
+
+        tokio::spawn(async move {
+            for _ in 0..8 {
+                let _ = tx.send(Update::ConnectionState(
+                    tdlib_rs::types::UpdateConnectionState {
+                        state: tdlib_rs::enums::ConnectionState::Updating,
+                    },
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(Update::AuthorizationState(
+                tdlib_rs::types::UpdateAuthorizationState {
+                    authorization_state: AuthorizationState::Ready,
+                },
+            ));
+        });
+
+        let result = tokio::time::timeout(Duration::from_secs(2), auth_wait_loop_no_lag_handling(rx)).await;
+        assert!(result.is_ok(), "should not timeout");
+        let inner = result.unwrap();
+        assert!(inner.is_err(), "without Lagged handling, should return error");
+        assert!(
+            inner.unwrap_err().contains("channel lagged"),
+            "error should mention channel lag"
+        );
     }
 }
