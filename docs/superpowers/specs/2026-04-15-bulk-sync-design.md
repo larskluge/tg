@@ -27,7 +27,7 @@ Object mapping chat ID (string) to ISO 8601 HWM timestamp:
 
 ### Flags
 
-- `--reconcile-days N`: Overrides all per-chat HWMs with `now - N days`. Used for periodic reconciliation sweeps that detect edits and deletions.
+- `--reconcile-days N`: Overrides all per-chat HWMs with `now - N days`. Used for periodic reconciliation sweeps that detect edits and deletions. Stdin is still required (to specify which chats to sync); the HWM values in stdin are ignored when this flag is set.
 - `--limit N`: Max messages per chat. Default: 1000.
 - No `--json` flag — output is always JSON (this command is machine-only).
 
