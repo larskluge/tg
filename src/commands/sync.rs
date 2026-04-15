@@ -16,9 +16,14 @@ pub enum SyncResult {
     Error { error: String },
 }
 
-/// Parse stdin JSON into a map of chat_id -> HWM timestamp string.
-pub fn parse_hwm_input(input: &str) -> std::result::Result<HashMap<i64, String>, String> {
-    let raw: HashMap<String, String> =
+/// Parse stdin JSON into a map of chat_id -> last seen message ID.
+///
+/// Input format: `{"chat_id": last_message_id, ...}`
+/// Example: `{"-1001666847309": 89508544512, "123456789": 42}`
+///
+/// A value of `0` means "fetch all messages" (no prior HWM).
+pub fn parse_hwm_input(input: &str) -> std::result::Result<HashMap<i64, i64>, String> {
+    let raw: HashMap<String, i64> =
         serde_json::from_str(input).map_err(|e| format!("Invalid JSON: {e}"))?;
     let mut result = HashMap::new();
     for (key, value) in raw {
@@ -30,47 +35,76 @@ pub fn parse_hwm_input(input: &str) -> std::result::Result<HashMap<i64, String>,
 
 /// Bulk-sync messages for multiple chats within a single TDLib session.
 ///
-/// For each chat in `hwm_map`, fetches messages newer than the HWM timestamp.
-/// If `reconcile_days` is set, all HWMs are overridden with `now - N days`.
+/// For each chat in `hwm_map`, fetches messages newer than the last seen message ID.
+/// If `reconcile_days` is set, all HWMs are overridden with a message-ID boundary
+/// computed from `now - N days`.
 pub async fn sync_chats<C: TelegramClient>(
     client: &C,
-    hwm_map: HashMap<i64, String>,
+    hwm_map: HashMap<i64, i64>,
     limit: i32,
     reconcile_days: Option<u32>,
 ) -> HashMap<i64, SyncResult> {
-    let effective_hwm_map: HashMap<i64, String> = if let Some(days) = reconcile_days {
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
-        hwm_map
-            .into_keys()
-            .map(|id| (id, cutoff.to_rfc3339()))
-            .collect()
-    } else {
-        hwm_map
-    };
-
     let mut results = HashMap::new();
-    for (chat_id, hwm) in effective_hwm_map {
-        let result = sync_single_chat(client, chat_id, &hwm, limit).await;
-        results.insert(chat_id, result);
+
+    if let Some(days) = reconcile_days {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+        let timestamp = cutoff.timestamp() as i32;
+
+        for &chat_id in hwm_map.keys() {
+            let result =
+                sync_single_chat_by_timestamp(client, chat_id, timestamp, limit).await;
+            results.insert(chat_id, result);
+        }
+    } else {
+        for (chat_id, hwm_message_id) in hwm_map {
+            let result = sync_single_chat(client, chat_id, hwm_message_id, limit).await;
+            results.insert(chat_id, result);
+        }
     }
+
     results
 }
 
+/// Fetch messages newer than `hwm_message_id` for a single chat.
+///
+/// Uses `hwm_message_id` as the inclusive lower boundary for `get_messages`,
+/// then strips the boundary message itself (it was already ingested).
+/// A `hwm_message_id` of 0 means "no prior state — fetch latest messages".
 async fn sync_single_chat<C: TelegramClient>(
     client: &C,
     chat_id: i64,
-    hwm_str: &str,
+    hwm_message_id: i64,
     limit: i32,
 ) -> SyncResult {
-    let timestamp = match crate::commands::messages::parse_since_date(hwm_str) {
-        Ok(ts) => ts,
-        Err(e) => {
-            return SyncResult::Error {
-                error: e.to_string(),
-            };
-        }
+    let until = if hwm_message_id > 0 {
+        Some(hwm_message_id)
+    } else {
+        None
     };
 
+    match client.get_messages(chat_id, limit, until).await {
+        Ok(mut messages) => {
+            // Drop the boundary message itself — it was already ingested
+            if hwm_message_id > 0 {
+                messages.retain(|m| m.id != hwm_message_id);
+            }
+            SyncResult::Messages(messages)
+        }
+        Err(e) => SyncResult::Error {
+            error: e.to_string(),
+        },
+    }
+}
+
+/// Fetch messages newer than a timestamp for a single chat (used by --reconcile-days).
+///
+/// Falls back to timestamp-based boundary lookup since we don't have a message ID.
+async fn sync_single_chat_by_timestamp<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+    timestamp: i32,
+    limit: i32,
+) -> SyncResult {
     // Warmup fetch to trigger TDLib server sync
     if let Err(e) = client.get_messages(chat_id, 1, None).await {
         return SyncResult::Error {
@@ -91,7 +125,6 @@ async fn sync_single_chat<C: TelegramClient>(
         BoundaryResult::Empty => return SyncResult::Messages(vec![]),
         BoundaryResult::BoundAt(id) => (Some(id), false),
         BoundaryResult::None => {
-            // Retry once after delay
             tokio::time::sleep(tokio::time::Duration::from_millis(BOUNDARY_RETRY_DELAY_MS)).await;
             match client.get_boundary_message_id(chat_id, timestamp).await {
                 Ok(BoundaryResult::BoundAt(id)) => (Some(id), false),
@@ -105,26 +138,22 @@ async fn sync_single_chat<C: TelegramClient>(
         }
     };
 
-    let messages = match client.get_messages(chat_id, limit, until_message_id).await {
-        Ok(msgs) => msgs,
-        Err(e) => {
-            return SyncResult::Error {
-                error: e.to_string(),
+    match client.get_messages(chat_id, limit, until_message_id).await {
+        Ok(messages) => {
+            let messages = if no_boundary {
+                messages
+                    .into_iter()
+                    .filter(|m| m.timestamp >= timestamp)
+                    .collect()
+            } else {
+                messages
             };
+            SyncResult::Messages(messages)
         }
-    };
-
-    // If boundary was None (no cutoff), filter by timestamp
-    let messages = if no_boundary {
-        messages
-            .into_iter()
-            .filter(|m| m.timestamp >= timestamp)
-            .collect()
-    } else {
-        messages
-    };
-
-    SyncResult::Messages(messages)
+        Err(e) => SyncResult::Error {
+            error: e.to_string(),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -150,13 +179,22 @@ mod tests {
         }
     }
 
+    // --- parse_hwm_input tests ---
+
     #[test]
     fn parse_hwm_valid() {
-        let input = r#"{"123": "2026-01-01T00:00:00Z", "-456": "2026-06-01T00:00:00Z"}"#;
+        let input = r#"{"123": 42, "-1001666847309": 89508544512}"#;
         let result = parse_hwm_input(input).unwrap();
         assert_eq!(result.len(), 2);
-        assert_eq!(result[&123], "2026-01-01T00:00:00Z");
-        assert_eq!(result[&-456], "2026-06-01T00:00:00Z");
+        assert_eq!(result[&123], 42);
+        assert_eq!(result[&-1001666847309], 89508544512);
+    }
+
+    #[test]
+    fn parse_hwm_zero_means_no_hwm() {
+        let input = r#"{"123": 0}"#;
+        let result = parse_hwm_input(input).unwrap();
+        assert_eq!(result[&123], 0);
     }
 
     #[test]
@@ -176,7 +214,7 @@ mod tests {
 
     #[test]
     fn parse_hwm_non_numeric_chat_id() {
-        let input = r#"{"abc": "2026-01-01T00:00:00Z"}"#;
+        let input = r#"{"abc": 42}"#;
         let err = parse_hwm_input(input).unwrap_err();
         assert!(
             err.contains("Invalid chat ID"),
@@ -184,17 +222,18 @@ mod tests {
         );
     }
 
+    // --- sync_chats tests ---
+
     #[tokio::test]
     async fn sync_happy_path_multiple_chats() {
         let client = MockClient {
-            boundary_result: BoundaryResult::BoundAt(1),
-            messages: vec![make_message(1, 1, 1000), make_message(2, 1, 2000)],
+            messages: vec![make_message(10, 1, 1000), make_message(20, 1, 2000)],
             ..MockClient::default()
         };
 
         let mut hwm_map = HashMap::new();
-        hwm_map.insert(1i64, "2026-01-01T00:00:00Z".to_string());
-        hwm_map.insert(2i64, "2026-01-01T00:00:00Z".to_string());
+        hwm_map.insert(1i64, 5i64); // HWM at msg 5, should get msgs 10 and 20
+        hwm_map.insert(2i64, 5i64);
 
         let results = sync_chats(&client, hwm_map, 20, None).await;
         assert_eq!(results.len(), 2);
@@ -208,6 +247,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_strips_boundary_message() {
+        // If HWM is msg 10, and results include msg 10 (the boundary), it should be stripped
+        let client = MockClient {
+            messages: vec![make_message(10, 1, 1000), make_message(20, 1, 2000)],
+            ..MockClient::default()
+        };
+
+        let mut hwm_map = HashMap::new();
+        hwm_map.insert(1i64, 10i64); // HWM is msg 10 itself
+
+        let results = sync_chats(&client, hwm_map, 20, None).await;
+        match &results[&1] {
+            SyncResult::Messages(msgs) => {
+                assert!(
+                    !msgs.iter().any(|m| m.id == 10),
+                    "boundary message (id=10) should be stripped"
+                );
+                assert!(
+                    msgs.iter().any(|m| m.id == 20),
+                    "newer message (id=20) should be included"
+                );
+            }
+            SyncResult::Error { error } => panic!("unexpected error: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_hwm_zero_fetches_all() {
+        let client = MockClient {
+            messages: vec![make_message(1, 1, 1000), make_message(2, 1, 2000)],
+            ..MockClient::default()
+        };
+
+        let mut hwm_map = HashMap::new();
+        hwm_map.insert(1i64, 0i64); // No prior HWM
+
+        let results = sync_chats(&client, hwm_map, 20, None).await;
+        match &results[&1] {
+            SyncResult::Messages(msgs) => assert_eq!(msgs.len(), 2),
+            SyncResult::Error { error } => panic!("unexpected error: {error}"),
+        }
+    }
+
+    #[tokio::test]
     async fn sync_empty_hwm_map() {
         let client = MockClient::default();
         let results = sync_chats(&client, HashMap::new(), 20, None).await;
@@ -217,15 +300,14 @@ mod tests {
     #[tokio::test]
     async fn sync_partial_failure() {
         let client = MockClient {
-            boundary_result: BoundaryResult::BoundAt(1),
             inaccessible_chat_ids: vec![999],
             messages: vec![make_message(1, 1, 1000)],
             ..MockClient::default()
         };
 
         let mut hwm_map = HashMap::new();
-        hwm_map.insert(1i64, "2026-01-01T00:00:00Z".to_string());
-        hwm_map.insert(999i64, "2026-01-01T00:00:00Z".to_string());
+        hwm_map.insert(1i64, 0i64);
+        hwm_map.insert(999i64, 0i64);
 
         let results = sync_chats(&client, hwm_map, 20, None).await;
         assert_eq!(results.len(), 2);
@@ -242,25 +324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_boundary_empty_returns_empty_messages() {
-        let client = MockClient {
-            boundary_result: BoundaryResult::Empty,
-            messages: vec![make_message(1, 1, 1000)],
-            ..MockClient::default()
-        };
-
-        let mut hwm_map = HashMap::new();
-        hwm_map.insert(1i64, "2037-01-01T00:00:00Z".to_string());
-
-        let results = sync_chats(&client, hwm_map, 20, None).await;
-        match &results[&1] {
-            SyncResult::Messages(msgs) => assert!(msgs.is_empty()),
-            SyncResult::Error { error } => panic!("unexpected error: {error}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn sync_reconcile_days_overrides_hwm() {
+    async fn sync_reconcile_days_uses_timestamp_path() {
         let client = MockClient {
             boundary_result: BoundaryResult::BoundAt(1),
             messages: vec![make_message(1, 1, 1000)],
@@ -268,10 +332,8 @@ mod tests {
         };
 
         let mut hwm_map = HashMap::new();
-        // Far-future HWM that would result in empty if not overridden
-        hwm_map.insert(1i64, "2099-01-01T00:00:00Z".to_string());
+        hwm_map.insert(1i64, 99999i64); // message ID ignored when reconcile_days is set
 
-        // reconcile_days=7 should override to ~7 days ago, giving non-empty results
         let results = sync_chats(&client, hwm_map, 20, Some(7)).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => assert!(!msgs.is_empty()),
@@ -279,24 +341,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn sync_invalid_hwm_timestamp() {
-        let client = MockClient::default();
-
-        let mut hwm_map = HashMap::new();
-        hwm_map.insert(1i64, "not-a-date".to_string());
-
-        let results = sync_chats(&client, hwm_map, 20, None).await;
-        match &results[&1] {
-            SyncResult::Error { error } => {
-                assert!(
-                    error.contains("Invalid date format"),
-                    "expected 'Invalid date format' in: {error}"
-                );
-            }
-            SyncResult::Messages(_) => panic!("expected error for invalid date"),
-        }
-    }
+    // --- serialization tests ---
 
     #[test]
     fn sync_result_messages_serializes_as_array() {
