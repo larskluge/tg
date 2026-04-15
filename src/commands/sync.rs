@@ -22,9 +22,7 @@ pub fn parse_hwm_input(input: &str) -> std::result::Result<HashMap<i64, String>,
         serde_json::from_str(input).map_err(|e| format!("Invalid JSON: {e}"))?;
     let mut result = HashMap::new();
     for (key, value) in raw {
-        let chat_id: i64 = key
-            .parse()
-            .map_err(|_| format!("Invalid chat ID: {key}"))?;
+        let chat_id: i64 = key.parse().map_err(|_| format!("Invalid chat ID: {key}"))?;
         result.insert(chat_id, value);
     }
     Ok(result)
@@ -39,8 +37,8 @@ pub async fn sync_chats<C: TelegramClient>(
     let effective_hwm_map: HashMap<i64, String> = if let Some(days) = reconcile_days {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
         hwm_map
-            .into_iter()
-            .map(|(id, _)| (id, cutoff.to_rfc3339()))
+            .into_keys()
+            .map(|id| (id, cutoff.to_rfc3339()))
             .collect()
     } else {
         hwm_map
@@ -62,17 +60,27 @@ async fn sync_single_chat<C: TelegramClient>(
 ) -> SyncResult {
     let timestamp = match crate::commands::messages::parse_since_date(hwm_str) {
         Ok(ts) => ts,
-        Err(e) => return SyncResult::Error { error: e.to_string() },
+        Err(e) => {
+            return SyncResult::Error {
+                error: e.to_string(),
+            };
+        }
     };
 
     // Warmup fetch to trigger TDLib server sync
     if let Err(e) = client.get_messages(chat_id, 1, None).await {
-        return SyncResult::Error { error: e.to_string() };
+        return SyncResult::Error {
+            error: e.to_string(),
+        };
     }
 
     let boundary = match client.get_boundary_message_id(chat_id, timestamp).await {
         Ok(b) => b,
-        Err(e) => return SyncResult::Error { error: e.to_string() },
+        Err(e) => {
+            return SyncResult::Error {
+                error: e.to_string(),
+            };
+        }
     };
 
     let (until_message_id, no_boundary) = match boundary {
@@ -84,14 +92,22 @@ async fn sync_single_chat<C: TelegramClient>(
             match client.get_boundary_message_id(chat_id, timestamp).await {
                 Ok(BoundaryResult::BoundAt(id)) => (Some(id), false),
                 Ok(_) => (None, true),
-                Err(e) => return SyncResult::Error { error: e.to_string() },
+                Err(e) => {
+                    return SyncResult::Error {
+                        error: e.to_string(),
+                    };
+                }
             }
         }
     };
 
     let messages = match client.get_messages(chat_id, limit, until_message_id).await {
         Ok(msgs) => msgs,
-        Err(e) => return SyncResult::Error { error: e.to_string() },
+        Err(e) => {
+            return SyncResult::Error {
+                error: e.to_string(),
+            };
+        }
     };
 
     // If boundary was None (no cutoff), filter by timestamp
@@ -148,24 +164,27 @@ mod tests {
     #[test]
     fn parse_hwm_invalid_json() {
         let err = parse_hwm_input("not json").unwrap_err();
-        assert!(err.contains("Invalid JSON"), "expected 'Invalid JSON' in: {err}");
+        assert!(
+            err.contains("Invalid JSON"),
+            "expected 'Invalid JSON' in: {err}"
+        );
     }
 
     #[test]
     fn parse_hwm_non_numeric_chat_id() {
         let input = r#"{"abc": "2026-01-01T00:00:00Z"}"#;
         let err = parse_hwm_input(input).unwrap_err();
-        assert!(err.contains("Invalid chat ID"), "expected 'Invalid chat ID' in: {err}");
+        assert!(
+            err.contains("Invalid chat ID"),
+            "expected 'Invalid chat ID' in: {err}"
+        );
     }
 
     #[tokio::test]
     async fn sync_happy_path_multiple_chats() {
         let client = MockClient {
             boundary_result: BoundaryResult::BoundAt(1),
-            messages: vec![
-                make_message(1, 1, 1000),
-                make_message(2, 1, 2000),
-            ],
+            messages: vec![make_message(1, 1, 1000), make_message(2, 1, 2000)],
             ..MockClient::default()
         };
 
@@ -279,7 +298,10 @@ mod tests {
     fn sync_result_messages_serializes_as_array() {
         let result = SyncResult::Messages(vec![make_message(1, 1, 1000)]);
         let json = serde_json::to_value(&result).unwrap();
-        assert!(json.is_array(), "Messages variant should serialize as JSON array");
+        assert!(
+            json.is_array(),
+            "Messages variant should serialize as JSON array"
+        );
         assert_eq!(json.as_array().unwrap().len(), 1);
     }
 
@@ -293,9 +315,14 @@ mod tests {
 
     #[test]
     fn sync_result_error_serializes_as_object() {
-        let result = SyncResult::Error { error: "Chat not found".to_string() };
+        let result = SyncResult::Error {
+            error: "Chat not found".to_string(),
+        };
         let json = serde_json::to_value(&result).unwrap();
-        assert!(json.is_object(), "Error variant should serialize as JSON object");
+        assert!(
+            json.is_object(),
+            "Error variant should serialize as JSON object"
+        );
         assert_eq!(json["error"], "Chat not found");
     }
 
@@ -304,7 +331,12 @@ mod tests {
         let mut results: HashMap<i64, SyncResult> = HashMap::new();
         results.insert(123, SyncResult::Messages(vec![make_message(1, 123, 1000)]));
         results.insert(456, SyncResult::Messages(vec![]));
-        results.insert(999, SyncResult::Error { error: "Not found".to_string() });
+        results.insert(
+            999,
+            SyncResult::Error {
+                error: "Not found".to_string(),
+            },
+        );
 
         let json = serde_json::to_value(&results).unwrap();
         assert!(json["123"].is_array());

@@ -9,12 +9,12 @@ use tg::commands::{
     chats, download, groups, mark_read, mark_unread, messages, search, send, sync, unread, whoami,
 };
 use tg::credentials::{self, ApiCredentials, BotEntry, CredentialsFile};
-use tg::resolve::{self, Recipient};
 use tg::error::{Result, TgError};
 use tg::output::{
     DownloadStatus, OutputFormat, SendResult, print_chats_table, print_contacts_table, print_error,
     print_list, print_messages_table, print_output, print_success,
 };
+use tg::resolve::{self, Recipient};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -101,10 +101,7 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
     result
 }
 
-async fn run_auth_bot(
-    args: &tg::cli::AuthBotArgs,
-    data_dir: &std::path::Path,
-) -> Result<()> {
+async fn run_auth_bot(args: &tg::cli::AuthBotArgs, data_dir: &std::path::Path) -> Result<()> {
     let token = match &args.token {
         Some(t) => t.clone(),
         None => {
@@ -137,20 +134,22 @@ async fn run_auth_bot(
         token,
     };
 
-    let mut creds_file = credentials::load_credentials_file(data_dir).unwrap_or_else(|_| {
-        CredentialsFile {
+    let mut creds_file =
+        credentials::load_credentials_file(data_dir).unwrap_or_else(|_| CredentialsFile {
             api_id: 0,
             api_hash: String::new(),
             user: None,
             bots: Vec::new(),
             known_contacts: Vec::new(),
-        }
-    });
+        });
 
     creds_file.upsert_bot(bot_entry);
     credentials::save_credentials_file(&creds_file, data_dir)?;
 
-    println!("Bot @{} (ID: {}) authenticated successfully!", username, bot_user.id);
+    println!(
+        "Bot @{} (ID: {}) authenticated successfully!",
+        username, bot_user.id
+    );
     Ok(())
 }
 
@@ -168,11 +167,7 @@ async fn run_bot_send(
     } else {
         creds_file.find_bot_by_username(send_as)
     }
-    .ok_or_else(|| {
-        TgError::Other(format!(
-            "Bot {send_as} not found. Run `tg auth bot` first."
-        ))
-    })?
+    .ok_or_else(|| TgError::Other(format!("Bot {send_as} not found. Run `tg auth bot` first.")))?
     .clone();
 
     // Resolve the recipient
@@ -315,7 +310,6 @@ async fn run_command(
             print_output(format, &result);
         }
 
-
         Command::Messages(args) => {
             client.start().await?;
             if args.since_utc.is_some() {
@@ -417,13 +411,17 @@ async fn run_command(
             let hwm_map = sync::parse_hwm_input(&input).map_err(|e| TgError::Other(e))?;
             let results = sync::sync_chats(client, hwm_map, args.limit, args.reconcile_days).await;
 
-            let has_errors = results.values().any(|r| matches!(r, sync::SyncResult::Error { .. }));
+            let has_errors = results
+                .values()
+                .any(|r| matches!(r, sync::SyncResult::Error { .. }));
 
             // Always output JSON (machine-only command)
             println!("{}", serde_json::to_string_pretty(&results).unwrap());
 
             if has_errors {
-                return Err(TgError::Other("One or more chats failed to sync".to_string()));
+                return Err(TgError::Other(
+                    "One or more chats failed to sync".to_string(),
+                ));
             }
         }
     }
