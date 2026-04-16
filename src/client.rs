@@ -130,7 +130,10 @@ async fn wait_for_connection_sync(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            eprintln!("Warning: TDLib sync timed out after {}s; results may be stale", timeout.as_secs());
+            eprintln!(
+                "Warning: TDLib sync timed out after {}s; results may be stale",
+                timeout.as_secs()
+            );
             return;
         }
         match tokio::time::timeout(remaining, receiver.recv()).await {
@@ -1160,7 +1163,10 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }
         }
         MessageContent::MessageInvoice(inv) => {
-            let text = format!("Invoice: {} ({} {})", inv.product_info.title, inv.total_amount, inv.currency);
+            let text = format!(
+                "Invoice: {} ({} {})",
+                inv.product_info.title, inv.total_amount, inv.currency
+            );
             ExtractedMessageData {
                 text,
                 content_type: Some("invoice".to_string()),
@@ -1282,9 +1288,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content_type: Some("chat_delete_member".to_string()),
             is_downloadable: false,
             download_files: vec![],
-            content: Some(MessageContentDetails::ChatDeleteMember {
-                user_id: m.user_id,
-            }),
+            content: Some(MessageContentDetails::ChatDeleteMember { user_id: m.user_id }),
         },
         MessageContent::MessageChatUpgradeTo(u) => ExtractedMessageData {
             text: format!("Upgraded to supergroup {}", u.supergroup_id),
@@ -1581,7 +1585,11 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ExpiredVoiceNote {}),
         },
         MessageContent::MessageGroupCall(g) => {
-            let kind = if g.is_video { "Video call" } else { "Group call" };
+            let kind = if g.is_video {
+                "Video call"
+            } else {
+                "Group call"
+            };
             let text = if g.duration > 0 {
                 format!("{kind} ({} sec)", g.duration)
             } else if g.was_missed {
@@ -1821,19 +1829,21 @@ impl MessageHistorySource for TdLibClient {
             let extracted = extract_message_data(&msg.content);
             let (sender_id, sender) = match &msg.sender_id {
                 tdlib_rs::enums::MessageSender::User(u) => {
-                    let name = if let Ok(ue) = tdlib_rs::functions::get_user(u.user_id, client_id).await {
-                        get_user_full_name(&unwrap_user(ue))
-                    } else {
-                        "Unknown".to_string()
-                    };
+                    let name =
+                        if let Ok(ue) = tdlib_rs::functions::get_user(u.user_id, client_id).await {
+                            get_user_full_name(&unwrap_user(ue))
+                        } else {
+                            "Unknown".to_string()
+                        };
                     (Some(u.user_id), name)
                 }
                 tdlib_rs::enums::MessageSender::Chat(c) => {
-                    let name = if let Ok(ce) = tdlib_rs::functions::get_chat(c.chat_id, client_id).await {
-                        unwrap_chat(ce).title
-                    } else {
-                        "Unknown".to_string()
-                    };
+                    let name =
+                        if let Ok(ce) = tdlib_rs::functions::get_chat(c.chat_id, client_id).await {
+                            unwrap_chat(ce).title
+                        } else {
+                            "Unknown".to_string()
+                        };
                     (None, name)
                 }
             };
@@ -2111,10 +2121,9 @@ impl TelegramClient for TdLibClient {
 
     async fn find_chat_by_username(&self, username: &str) -> Result<i64> {
         let client_id = self.get_client_id().await?;
-        let chat_enum =
-            tdlib_rs::functions::search_public_chat(username.to_string(), client_id)
-                .await
-                .map_err(|e| TgError::ContactNotFound(format!("@{username}: {}", e.message)))?;
+        let chat_enum = tdlib_rs::functions::search_public_chat(username.to_string(), client_id)
+            .await
+            .map_err(|e| TgError::ContactNotFound(format!("@{username}: {}", e.message)))?;
         let chat = unwrap_chat(chat_enum);
         Ok(chat.id)
     }
@@ -2425,7 +2434,10 @@ impl TelegramClient for TdLibClient {
             .await
             .map_err(|e| TgError::TdLib(e.message))?;
         let tdlib_rs::enums::User::User(user) = user_enum;
-        let username = user.usernames.map(|u| u.editable_username).filter(|u| !u.is_empty());
+        let username = user
+            .usernames
+            .map(|u| u.editable_username)
+            .filter(|u| !u.is_empty());
         let phone = if user.phone_number.is_empty() {
             None
         } else {
@@ -2748,7 +2760,9 @@ pub mod mock {
                 ],
                 inaccessible_chat_ids: vec![],
                 boundary_result: BoundaryResult::None,
-                get_messages_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                get_messages_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                    0,
+                )),
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -2879,7 +2893,8 @@ pub mod mock {
             limit: i32,
             until_message_id: Option<i64>,
         ) -> Result<Vec<MessageInfo>> {
-            self.get_messages_call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.get_messages_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.inaccessible_chat_ids.contains(&chat_id) {
                 return Err(TgError::ChatInaccessible(chat_id));
             }
@@ -3233,11 +3248,12 @@ mod tests {
     fn extract_basic_group_chat_create() {
         use tdlib_rs::enums::MessageContent;
 
-        let content =
-            MessageContent::MessageBasicGroupChatCreate(tdlib_rs::types::MessageBasicGroupChatCreate {
+        let content = MessageContent::MessageBasicGroupChatCreate(
+            tdlib_rs::types::MessageBasicGroupChatCreate {
                 title: "My Group".to_string(),
                 member_user_ids: vec![100, 200, 300],
-            });
+            },
+        );
         let extracted = extract_message_data(&content);
         assert_eq!(extracted.content_type.as_deref(), Some("group_created"));
         assert_eq!(extracted.text, "Group created: My Group");
@@ -3931,7 +3947,10 @@ mod tests {
         let start = tokio::time::Instant::now();
         wait_for_connection_sync(rx, true, Duration::from_secs(5)).await;
         let elapsed = start.elapsed();
-        assert!(elapsed < Duration::from_millis(100), "should return immediately, took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "should return immediately, took {elapsed:?}"
+        );
         drop(tx);
     }
 
@@ -3953,7 +3972,10 @@ mod tests {
         let start = tokio::time::Instant::now();
         wait_for_connection_sync(rx, false, Duration::from_secs(5)).await;
         let elapsed = start.elapsed();
-        assert!(elapsed < Duration::from_secs(1), "should resolve quickly after Ready, took {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "should resolve quickly after Ready, took {elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -3976,8 +3998,14 @@ mod tests {
         let start = tokio::time::Instant::now();
         wait_for_connection_sync(rx, false, timeout).await;
         let elapsed = start.elapsed();
-        assert!(elapsed >= timeout, "should wait at least the timeout duration, took {elapsed:?}");
-        assert!(elapsed < timeout + Duration::from_millis(200), "should not wait much longer than timeout, took {elapsed:?}");
+        assert!(
+            elapsed >= timeout,
+            "should wait at least the timeout duration, took {elapsed:?}"
+        );
+        assert!(
+            elapsed < timeout + Duration::from_millis(200),
+            "should not wait much longer than timeout, took {elapsed:?}"
+        );
     }
 
     /// Replicates the auth-wait recv loop pattern from start() to test
@@ -4034,7 +4062,10 @@ mod tests {
 
         let result = tokio::time::timeout(Duration::from_secs(2), auth_wait_loop(rx)).await;
         assert!(result.is_ok(), "should not timeout");
-        assert!(result.unwrap().is_ok(), "should not return Update channel error");
+        assert!(
+            result.unwrap().is_ok(),
+            "should not return Update channel error"
+        );
     }
 
     #[tokio::test]
@@ -4080,10 +4111,14 @@ mod tests {
             ));
         });
 
-        let result = tokio::time::timeout(Duration::from_secs(2), auth_wait_loop_no_lag_handling(rx)).await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), auth_wait_loop_no_lag_handling(rx)).await;
         assert!(result.is_ok(), "should not timeout");
         let inner = result.unwrap();
-        assert!(inner.is_err(), "without Lagged handling, should return error");
+        assert!(
+            inner.is_err(),
+            "without Lagged handling, should return error"
+        );
         assert!(
             inner.unwrap_err().contains("channel lagged"),
             "error should mention channel lag"

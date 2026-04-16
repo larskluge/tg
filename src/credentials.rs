@@ -91,11 +91,7 @@ impl CredentialsFile {
     }
 
     pub fn upsert_known_contact(&mut self, contact: KnownContact) {
-        if let Some(existing) = self
-            .known_contacts
-            .iter_mut()
-            .find(|c| c.id == contact.id)
-        {
+        if let Some(existing) = self.known_contacts.iter_mut().find(|c| c.id == contact.id) {
             *existing = contact;
         } else {
             self.known_contacts.push(contact);

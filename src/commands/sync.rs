@@ -51,8 +51,7 @@ pub async fn sync_chats<C: TelegramClient>(
         let timestamp = cutoff.timestamp() as i32;
 
         for &chat_id in hwm_map.keys() {
-            let result =
-                sync_single_chat_by_timestamp(client, chat_id, timestamp, limit).await;
+            let result = sync_single_chat_by_timestamp(client, chat_id, timestamp, limit).await;
             results.insert(chat_id, result);
         }
     } else {

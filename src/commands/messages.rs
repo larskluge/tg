@@ -110,10 +110,7 @@ pub async fn get_messages<C: TelegramClient>(
     // we fetched without a message-ID boundary. Filter by timestamp so callers
     // never receive messages older than the requested cutoff.
     let messages = if let (Some(ts), None) = (since_timestamp, until_message_id) {
-        messages
-            .into_iter()
-            .filter(|m| m.timestamp >= ts)
-            .collect()
+        messages.into_iter().filter(|m| m.timestamp >= ts).collect()
     } else {
         messages
     };
@@ -387,17 +384,15 @@ mod tests {
             ],
             ..MockClient::default()
         };
-        let result = get_messages(
-            &client,
-            ChatTarget::Id(1),
-            20,
-            Some("2026-03-01"),
-            false,
-        )
-        .await
-        .unwrap();
+        let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-03-01"), false)
+            .await
+            .unwrap();
         // Should include the newer message, exclude the older one
-        assert_eq!(result.messages.len(), 1, "should filter to only messages >= since timestamp");
+        assert_eq!(
+            result.messages.len(),
+            1,
+            "should filter to only messages >= since timestamp"
+        );
         assert_eq!(result.messages[0].id, 10);
     }
 
@@ -415,7 +410,10 @@ mod tests {
 
         // 1 warm-up fetch + 1 actual fetch — no retry nudges
         let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(count, 2, "expected 1 warm-up + 1 actual fetch when boundary found immediately, got {count}");
+        assert_eq!(
+            count, 2,
+            "expected 1 warm-up + 1 actual fetch when boundary found immediately, got {count}"
+        );
     }
 
     #[tokio::test]
@@ -444,6 +442,9 @@ mod tests {
         let _ = get_messages(&client, ChatTarget::Id(1), 20, None, false).await;
 
         let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
-        assert_eq!(count, 1, "without --since-utc, expected exactly 1 get_messages call, got {count}");
+        assert_eq!(
+            count, 1,
+            "without --since-utc, expected exactly 1 get_messages call, got {count}"
+        );
     }
 }
