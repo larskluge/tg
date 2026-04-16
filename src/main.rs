@@ -6,7 +6,8 @@ use tg::bot_api;
 use tg::cli::{Cli, Command};
 use tg::client::TdLibClient;
 use tg::commands::{
-    chats, download, groups, mark_read, mark_unread, messages, search, send, sync, unread, whoami,
+    auth_status, chats, download, groups, mark_read, mark_unread, messages, search, send, sync,
+    unread, whoami,
 };
 use tg::credentials::{self, ApiCredentials, BotEntry, CredentialsFile};
 use tg::error::{Result, TgError};
@@ -32,10 +33,18 @@ async fn main() -> ExitCode {
 async fn run(command: Command, format: OutputFormat) -> Result<()> {
     let data_dir = credentials::tg_data_dir();
 
-    // Handle `tg auth bot` separately — no TDLib client needed.
+    // Handle `tg auth bot` / `tg auth status` separately — no TDLib client needed.
     if let Command::Auth(ref args) = command {
-        if let Some(tg::cli::AuthSubcommand::Bot(ref bot_args)) = args.subcommand {
-            return run_auth_bot(bot_args, &data_dir).await;
+        match args.subcommand {
+            Some(tg::cli::AuthSubcommand::Bot(ref bot_args)) => {
+                return run_auth_bot(bot_args, &data_dir).await;
+            }
+            Some(tg::cli::AuthSubcommand::Status) => {
+                let status = auth_status::build_auth_status(&data_dir)?;
+                print_output(format, &status);
+                return Ok(());
+            }
+            None => {}
         }
     }
 

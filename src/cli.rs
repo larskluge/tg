@@ -66,6 +66,9 @@ pub struct AuthArgs {
 pub enum AuthSubcommand {
     /// Authenticate a bot with its token
     Bot(AuthBotArgs),
+
+    /// Show current authentication status and configured bots
+    Status,
 }
 
 #[derive(Parser, Debug)]
@@ -676,6 +679,17 @@ mod tests {
                 }
                 _ => panic!("Expected Auth Bot subcommand"),
             },
+            _ => panic!("Expected Auth command"),
+        }
+    }
+
+    #[test]
+    fn parse_auth_status() {
+        let cli = Cli::parse_from(["tg", "auth", "status"]);
+        match cli.command {
+            Command::Auth(args) => {
+                assert!(matches!(args.subcommand, Some(AuthSubcommand::Status)));
+            }
             _ => panic!("Expected Auth command"),
         }
     }

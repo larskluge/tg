@@ -1,5 +1,5 @@
+pub mod auth_status;
 pub mod chats;
-pub mod sync;
 pub mod download;
 pub mod groups;
 pub mod mark_read;
@@ -7,5 +7,6 @@ pub mod mark_unread;
 pub mod messages;
 pub mod search;
 pub mod send;
+pub mod sync;
 pub mod unread;
 pub mod whoami;
