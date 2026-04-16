@@ -94,6 +94,8 @@ tg download --chat -1001666847309 --message 42 [--output-dir .] [--priority 16]
 tg search "John"
 tg mark-read "John Doe"
 tg mark-unread --id 123456789
+echo '{"123": 42, "-1001666847309": 89508544512}' | tg sync [--limit 1000]
+echo '{"123": 0, "-1001666847309": 0}' | tg sync --reconcile-days 7
 ```
 
 ## Architecture
@@ -106,7 +108,7 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 - `error.rs` - Custom error types using thiserror; use `TgError` variants and `Result<T>` alias
 - `client.rs` - TDLib client wrapper with `TelegramClient` trait for mocking
 - `output.rs` - Dual output formatting (plain text default, JSON with `--json`)
-- `commands/` - One file per command
+- `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers)
 
 **Testing pattern:** Mock `TelegramClient` trait for unit tests. CLI parsing tests use `Cli::parse_from()`. Internal algorithms (e.g. `collect_messages_paginated`, `collect_filtered_chats_from_source`) are extracted as free functions taking a source trait so they can be tested without TDLib.
 

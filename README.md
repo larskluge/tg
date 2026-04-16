@@ -12,6 +12,7 @@ A modern CLI tool for interacting with Telegram, built in Rust using [TDLib](htt
 - **Search** — find contacts by name
 - **Download** — download media attachments from messages
 - **Mark read/unread** — manage read state of chats
+- **Bulk sync** — fetch new messages for multiple chats in a single session (machine use)
 - **JSON output** — pass `--json` to any command for machine-readable output
 
 ## Requirements
@@ -100,7 +101,39 @@ tg search "John"
 # Manage read state
 tg mark-read "John Doe"
 tg mark-unread --id 123456789
+
+# Bulk sync (machine use — reads JSON from stdin, outputs JSON to stdout)
+echo '{"123": 42, "-1001666847309": 89508544512}' | tg sync
+echo '{"123": 0}' | tg sync --reconcile-days 7 --limit 500
 ```
+
+### Bulk sync
+
+`tg sync` fetches new messages for multiple chats in a single TDLib session, avoiding per-chat process startup overhead. It reads a JSON map of `{chat_id: last_message_id}` from stdin and outputs results keyed by chat ID.
+
+```bash
+# Stdin: map of chat ID (string) → last seen message ID (integer)
+# Use 0 as the message ID to fetch all recent messages (no prior state)
+echo '{"123": 42, "-1001666847309": 89508544512}' | tg sync
+
+# Override all HWMs with a date-based cutoff (for reconciliation sweeps)
+echo '{"123": 0, "-1001666847309": 0}' | tg sync --reconcile-days 7
+
+# Limit messages per chat (default: 1000)
+echo '{"123": 0}' | tg sync --limit 500
+```
+
+Output is always JSON, keyed by chat ID. Each value is an array of messages or an error object:
+
+```json
+{
+  "123": [{"id": 43, "chat_id": 123, "sender": "Alice", "text": "hello", ...}],
+  "-1001666847309": [],
+  "999": {"error": "Chat not found"}
+}
+```
+
+The HWM boundary message itself is excluded from results (it was already consumed). Exit code is 0 if all chats succeeded, 1 if any chat had an error (successful results are still in the output).
 
 ## Testing
 
