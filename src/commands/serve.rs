@@ -1,5 +1,5 @@
 use std::io::ErrorKind;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -129,6 +129,20 @@ fn bind_with_restricted_umask(path: &Path) -> Result<UnixListener> {
 /// processes to compete for the same TDLib database.
 pub async fn prepare_socket_path(path: &Path) -> Result<()> {
     if path.exists() {
+        // Only consider unlinking if the path is actually a Unix socket. A
+        // regular file at the socket path is somebody else's data and must
+        // not be removed — refuse to start instead. This also normalises
+        // platform differences: on Linux, connect() to a non-socket can
+        // return ECONNREFUSED, which would otherwise trick us into deleting
+        // unrelated files.
+        let meta = std::fs::metadata(path)?;
+        if !meta.file_type().is_socket() {
+            return Err(TgError::Other(format!(
+                "tg serve: path {} exists and is not a socket; refusing to start",
+                path.display()
+            )));
+        }
+
         match tokio::time::timeout(
             std::time::Duration::from_millis(250),
             UnixStream::connect(path),
@@ -142,18 +156,18 @@ pub async fn prepare_socket_path(path: &Path) -> Result<()> {
                 )));
             }
             Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => {
-                // Definitively no listener on a real Unix socket — safe to remove.
+                // Real socket with no listener — safe to remove.
                 std::fs::remove_file(path)?;
             }
             Ok(Err(e)) => {
                 return Err(TgError::Other(format!(
-                    "tg serve: path {} exists and is not a stale socket (connect: {e}); refusing to start",
+                    "tg serve: socket at {} exists but connect failed unexpectedly ({e}); refusing to start",
                     path.display()
                 )));
             }
             Err(_) => {
                 return Err(TgError::Other(format!(
-                    "tg serve: path {} exists and connect timed out; another server may be running. \
+                    "tg serve: socket at {} exists and connect timed out; another server may be running. \
                      Refusing to remove. If you are sure no server is running, delete the file manually.",
                     path.display()
                 )));

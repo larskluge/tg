@@ -70,7 +70,7 @@ async fn prepare_socket_path_refuses_when_path_is_plain_file() {
     let err = prepare_socket_path(&path).await.unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("not a stale socket") || msg.contains("refusing to start"),
+        msg.contains("not a socket") || msg.contains("refusing to start"),
         "expected refusal-to-start error for non-socket path, got: {msg}"
     );
     // The plain file must NOT be removed — that would be a destructive surprise.
