@@ -21,13 +21,13 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/build/tdlib-rs-*/out/tdlib/lib/libtdjson.so* /out/lib/
 
 # --- runtime ---------------------------------------------------------------
-FROM docker.io/library/debian:bookworm-slim
+FROM docker.io/library/debian:trixie-slim
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         libc++1 \
-        libssl3 \
+        libssl3t64 \
         zlib1g \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 1000 tg \
