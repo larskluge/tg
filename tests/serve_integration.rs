@@ -46,16 +46,37 @@ where
 }
 
 #[tokio::test]
-async fn prepare_socket_path_removes_stale_file() {
+async fn prepare_socket_path_removes_real_stale_socket() {
     let dir = TempDir::new().unwrap();
     let path = sock_path(&dir, "stale.sock");
-    std::fs::write(&path, b"garbage").unwrap();
+    // Create a real Unix socket then drop the listener — the path remains
+    // as a socket file with no listener, so connect() returns ECONNREFUSED.
+    let listener = UnixListener::bind(&path).unwrap();
+    drop(listener);
     assert!(path.exists());
     prepare_socket_path(&path).await.unwrap();
     assert!(
         !path.exists(),
-        "stale file at {path:?} should be unlinked",
+        "real stale socket at {path:?} should be unlinked",
         path = path
+    );
+}
+
+#[tokio::test]
+async fn prepare_socket_path_refuses_when_path_is_plain_file() {
+    let dir = TempDir::new().unwrap();
+    let path = sock_path(&dir, "not-a-socket");
+    std::fs::write(&path, b"garbage").unwrap();
+    let err = prepare_socket_path(&path).await.unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not a stale socket") || msg.contains("refusing to start"),
+        "expected refusal-to-start error for non-socket path, got: {msg}"
+    );
+    // The plain file must NOT be removed — that would be a destructive surprise.
+    assert!(
+        path.exists(),
+        "non-socket file at {path:?} must not be removed"
     );
 }
 
