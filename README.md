@@ -12,6 +12,7 @@ A modern CLI tool for interacting with Telegram, built in Rust using [TDLib](htt
 - **Search** — find contacts by name
 - **Download** — download media attachments from messages
 - **Mark read/unread** — manage read state of chats
+- **Long-lived server** — `tg serve` keeps a TDLib client warm so every other `tg <cmd>` skips cold start
 - **Bulk sync** — fetch new messages for multiple chats in a single session (machine use)
 - **JSON output** — pass `--json` to any command for machine-readable output
 
@@ -102,14 +103,49 @@ tg search "John"
 tg mark-read "John Doe"
 tg mark-unread --id 123456789
 
-# Bulk sync (machine use — reads JSON from stdin, outputs JSON to stdout)
-echo '{"123": 42, "-1001666847309": 89508544512}' | tg sync
-echo '{"123": 0}' | tg sync --reconcile-days 7 --limit 500
+# Run the long-lived server so other commands skip cold start
+tg serve
 ```
 
-### Bulk sync
+## Machine use
 
-`tg sync` fetches new messages for multiple chats in a single TDLib session, avoiding per-chat process startup overhead. It reads a JSON map of `{chat_id: last_message_id}` from stdin and outputs results keyed by chat ID.
+`tg serve` runs a long-lived background process that keeps one TDLib client warm and exposes it over a Unix socket. Every other `tg <cmd>` automatically routes through it when it's up — and falls back to in-process TDLib (today's behaviour) when it isn't. The server is a pure performance optimisation; nothing breaks without it.
+
+### Running the server
+
+```bash
+tg serve                                  # foreground
+podman exec -d tg tg serve                # backgrounded inside a container
+```
+
+The socket path is resolved in this order:
+
+1. `TG_SERVE_SOCKET=/explicit/path` — use that path verbatim.
+2. `TG_SERVE_SOCKET=` (set but empty) — disabled; clients always use in-process TDLib.
+3. `$XDG_RUNTIME_DIR/tg.sock` if `XDG_RUNTIME_DIR` is set.
+4. `$DATA_DIR/tg/serve.sock` (e.g. `~/Library/Application Support/tg/serve.sock` on macOS).
+
+The socket is created with `0600` permissions. Concurrent connections are accepted, but TDLib calls are serialised internally — slow commands (e.g. `download`) block the channel until they complete.
+
+**Operational notes:**
+
+- `tg auth`, `tg auth bot`, and `tg auth status` cannot run while `tg serve` is active. Stop the server first, run auth, then start the server again.
+- Bot sends (`tg send --as <bot>`) use the HTTP API and bypass the socket — they work whether the server is up or not.
+- Restarting the server gives you a cold TDLib but the on-disk session survives, so re-auth is not needed.
+
+### Wire protocol (for non-`tg`-CLI clients)
+
+Newline-delimited JSON on the Unix socket. One request per line, one response per line, in arrival order.
+
+Request: `{"id": "<opaque>", "cmd": "<command>", "args": { ... }}`
+Response (success): `{"id": "<echoed>", "ok": true, "result": <value>}`
+Response (failure): `{"id": "<echoed>", "ok": false, "error": "<message>"}`
+
+`cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `send`, `download`, `mark_read`, `mark_unread`, `sync`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today.
+
+### One-shot bulk sync
+
+`tg sync` is a one-shot variant of the server's `sync` command for callers that don't want to maintain a long-lived child. It reads a JSON map of `{chat_id: last_message_id}` from stdin and outputs results keyed by chat ID. Works whether or not `tg serve` is up — when the server is running, the request goes through the socket; otherwise it cold-starts TDLib.
 
 ```bash
 # Stdin: map of chat ID (string) → last seen message ID (integer)

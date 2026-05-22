@@ -1,6 +1,51 @@
+use serde::{Deserialize, Serialize};
+
+use crate::cli::MessagesArgs;
 use crate::client::{BoundaryResult, TelegramClient};
 use crate::error::{Result, TgError};
 use crate::output::MessageInfo;
+
+fn default_limit() -> i32 {
+    20
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagesRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub chat: Option<i64>,
+    #[serde(default = "default_limit")]
+    pub limit: i32,
+    #[serde(default)]
+    pub since_utc: Option<String>,
+    #[serde(default)]
+    pub oldest_first: bool,
+}
+
+impl Default for MessagesRequest {
+    fn default() -> Self {
+        Self {
+            name: None,
+            chat: None,
+            limit: default_limit(),
+            since_utc: None,
+            oldest_first: false,
+        }
+    }
+}
+
+impl From<MessagesArgs> for MessagesRequest {
+    fn from(args: MessagesArgs) -> Self {
+        Self {
+            name: args.name,
+            chat: args.chat,
+            limit: args.limit,
+            since_utc: args.since_utc,
+            oldest_first: args.oldest_first,
+        }
+    }
+}
 
 /// Milliseconds to wait before a single retry of `get_boundary_message_id`.
 /// The warmup fetch and `wait_for_sync()` handle most sync cases, but
@@ -116,6 +161,30 @@ pub async fn get_messages<C: TelegramClient>(
     };
 
     Ok(MessagesResult { chat_id, messages })
+}
+
+pub async fn handle<C: TelegramClient>(
+    client: &C,
+    req: MessagesRequest,
+) -> Result<Vec<MessageInfo>> {
+    let target = if let Some(id) = req.chat {
+        ChatTarget::Id(id)
+    } else if let Some(name) = req.name {
+        ChatTarget::Name(name)
+    } else {
+        return Err(TgError::Other(
+            "messages: either `chat` or `name` is required".to_string(),
+        ));
+    };
+    let result = get_messages(
+        client,
+        target,
+        req.limit,
+        req.since_utc.as_deref(),
+        req.oldest_first,
+    )
+    .await?;
+    Ok(result.messages)
 }
 
 #[cfg(test)]
