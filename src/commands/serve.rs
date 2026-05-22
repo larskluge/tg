@@ -385,7 +385,6 @@ mod tests {
     async fn handle_connection_rejects_oversized_line_and_closes() {
         use crate::client::mock::MockClient;
         use tempfile::TempDir;
-        use tokio::io::AsyncReadExt;
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("big.sock");
@@ -397,42 +396,36 @@ mod tests {
             handle_connection(stream, client).await.unwrap();
         });
 
-        // Give the listener a moment to be ready.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
         let stream = UnixStream::connect(&path).await.unwrap();
         let (read, mut write) = stream.into_split();
 
-        // Drive writes on a separate task so we can read the server's error
-        // response in parallel. The server is expected to close the
-        // connection mid-write once it sees too many bytes without a
-        // newline, so write errors here are expected and ignored.
-        let writer = tokio::spawn(async move {
-            let chunk = vec![b'A'; 64 * 1024];
-            // Up to 32 MiB; the server should kill us long before this.
-            for _ in 0..512 {
-                if write.write_all(&chunk).await.is_err() {
-                    break;
-                }
-            }
+        // Read the single error-response line on a task — read_line returns
+        // as soon as one `\n` arrives, so we don't depend on EOF timing.
+        let reader = tokio::spawn(async move {
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                reader.read_line(&mut line),
+            )
+            .await;
+            line
         });
 
-        // Read what the server sends before it closes.
-        let mut response = String::new();
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
-            tokio::io::AsyncReadExt::read_to_string(
-                &mut tokio::io::BufReader::new(read),
-                &mut response,
-            ),
-        )
-        .await;
+        // Push 2 MiB of data without a newline — more than the 1 MiB cap.
+        // Write errors are expected once the server closes the connection.
+        let chunk = vec![b'A'; 64 * 1024];
+        for _ in 0..32 {
+            if write.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+        drop(write); // signal end of write side
 
-        let _ = writer.await;
-
+        let line = reader.await.unwrap();
         assert!(
-            response.contains("exceeds") && response.contains("byte limit"),
-            "expected oversized-line error response, got: {response:?}"
+            line.contains("exceeds") && line.contains("byte limit"),
+            "expected oversized-line error response, got: {line:?}"
         );
 
         server.await.unwrap();
