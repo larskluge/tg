@@ -434,4 +434,81 @@ mod tests {
         assert!(json["456"].as_array().unwrap().is_empty());
         assert_eq!(json["999"]["error"], "Not found");
     }
+
+    // --- round-trip tests (server emit -> client parse) ---
+    //
+    // Mirrors the wire path: `sync::handle` builds `HashMap<i64, SyncResult>`,
+    // `serve::execute` serializes it via `serde_json::to_value`, and the
+    // client in `main.rs` deserializes the response into
+    // `HashMap<String, SyncResult>`. A bug here surfaces in production as
+    // `tg serve: result parse error: data did not match any variant of
+    // untagged enum SyncResult`.
+    #[test]
+    fn sync_result_messages_roundtrips_through_serde() {
+        let original = SyncResult::Messages(vec![make_message(1, 1, 1000)]);
+        let json = serde_json::to_value(&original).unwrap();
+        let back: SyncResult = serde_json::from_value(json).expect("Messages should roundtrip");
+        match back {
+            SyncResult::Messages(msgs) => assert_eq!(msgs.len(), 1),
+            SyncResult::Error { error } => panic!("got Error: {error}"),
+        }
+    }
+
+    #[test]
+    fn sync_result_empty_messages_roundtrips_through_serde() {
+        let original = SyncResult::Messages(vec![]);
+        let json = serde_json::to_value(&original).unwrap();
+        let back: SyncResult =
+            serde_json::from_value(json).expect("empty Messages should roundtrip");
+        match back {
+            SyncResult::Messages(msgs) => assert!(msgs.is_empty()),
+            SyncResult::Error { error } => panic!("got Error: {error}"),
+        }
+    }
+
+    #[test]
+    fn sync_result_error_roundtrips_through_serde() {
+        let original = SyncResult::Error {
+            error: "boom".to_string(),
+        };
+        let json = serde_json::to_value(&original).unwrap();
+        let back: SyncResult = serde_json::from_value(json).expect("Error should roundtrip");
+        match back {
+            SyncResult::Error { error } => assert_eq!(error, "boom"),
+            SyncResult::Messages(_) => panic!("got Messages, expected Error"),
+        }
+    }
+
+    #[test]
+    fn full_sync_output_roundtrips_server_to_client() {
+        // Server emits HashMap<i64, SyncResult>; client receives
+        // HashMap<String, SyncResult>. The whole JSON value must survive.
+        let mut server_side: HashMap<i64, SyncResult> = HashMap::new();
+        server_side.insert(123, SyncResult::Messages(vec![make_message(1, 123, 1000)]));
+        server_side.insert(456, SyncResult::Messages(vec![]));
+        server_side.insert(
+            999,
+            SyncResult::Error {
+                error: "Not found".to_string(),
+            },
+        );
+
+        let json = serde_json::to_value(&server_side).unwrap();
+        let client_side: HashMap<String, SyncResult> =
+            serde_json::from_value(json).expect("server payload must parse client-side");
+
+        assert_eq!(client_side.len(), 3);
+        match &client_side["123"] {
+            SyncResult::Messages(msgs) => assert_eq!(msgs.len(), 1),
+            SyncResult::Error { error } => panic!("123 should be Messages, got Error: {error}"),
+        }
+        match &client_side["456"] {
+            SyncResult::Messages(msgs) => assert!(msgs.is_empty()),
+            SyncResult::Error { error } => panic!("456 should be Messages, got Error: {error}"),
+        }
+        match &client_side["999"] {
+            SyncResult::Error { error } => assert_eq!(error, "Not found"),
+            SyncResult::Messages(_) => panic!("999 should be Error"),
+        }
+    }
 }

@@ -725,7 +725,7 @@ pub struct MessageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
     pub is_downloadable: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub download_files: Vec<MessageFileRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<MessageContentDetails>,
@@ -787,7 +787,7 @@ pub struct DownloadReport {
     pub content_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<MessageContentDetails>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<DownloadedFileResult>,
 }
 
