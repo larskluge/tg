@@ -1,0 +1,13 @@
+target/
+.git/
+.github/
+.idea/
+.vscode/
+*.md
+docs/
+specs/
+_links/
+.DS_Store
+Containerfile
+.dockerignore
+Makefile
