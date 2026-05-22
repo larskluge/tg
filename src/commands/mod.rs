@@ -7,6 +7,7 @@ pub mod mark_unread;
 pub mod messages;
 pub mod search;
 pub mod send;
+pub mod serve;
 pub mod sync;
 pub mod unread;
 pub mod whoami;

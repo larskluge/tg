@@ -1,6 +1,6 @@
 use colored::Colorize;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Table};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::env;
 use terminal_size::terminal_size;
 use unicode_width::UnicodeWidthStr;
@@ -57,7 +57,7 @@ pub trait PlainText {
     fn to_plain_text(&self) -> String;
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatInfo {
     pub id: i64,
     pub name: String,
@@ -260,7 +260,7 @@ pub fn print_chats_table(chats: &[ChatInfo]) {
     println!("{table}");
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContactInfo {
     pub id: i64,
     pub name: String,
@@ -385,7 +385,7 @@ pub fn print_messages_table(messages: &[MessageInfo]) {
     println!("{}", messages_table_string(messages));
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessageContentDetails {
     Text {
@@ -687,7 +687,7 @@ pub enum MessageContentDetails {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageFileRef {
     pub file_id: i32,
     pub is_primary: bool,
@@ -709,7 +709,7 @@ pub struct MessageFileRef {
     pub is_downloaded: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageInfo {
     pub id: i64,
     pub chat_id: i64,
@@ -746,7 +746,7 @@ impl PlainText for MessageInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadStatus {
     Downloaded,
@@ -756,7 +756,7 @@ pub enum DownloadStatus {
     NoDownloadableMedia,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadedFileResult {
     pub file_id: i32,
     pub is_primary: bool,
@@ -777,7 +777,7 @@ pub struct DownloadedFileResult {
     pub note: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DownloadReport {
     pub chat_id: i64,
     pub message_id: i64,
@@ -816,7 +816,7 @@ impl PlainText for DownloadReport {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserInfo {
     pub id: i64,
     pub first_name: String,
@@ -846,7 +846,7 @@ impl PlainText for UserInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendResult {
     pub message_id: i64,
     pub chat_id: i64,

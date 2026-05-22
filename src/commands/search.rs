@@ -1,12 +1,30 @@
+use serde::{Deserialize, Serialize};
+
+use crate::cli::SearchArgs;
 use crate::client::TelegramClient;
 use crate::error::Result;
 use crate::output::ContactInfo;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SearchRequest {
+    pub query: String,
+}
+
+impl From<SearchArgs> for SearchRequest {
+    fn from(args: SearchArgs) -> Self {
+        Self { query: args.query }
+    }
+}
 
 pub async fn search_contacts<C: TelegramClient>(
     client: &C,
     query: &str,
 ) -> Result<Vec<ContactInfo>> {
     client.search_contacts(query).await
+}
+
+pub async fn handle<C: TelegramClient>(client: &C, req: SearchRequest) -> Result<Vec<ContactInfo>> {
+    search_contacts(client, &req.query).await
 }
 
 #[cfg(test)]
@@ -34,5 +52,15 @@ mod tests {
         let client = MockClient::default();
         let contacts = search_contacts(&client, "xyz").await.unwrap();
         assert!(contacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_runs_search() {
+        let client = MockClient::default();
+        let req = SearchRequest {
+            query: "John".to_string(),
+        };
+        let contacts = handle(&client, req).await.unwrap();
+        assert_eq!(contacts.len(), 1);
     }
 }

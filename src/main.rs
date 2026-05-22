@@ -1,21 +1,25 @@
 use clap::Parser;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use tg::bot_api;
 use tg::cli::{Cli, Command};
 use tg::client::TdLibClient;
 use tg::commands::{
-    auth_status, chats, download, groups, mark_read, mark_unread, messages, search, send, sync,
-    unread, whoami,
+    auth_status, chats, download, groups, mark_read, mark_unread, messages, search, send, serve,
+    sync, unread, whoami,
 };
 use tg::credentials::{self, ApiCredentials, BotEntry, CredentialsFile};
 use tg::error::{Result, TgError};
 use tg::output::{
-    DownloadStatus, OutputFormat, SendResult, print_chats_table, print_contacts_table, print_error,
-    print_list, print_messages_table, print_output, print_success,
+    ChatInfo, ContactInfo, DownloadReport, DownloadStatus, MessageInfo, OutputFormat, SendResult,
+    UserInfo, print_chats_table, print_contacts_table, print_error, print_list,
+    print_messages_table, print_output, print_success,
 };
 use tg::resolve::{self, Recipient};
+use tg::serve_client;
+use tokio::net::UnixStream;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -33,7 +37,7 @@ async fn main() -> ExitCode {
 async fn run(command: Command, format: OutputFormat) -> Result<()> {
     let data_dir = credentials::tg_data_dir();
 
-    // Handle `tg auth bot` / `tg auth status` separately — no TDLib client needed.
+    // Auth subcommands that don't need TDLib at all.
     if let Command::Auth(ref args) = command {
         match args.subcommand {
             Some(tg::cli::AuthSubcommand::Bot(ref bot_args)) => {
@@ -44,18 +48,39 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
                 print_output(format, &status);
                 return Ok(());
             }
-            None => {}
+            None => {
+                // Interactive auth — refuse if `tg serve` is up, since both
+                // want exclusive access to the TDLib on-disk database.
+                if serve_client::is_running().await {
+                    return Err(TgError::Other(
+                        "tg auth: cannot run while `tg serve` is active. Stop the serve process and retry."
+                            .to_string(),
+                    ));
+                }
+            }
         }
     }
 
-    // Handle --as bot sends via HTTP API (may need TDLib for --to resolution).
+    // Bot sends use the HTTP API, never TDLib — bypass the proxy entirely.
     if let Command::Send(ref args) = command
         && args.send_as.is_some()
     {
         return run_bot_send(args, &data_dir, format).await;
     }
 
+    // Serve owns the TDLib client and handles its own lifecycle.
+    if matches!(command, Command::Serve) {
+        let api_credentials = credentials::load_credentials_for_non_auth(&data_dir)?;
+        let client = TdLibClient::new(api_credentials.api_id, api_credentials.api_hash)?;
+        return serve::run(client).await;
+    }
+
+    // Try the warm serve socket first. If unreachable, fall through to the
+    // in-process path so existing usage keeps working with no server up.
     let is_auth = matches!(&command, Command::Auth(a) if a.subcommand.is_none());
+    if !is_auth && let Some(stream) = serve_client::try_connect().await {
+        return route_via_serve(command, stream, format).await;
+    }
 
     let api_credentials = if is_auth {
         match credentials::try_load_credentials_for_auth(&data_dir) {
@@ -108,6 +133,145 @@ async fn run(command: Command, format: OutputFormat) -> Result<()> {
     }
 
     result
+}
+
+/// Forward a command to a running `tg serve` over an already-connected socket
+/// and render the response locally.
+async fn route_via_serve(command: Command, stream: UnixStream, format: OutputFormat) -> Result<()> {
+    match command {
+        Command::Whoami => {
+            let info: UserInfo =
+                serve_client::send_request(stream, "whoami", whoami::WhoamiRequest::default())
+                    .await?;
+            print_output(format, &info);
+        }
+        Command::Chats(args) => {
+            let req = chats::ChatsRequest::from(args);
+            let chats: Vec<ChatInfo> = serve_client::send_request(stream, "chats", req).await?;
+            render_chat_list(format, &chats);
+        }
+        Command::Groups(args) => {
+            let req = groups::GroupsRequest::from(args);
+            let groups: Vec<ChatInfo> = serve_client::send_request(stream, "groups", req).await?;
+            render_chat_list(format, &groups);
+        }
+        Command::Unread(args) => {
+            let req = unread::UnreadRequest::from(args);
+            let unread: Vec<ChatInfo> = serve_client::send_request(stream, "unread", req).await?;
+            render_chat_list(format, &unread);
+        }
+        Command::Search(args) => {
+            let req = search::SearchRequest::from(args);
+            let contacts: Vec<ContactInfo> =
+                serve_client::send_request(stream, "search", req).await?;
+            match format {
+                OutputFormat::Json => print_list(format, &contacts),
+                OutputFormat::Plain => print_contacts_table(&contacts),
+            }
+        }
+        Command::Messages(args) => {
+            let req = messages::MessagesRequest::from(args);
+            let msgs: Vec<MessageInfo> =
+                serve_client::send_request(stream, "messages", req).await?;
+            match format {
+                OutputFormat::Json => print_list(format, &msgs),
+                OutputFormat::Plain => print_messages_table(&msgs),
+            }
+        }
+        Command::Send(args) => {
+            // Bot sends are filtered out before route_via_serve.
+            let req = send::SendRequest::from(args);
+            let result: SendResult = serve_client::send_request(stream, "send", req).await?;
+            print_output(format, &result);
+        }
+        Command::Download(args) => {
+            let mut req = download::DownloadRequest::from(args);
+            // Resolve output_dir relative to the CLIENT's CWD before sending —
+            // the server may have a different working directory.
+            req.output_dir = absolutize(&req.output_dir);
+            let report: DownloadReport =
+                serve_client::send_request(stream, "download", req).await?;
+            print_output(format, &report);
+            match report.status {
+                DownloadStatus::NoDownloadableMedia => {
+                    return Err(TgError::Other(
+                        "Selected message has no downloadable media".to_string(),
+                    ));
+                }
+                DownloadStatus::Failed => {
+                    return Err(TgError::Other("One or more downloads failed".to_string()));
+                }
+                _ => {}
+            }
+        }
+        Command::MarkRead(args) => {
+            let req = mark_read::MarkReadRequest::from(args);
+            let _: serde_json::Value = serve_client::send_request(stream, "mark_read", req).await?;
+            print_success("Chat marked as read");
+        }
+        Command::MarkUnread(args) => {
+            let req = mark_unread::MarkUnreadRequest::from(args);
+            let _: serde_json::Value =
+                serve_client::send_request(stream, "mark_unread", req).await?;
+            print_success("Chat marked as unread");
+        }
+        Command::Sync(args) => {
+            let hwm = read_sync_hwm_from_stdin()?;
+            let req = sync::SyncRequest {
+                hwm,
+                limit: args.limit,
+                reconcile_days: args.reconcile_days,
+            };
+            let results: HashMap<String, sync::SyncResult> =
+                serve_client::send_request(stream, "sync", req).await?;
+            println!("{}", serde_json::to_string_pretty(&results).unwrap());
+            let has_errors = results
+                .values()
+                .any(|r| matches!(r, sync::SyncResult::Error { .. }));
+            if has_errors {
+                return Err(TgError::Other(
+                    "One or more chats failed to sync".to_string(),
+                ));
+            }
+        }
+        Command::Serve | Command::Auth(_) => {
+            unreachable!("Serve and Auth are routed before route_via_serve")
+        }
+    }
+    Ok(())
+}
+
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    }
+}
+
+fn render_chat_list(format: OutputFormat, chats: &[ChatInfo]) {
+    match format {
+        OutputFormat::Json => print_list(format, chats),
+        OutputFormat::Plain => print_chats_table(chats),
+    }
+}
+
+fn read_sync_hwm_from_stdin() -> Result<HashMap<String, i64>> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .map_err(|e| TgError::Other(format!("Failed to read stdin: {e}")))?;
+    let parsed: HashMap<String, i64> =
+        serde_json::from_str(&buf).map_err(|e| TgError::Other(format!("Invalid JSON: {e}")))?;
+    for k in parsed.keys() {
+        if k.parse::<i64>().is_err() {
+            return Err(TgError::Other(format!("Invalid chat ID: {k}")));
+        }
+    }
+    Ok(parsed)
 }
 
 async fn run_auth_bot(args: &tg::cli::AuthBotArgs, data_dir: &std::path::Path) -> Result<()> {
@@ -264,28 +428,19 @@ async fn run_command(
         Command::Chats(args) => {
             client.start().await?;
             let chats = chats::list_chats(client, args.limit).await?;
-            match format {
-                OutputFormat::Json => print_list(format, &chats),
-                OutputFormat::Plain => print_chats_table(&chats),
-            }
+            render_chat_list(format, &chats);
         }
 
         Command::Groups(args) => {
             client.start().await?;
             let groups = groups::list_groups(client, args.limit).await?;
-            match format {
-                OutputFormat::Json => print_list(format, &groups),
-                OutputFormat::Plain => print_chats_table(&groups),
-            }
+            render_chat_list(format, &groups);
         }
 
         Command::Unread(args) => {
             client.start().await?;
             let unread = unread::list_unread(client, args.limit).await?;
-            match format {
-                OutputFormat::Json => print_list(format, &unread),
-                OutputFormat::Plain => print_chats_table(&unread),
-            }
+            render_chat_list(format, &unread);
         }
 
         Command::Search(args) => {
@@ -417,7 +572,7 @@ async fn run_command(
                 buf
             };
 
-            let hwm_map = sync::parse_hwm_input(&input).map_err(|e| TgError::Other(e))?;
+            let hwm_map = sync::parse_hwm_input(&input).map_err(TgError::Other)?;
             let results = sync::sync_chats(client, hwm_map, args.limit, args.reconcile_days).await;
 
             let has_errors = results
@@ -432,6 +587,12 @@ async fn run_command(
                     "One or more chats failed to sync".to_string(),
                 ));
             }
+        }
+
+        Command::Serve => {
+            // Serve is handled at the top of `run()` because it owns the
+            // TDLib client and its own shutdown lifecycle.
+            unreachable!("Serve is handled at the top of run()");
         }
     }
 

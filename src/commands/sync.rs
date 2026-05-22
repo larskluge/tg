@@ -1,15 +1,56 @@
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::client::{BoundaryResult, TelegramClient};
+use crate::error::{Result, TgError};
 use crate::output::MessageInfo;
+
+fn default_sync_limit() -> i32 {
+    1000
+}
+
+/// Wire-format request for `sync`. The HWM map is keyed by stringified chat
+/// ID because JSON object keys must be strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncRequest {
+    #[serde(default)]
+    pub hwm: HashMap<String, i64>,
+    #[serde(default = "default_sync_limit")]
+    pub limit: i32,
+    #[serde(default)]
+    pub reconcile_days: Option<u32>,
+}
+
+impl Default for SyncRequest {
+    fn default() -> Self {
+        Self {
+            hwm: HashMap::new(),
+            limit: default_sync_limit(),
+            reconcile_days: None,
+        }
+    }
+}
+
+pub async fn handle<C: TelegramClient>(
+    client: &C,
+    req: SyncRequest,
+) -> Result<HashMap<i64, SyncResult>> {
+    let mut hwm_map = HashMap::with_capacity(req.hwm.len());
+    for (k, v) in req.hwm {
+        let id: i64 = k
+            .parse()
+            .map_err(|_| TgError::Other(format!("Invalid chat ID: {k}")))?;
+        hwm_map.insert(id, v);
+    }
+    Ok(sync_chats(client, hwm_map, req.limit, req.reconcile_days).await)
+}
 
 /// Milliseconds to wait before a single retry of `get_boundary_message_id`.
 const BOUNDARY_RETRY_DELAY_MS: u64 = 300;
 
 /// Per-chat sync outcome: either messages or an error description.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SyncResult {
     Messages(Vec<MessageInfo>),

@@ -54,6 +54,9 @@ pub enum Command {
 
     /// Show your Telegram user info (ID, name, username, phone)
     Whoami,
+
+    /// Run a long-lived TDLib server on a Unix socket so other `tg` commands skip cold start
+    Serve,
 }
 
 #[derive(Parser, Debug)]
@@ -751,6 +754,12 @@ mod tests {
         // --as alone without a recipient should fail
         let cli = Cli::try_parse_from(["tg", "send", "--as", "@mybot", "-m", "hi"]);
         assert!(cli.is_err());
+    }
+
+    #[test]
+    fn parse_serve() {
+        let cli = Cli::parse_from(["tg", "serve"]);
+        assert!(matches!(cli.command, Command::Serve));
     }
 
     #[test]
