@@ -8,6 +8,7 @@ use crate::output::SendResult;
 pub enum SendTarget {
     Id(i64),
     Name(String),
+    Username(String),
     Group(String),
 }
 
@@ -50,6 +51,7 @@ pub async fn send_message<C: TelegramClient>(
     let chat_id = match target {
         SendTarget::Id(id) => id,
         SendTarget::Name(name) => client.find_chat_by_name(&name).await?,
+        SendTarget::Username(username) => client.find_chat_by_username(&username).await?,
         SendTarget::Group(name) => client.find_group_by_name(&name).await?,
     };
 
@@ -60,9 +62,10 @@ pub async fn handle<C: TelegramClient>(client: &C, req: SendRequest) -> Result<S
     let target = if let Some(ref to) = req.to {
         if let Ok(id) = to.parse::<i64>() {
             SendTarget::Id(id)
+        } else if let Some(username) = to.strip_prefix('@') {
+            SendTarget::Username(username.to_string())
         } else {
-            let name = to.strip_prefix('@').unwrap_or(to);
-            SendTarget::Name(name.to_string())
+            SendTarget::Name(to.clone())
         }
     } else if let Some(id) = req.id {
         SendTarget::Id(id)
@@ -173,14 +176,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_to_at_username_strips_prefix() {
+    async fn handle_to_at_username_resolves_by_username() {
+        // `@handle` must resolve via username lookup (search_public_chat), not a
+        // display-name contact search. Mock contact id 1 has username "johndoe"
+        // but display name "John Doe", so a name search for "johndoe" would miss.
         let client = MockClient::default();
         let req = SendRequest {
             message: "hi".to_string(),
-            to: Some("@John".to_string()),
+            to: Some("@johndoe".to_string()),
             ..Default::default()
         };
-        handle(&client, req).await.unwrap();
+        let res = handle(&client, req).await.unwrap();
+        assert_eq!(res.chat_id, 1);
+    }
+
+    #[tokio::test]
+    async fn handle_to_plain_name_uses_name_search() {
+        // A `--to` value without `@` and not numeric is a display name.
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            to: Some("John".to_string()),
+            ..Default::default()
+        };
+        let res = handle(&client, req).await.unwrap();
+        assert_eq!(res.chat_id, 1);
+    }
+
+    #[tokio::test]
+    async fn send_by_username() {
+        let client = MockClient::default();
+        let result = send_message(
+            &client,
+            SendTarget::Username("johndoe".to_string()),
+            "Hello",
+        )
+        .await;
+        assert_eq!(result.unwrap().chat_id, 1);
     }
 
     #[tokio::test]

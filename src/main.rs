@@ -458,9 +458,10 @@ async fn run_command(
             let target = if let Some(ref to) = args.to {
                 if let Ok(id) = to.parse::<i64>() {
                     send::SendTarget::Id(id)
+                } else if let Some(username) = to.strip_prefix('@') {
+                    send::SendTarget::Username(username.to_string())
                 } else {
-                    let name = to.strip_prefix('@').unwrap_or(to);
-                    send::SendTarget::Name(name.to_string())
+                    send::SendTarget::Name(to.clone())
                 }
             } else if let Some(id) = args.id {
                 send::SendTarget::Id(id)
