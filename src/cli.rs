@@ -87,9 +87,9 @@ pub struct SendArgs {
     #[arg(required_unless_present_any = ["id", "group", "to"])]
     pub name: Option<String>,
 
-    /// Message text
+    /// Message text (if omitted, read from stdin)
     #[arg(short, long)]
-    pub message: String,
+    pub message: Option<String>,
 
     /// Chat ID (for piping from search)
     #[arg(long, allow_hyphen_values = true)]
@@ -256,7 +256,7 @@ mod tests {
                 assert_eq!(args.name, Some("John Doe".to_string()));
                 assert_eq!(args.id, None);
                 assert_eq!(args.group, None);
-                assert_eq!(args.message, "Hello!");
+                assert_eq!(args.message.as_deref(), Some("Hello!"));
             }
             _ => panic!("Expected Send command"),
         }
@@ -269,7 +269,7 @@ mod tests {
             Command::Send(args) => {
                 assert_eq!(args.name, None);
                 assert_eq!(args.id, Some(123456789));
-                assert_eq!(args.message, "Hello!");
+                assert_eq!(args.message.as_deref(), Some("Hello!"));
             }
             _ => panic!("Expected Send command"),
         }
@@ -289,7 +289,7 @@ mod tests {
             Command::Send(args) => {
                 assert_eq!(args.name, None);
                 assert_eq!(args.group, Some("Family Chat".to_string()));
-                assert_eq!(args.message, "Hello everyone!");
+                assert_eq!(args.message.as_deref(), Some("Hello everyone!"));
             }
             _ => panic!("Expected Send command"),
         }
@@ -717,7 +717,7 @@ mod tests {
             Command::Send(args) => {
                 assert_eq!(args.send_as, Some("@mybot".to_string()));
                 assert_eq!(args.to, Some("@someone".to_string()));
-                assert_eq!(args.message, "hello");
+                assert_eq!(args.message.as_deref(), Some("hello"));
                 assert_eq!(args.name, None);
             }
             _ => panic!("Expected Send command"),

@@ -1,3 +1,5 @@
+use std::io::Read;
+
 use serde::{Deserialize, Serialize};
 
 use crate::cli::SendArgs;
@@ -26,7 +28,8 @@ pub struct SendRequest {
 }
 
 /// Convert clap args to a `SendRequest`. Panics if `--as <bot>` is set, because
-/// bot sends use the HTTP API path and never reach this code.
+/// bot sends use the HTTP API path and never reach this code. Also expects the
+/// message to have been resolved (from `--message` or stdin) in `main::run`.
 impl From<SendArgs> for SendRequest {
     fn from(args: SendArgs) -> Self {
         debug_assert!(
@@ -34,13 +37,57 @@ impl From<SendArgs> for SendRequest {
             "bot sends (--as) must be routed before SendRequest"
         );
         Self {
-            message: args.message,
+            message: args
+                .message
+                .expect("send message must be resolved before SendRequest"),
             name: args.name,
             id: args.id,
             to: args.to,
             group: args.group,
         }
     }
+}
+
+/// Resolve the message body to send: use `--message`/`-m` if provided, otherwise
+/// read it from stdin. Errors if no `--message` is given and stdin is an
+/// interactive terminal (nothing piped) or contains only whitespace.
+pub fn resolve_message(message: Option<String>) -> Result<String> {
+    use std::io::IsTerminal;
+    let stdin = std::io::stdin();
+    let is_terminal = stdin.is_terminal();
+    resolve_message_from(message, is_terminal, stdin.lock())
+}
+
+/// Testable core of [`resolve_message`]: takes the terminal flag and reader
+/// explicitly so stdin handling can be exercised without a real terminal.
+fn resolve_message_from<R: Read>(
+    message: Option<String>,
+    stdin_is_terminal: bool,
+    mut reader: R,
+) -> Result<String> {
+    if let Some(message) = message {
+        return Ok(message);
+    }
+
+    if stdin_is_terminal {
+        return Err(TgError::Other(
+            "send: no message provided (pass --message/-m or pipe text via stdin)".to_string(),
+        ));
+    }
+
+    let mut buf = String::new();
+    reader.read_to_string(&mut buf)?;
+
+    // Strip the trailing newline(s) that pipes/`echo` append, but keep internal
+    // newlines and any other trailing whitespace the user intended.
+    let trimmed = buf.trim_end_matches(['\n', '\r']);
+    if trimmed.trim().is_empty() {
+        return Err(TgError::Other(
+            "send: empty message read from stdin".to_string(),
+        ));
+    }
+
+    Ok(trimmed.to_string())
 }
 
 pub async fn send_message<C: TelegramClient>(
@@ -213,6 +260,54 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap().chat_id, 1);
+    }
+
+    #[test]
+    fn resolve_message_prefers_explicit_flag() {
+        // When --message is given, stdin is ignored entirely (even if non-terminal).
+        let got = resolve_message_from(Some("hello".to_string()), false, b"piped".as_slice())
+            .expect("explicit message should resolve");
+        assert_eq!(got, "hello");
+    }
+
+    #[test]
+    fn resolve_message_reads_stdin_and_strips_trailing_newline() {
+        let got = resolve_message_from(None, false, b"hi\n".as_slice())
+            .expect("piped message should resolve");
+        assert_eq!(got, "hi");
+    }
+
+    #[test]
+    fn resolve_message_preserves_internal_newlines() {
+        let got = resolve_message_from(None, false, b"line1\nline2\n".as_slice())
+            .expect("multi-line message should resolve");
+        assert_eq!(got, "line1\nline2");
+    }
+
+    #[test]
+    fn resolve_message_strips_crlf() {
+        let got = resolve_message_from(None, false, b"hi\r\n".as_slice())
+            .expect("CRLF message should resolve");
+        assert_eq!(got, "hi");
+    }
+
+    #[test]
+    fn resolve_message_empty_stdin_errors() {
+        let err = resolve_message_from(None, false, b"".as_slice()).unwrap_err();
+        assert!(err.to_string().contains("message"));
+    }
+
+    #[test]
+    fn resolve_message_whitespace_only_stdin_errors() {
+        let err = resolve_message_from(None, false, b"   \n".as_slice()).unwrap_err();
+        assert!(err.to_string().contains("message"));
+    }
+
+    #[test]
+    fn resolve_message_terminal_without_flag_errors() {
+        // Interactive terminal with no --message must not hang; it errors instead.
+        let err = resolve_message_from(None, true, b"".as_slice()).unwrap_err();
+        assert!(err.to_string().contains("message"));
     }
 
     #[tokio::test]

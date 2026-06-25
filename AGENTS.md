@@ -88,6 +88,8 @@ tg unread
 tg send "John Doe" -m "Hello!"
 tg send --id 123456789 -m "Hello!"
 tg send --group "Family" -m "Hi all!"
+tg send --to @username -m "Hi!"
+echo "Hello from stdin" | tg send --to @username   # omit -m to read the body from stdin
 tg messages "John Doe" [--limit 20] [--since-utc 2026-03-01]
 tg messages --chat -1001666847309 [--limit 20] [--since-utc 2026-03-01]
 tg download --chat -1001666847309 --message 42 [--output-dir .] [--priority 16]

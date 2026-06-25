@@ -34,8 +34,15 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(command: Command, format: OutputFormat) -> Result<()> {
+async fn run(mut command: Command, format: OutputFormat) -> Result<()> {
     let data_dir = credentials::tg_data_dir();
+
+    // Resolve the send message body (from --message or stdin) once, up front, so
+    // every downstream path (bot HTTP, serve proxy, in-process) sees a concrete
+    // value. Done before any network/auth work so a missing message fails fast.
+    if let Command::Send(ref mut args) = command {
+        args.message = Some(send::resolve_message(args.message.take())?);
+    }
 
     // Auth subcommands that don't need TDLib at all.
     if let Command::Auth(ref args) = command {
@@ -355,7 +362,11 @@ async fn run_bot_send(
     };
     let chat_id = resolve::resolve_recipient(recipient, &creds_file, data_dir).await?;
 
-    let message_id = bot_api::send_message(&bot.token, chat_id, &args.message).await?;
+    let message = args
+        .message
+        .as_deref()
+        .expect("send message must be resolved before run_bot_send");
+    let message_id = bot_api::send_message(&bot.token, chat_id, message).await?;
 
     let result = SendResult {
         message_id,
@@ -471,7 +482,11 @@ async fn run_command(
                 send::SendTarget::Name(args.name.unwrap())
             };
 
-            let result = send::send_message(client, target, &args.message).await?;
+            let message = args
+                .message
+                .as_deref()
+                .expect("send message must be resolved before run_command");
+            let result = send::send_message(client, target, message).await?;
             print_output(format, &result);
         }
 
