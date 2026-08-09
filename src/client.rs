@@ -419,6 +419,9 @@ struct ChatSnapshot {
     unread_count: i32,
     last_message: Option<String>,
     chat_type: ChatTypeKind,
+    /// Bot marker of the chat's user counterpart; `None` when there is none or
+    /// it could not be read.
+    is_bot: Option<bool>,
 }
 
 impl ChatSnapshot {
@@ -426,6 +429,7 @@ impl ChatSnapshot {
         ChatInfo {
             id: self.id,
             name: self.title.clone(),
+            is_bot: self.is_bot,
             unread_count: self.unread_count,
             last_message: self.last_message.clone(),
         }
@@ -454,11 +458,23 @@ impl ChatDataSource for TdLibClient {
             .await
             .map_err(|e| TgError::TdLib(e.message))?;
         let chat = unwrap_chat(chat_enum);
-        let chat_type = match chat.r#type {
-            tdlib_rs::enums::ChatType::Private(_) => ChatTypeKind::Private,
-            tdlib_rs::enums::ChatType::BasicGroup(_) => ChatTypeKind::BasicGroup,
-            tdlib_rs::enums::ChatType::Supergroup(_) => ChatTypeKind::Supergroup,
-            _ => ChatTypeKind::Other,
+        let (chat_type, counterpart_user_id) = match chat.r#type {
+            tdlib_rs::enums::ChatType::Private(p) => (ChatTypeKind::Private, Some(p.user_id)),
+            tdlib_rs::enums::ChatType::BasicGroup(_) => (ChatTypeKind::BasicGroup, None),
+            tdlib_rs::enums::ChatType::Supergroup(_) => (ChatTypeKind::Supergroup, None),
+            _ => (ChatTypeKind::Other, None),
+        };
+
+        // Only a private chat has a single user counterpart that can carry the
+        // bot marker. TDLib answers `getUser` for a listed chat from its local
+        // cache, so this costs no server round trip. A failed lookup stays
+        // `None` — unknown, not "not a bot".
+        let is_bot = match counterpart_user_id {
+            Some(user_id) => tdlib_rs::functions::get_user(user_id, client_id)
+                .await
+                .ok()
+                .map(|ue| user_type_is_bot(&unwrap_user(ue).r#type)),
+            None => None,
         };
 
         Ok(ChatSnapshot {
@@ -470,6 +486,7 @@ impl ChatDataSource for TdLibClient {
                 .as_ref()
                 .and_then(|m| extract_message_text(&m.content)),
             chat_type,
+            is_bot,
         })
     }
 }
@@ -1789,6 +1806,14 @@ fn get_user_full_name(user: &tdlib_rs::types::User) -> String {
     }
 }
 
+/// Telegram's own bot marker. `userTypeBot` is the only authoritative signal —
+/// a display name is not one (a person may be surnamed "Talbot"). A deleted
+/// bot reports `userTypeDeleted`, which is indistinguishable from a deleted
+/// person, so it reads as not-a-bot.
+fn user_type_is_bot(user_type: &tdlib_rs::enums::UserType) -> bool {
+    matches!(user_type, tdlib_rs::enums::UserType::Bot(_))
+}
+
 #[async_trait]
 impl MessageHistorySource for TdLibClient {
     async fn fetch_batch(
@@ -1827,15 +1852,18 @@ impl MessageHistorySource for TdLibClient {
         let mut result = Vec::new();
         for msg in unwrap_messages(msgs_enum).messages.into_iter().flatten() {
             let extracted = extract_message_data(&msg.content);
-            let (sender_id, sender) = match &msg.sender_id {
+            let (sender_id, sender, sender_is_bot) = match &msg.sender_id {
                 tdlib_rs::enums::MessageSender::User(u) => {
-                    let name =
-                        if let Ok(ue) = tdlib_rs::functions::get_user(u.user_id, client_id).await {
-                            get_user_full_name(&unwrap_user(ue))
-                        } else {
-                            "Unknown".to_string()
-                        };
-                    (Some(u.user_id), name)
+                    match tdlib_rs::functions::get_user(u.user_id, client_id).await {
+                        Ok(ue) => {
+                            let user = unwrap_user(ue);
+                            let is_bot = user_type_is_bot(&user.r#type);
+                            (Some(u.user_id), get_user_full_name(&user), Some(is_bot))
+                        }
+                        // No user object, no answer. The gap travels as
+                        // "Unknown"/`null` rather than as a guessed `false`.
+                        Err(_) => (Some(u.user_id), "Unknown".to_string(), None),
+                    }
                 }
                 tdlib_rs::enums::MessageSender::Chat(c) => {
                     let name =
@@ -1844,7 +1872,9 @@ impl MessageHistorySource for TdLibClient {
                         } else {
                             "Unknown".to_string()
                         };
-                    (None, name)
+                    // A chat sender is a channel or group, not a user account,
+                    // so it carries no bot marker either way.
+                    (None, name, Some(false))
                 }
             };
             result.push(MessageInfo {
@@ -1852,6 +1882,7 @@ impl MessageHistorySource for TdLibClient {
                 chat_id: msg.chat_id,
                 sender_id,
                 sender,
+                sender_is_bot,
                 text: extracted.text,
                 date: format_timestamp(msg.date),
                 timestamp: msg.date,
@@ -2103,6 +2134,7 @@ impl TelegramClient for TdLibClient {
                 result.push(ContactInfo {
                     id: user_id,
                     name: get_user_full_name(&user),
+                    is_bot: Some(user_type_is_bot(&user.r#type)),
                     username,
                     phone,
                 });
@@ -2434,6 +2466,7 @@ impl TelegramClient for TdLibClient {
             .await
             .map_err(|e| TgError::TdLib(e.message))?;
         let tdlib_rs::enums::User::User(user) = user_enum;
+        let is_bot = user_type_is_bot(&user.r#type);
         let username = user
             .usernames
             .map(|u| u.editable_username)
@@ -2447,6 +2480,7 @@ impl TelegramClient for TdLibClient {
             id: user.id,
             first_name: user.first_name,
             last_name: user.last_name,
+            is_bot: Some(is_bot),
             username,
             phone,
         })
@@ -2728,12 +2762,14 @@ pub mod mock {
                     ChatInfo {
                         id: 1,
                         name: "John Doe".to_string(),
+                        is_bot: Some(false),
                         unread_count: 2,
                         last_message: Some("Hello!".to_string()),
                     },
                     ChatInfo {
                         id: 2,
                         name: "Jane Smith".to_string(),
+                        is_bot: Some(false),
                         unread_count: 0,
                         last_message: None,
                     },
@@ -2741,6 +2777,7 @@ pub mod mock {
                 groups: vec![ChatInfo {
                     id: 100,
                     name: "Family Chat".to_string(),
+                    is_bot: Some(false),
                     unread_count: 5,
                     last_message: Some("See you tomorrow".to_string()),
                 }],
@@ -2748,12 +2785,14 @@ pub mod mock {
                     ContactInfo {
                         id: 1,
                         name: "John Doe".to_string(),
+                        is_bot: Some(false),
                         username: Some("johndoe".to_string()),
                         phone: Some("+1234567890".to_string()),
                     },
                     ContactInfo {
                         id: 2,
                         name: "Jane Smith".to_string(),
+                        is_bot: Some(false),
                         username: None,
                         phone: None,
                     },
@@ -2769,6 +2808,7 @@ pub mod mock {
                         chat_id: 1,
                         sender_id: Some(100),
                         sender: "John Doe".to_string(),
+                        sender_is_bot: Some(false),
                         text: "Hello!".to_string(),
                         date: "1h ago".to_string(),
                         timestamp: 0,
@@ -2784,6 +2824,7 @@ pub mod mock {
                         chat_id: 1,
                         sender_id: Some(200),
                         sender: "You".to_string(),
+                        sender_is_bot: Some(false),
                         text: "Hi there!".to_string(),
                         date: "30m ago".to_string(),
                         timestamp: 0,
@@ -2944,6 +2985,7 @@ pub mod mock {
                 id: 42,
                 first_name: "John".to_string(),
                 last_name: "Doe".to_string(),
+                is_bot: Some(false),
                 username: Some("johndoe".to_string()),
                 phone: Some("+1234567890".to_string()),
             })
@@ -2994,6 +3036,19 @@ mod tests {
                 uploaded_size: 1234,
             },
         }
+    }
+
+    #[test]
+    fn bot_marker_comes_from_the_user_type_only() {
+        use tdlib_rs::enums::UserType;
+
+        assert!(user_type_is_bot(&UserType::Bot(
+            tdlib_rs::types::UserTypeBot::default()
+        )));
+        assert!(!user_type_is_bot(&UserType::Regular));
+        // A deleted bot is reported as deleted, not as a bot.
+        assert!(!user_type_is_bot(&UserType::Deleted));
+        assert!(!user_type_is_bot(&UserType::Unknown));
     }
 
     #[test]
@@ -3460,6 +3515,7 @@ mod tests {
             unread_count,
             last_message: None,
             chat_type,
+            is_bot: None,
         }
     }
 
@@ -3528,6 +3584,7 @@ mod tests {
             chat_id: 1,
             sender_id: Some(300),
             sender: "Alice".to_string(),
+            sender_is_bot: Some(false),
             text: format!("msg {id}"),
             date: "1h ago".to_string(),
             timestamp: 0,

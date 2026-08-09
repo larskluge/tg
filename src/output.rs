@@ -61,6 +61,11 @@ pub trait PlainText {
 pub struct ChatInfo {
     pub id: i64,
     pub name: String,
+    /// Telegram's `userTypeBot` marker for the chat's counterpart. `None` when
+    /// the chat has no single user counterpart (group, channel) or the user
+    /// could not be read — never `false` on a guess.
+    #[serde(default)]
+    pub is_bot: Option<bool>,
     pub unread_count: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message: Option<String>,
@@ -264,6 +269,10 @@ pub fn print_chats_table(chats: &[ChatInfo]) {
 pub struct ContactInfo {
     pub id: i64,
     pub name: String,
+    /// Telegram's `userTypeBot` marker. `None` only when the value is unknown,
+    /// e.g. a payload from a `tg serve` older than 0.4.4.
+    #[serde(default)]
+    pub is_bot: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -715,6 +724,14 @@ pub struct MessageInfo {
     pub chat_id: i64,
     pub sender_id: Option<i64>,
     pub sender: String,
+    /// Telegram's `userTypeBot` marker for the sender. `false` for a human and
+    /// for a chat sender (a channel or group posts as a chat, not as a user
+    /// account). `None` means the sender's user object could not be read, so
+    /// the answer is unknown — the same case that leaves `sender` as
+    /// `"Unknown"`. Never `false` on a guess: a display name ending in "bot"
+    /// is not a marker.
+    #[serde(default)]
+    pub sender_is_bot: Option<bool>,
     pub text: String,
     pub date: String,
     #[serde(skip)]
@@ -821,6 +838,10 @@ pub struct UserInfo {
     pub id: i64,
     pub first_name: String,
     pub last_name: String,
+    /// Telegram's `userTypeBot` marker. `None` only when the value is unknown,
+    /// e.g. a payload from a `tg serve` older than 0.4.4.
+    #[serde(default)]
+    pub is_bot: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -873,6 +894,7 @@ mod tests {
         let chat = ChatInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            is_bot: Some(false),
             unread_count: 0,
             last_message: None,
         };
@@ -886,6 +908,7 @@ mod tests {
         let chat = ChatInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            is_bot: Some(false),
             unread_count: 5,
             last_message: None,
         };
@@ -900,6 +923,7 @@ mod tests {
         let chat = ChatInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            is_bot: Some(false),
             unread_count: 5,
             last_message: Some("Hello".to_string()),
         };
@@ -915,6 +939,7 @@ mod tests {
         let chat = ChatInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            is_bot: Some(false),
             unread_count: 0,
             last_message: None,
         };
@@ -927,6 +952,7 @@ mod tests {
         let contact = ContactInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            is_bot: Some(false),
             username: Some("johndoe".to_string()),
             phone: Some("+1234567890".to_string()),
         };
@@ -942,6 +968,7 @@ mod tests {
         let contact = ContactInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            is_bot: Some(false),
             username: None,
             phone: None,
         };
@@ -956,6 +983,7 @@ mod tests {
         let contact = ContactInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            is_bot: Some(false),
             username: Some("johndoe".to_string()),
             phone: Some("+1234567890".to_string()),
         };
@@ -971,6 +999,7 @@ mod tests {
         let contact = ContactInfo {
             id: 123456789,
             name: "John Doe".to_string(),
+            is_bot: Some(false),
             username: None,
             phone: None,
         };
@@ -988,6 +1017,7 @@ mod tests {
             chat_id: 123,
             sender_id: Some(400),
             sender: "John".to_string(),
+            sender_is_bot: Some(false),
             text: "Hello!".to_string(),
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
@@ -1012,6 +1042,7 @@ mod tests {
             chat_id: 123,
             sender_id: Some(500),
             sender: "Me".to_string(),
+            sender_is_bot: Some(false),
             text: "Hi there!".to_string(),
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
@@ -1028,12 +1059,97 @@ mod tests {
     }
 
     #[test]
+    fn message_info_json_carries_the_bot_marker() {
+        let msg = MessageInfo {
+            id: 1,
+            chat_id: 93372553,
+            sender_id: Some(93372553),
+            sender: "BotFather".to_string(),
+            sender_is_bot: Some(true),
+            text: "/start".to_string(),
+            date: "2024-01-01 12:00".to_string(),
+            timestamp: 0,
+            is_outgoing: false,
+            edit_date: None,
+            content_type: None,
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"sender_is_bot\":true"));
+    }
+
+    #[test]
+    fn message_info_json_reports_an_unreadable_sender_as_null() {
+        // A sender we could not look up must not read as "not a bot".
+        let msg = MessageInfo {
+            id: 1,
+            chat_id: 123,
+            sender_id: Some(400),
+            sender: "Unknown".to_string(),
+            sender_is_bot: None,
+            text: "Hello!".to_string(),
+            date: "2024-01-01 12:00".to_string(),
+            timestamp: 0,
+            is_outgoing: false,
+            edit_date: None,
+            content_type: None,
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+        };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"sender_is_bot\":null"));
+    }
+
+    #[test]
+    fn message_info_without_the_bot_marker_deserialises_as_unknown() {
+        // Payload from a `tg serve` older than 0.4.4: the key is absent, and
+        // the gap must survive as `None` rather than collapse to `false`.
+        let json = r#"{
+            "id": 1,
+            "chat_id": 123,
+            "sender_id": 400,
+            "sender": "John",
+            "text": "Hello!",
+            "date": "2024-01-01 12:00",
+            "is_outgoing": false,
+            "is_downloadable": false
+        }"#;
+        let msg: MessageInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.sender_is_bot, None);
+    }
+
+    #[test]
+    fn chat_info_without_the_bot_marker_deserialises_as_unknown() {
+        let json = r#"{"id": 1, "name": "John Doe", "unread_count": 0}"#;
+        let chat: ChatInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(chat.is_bot, None);
+    }
+
+    #[test]
+    fn user_info_without_the_bot_marker_deserialises_as_unknown() {
+        let json = r#"{"id": 1, "first_name": "John", "last_name": "Doe"}"#;
+        let user: UserInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(user.is_bot, None);
+    }
+
+    #[test]
+    fn contact_info_without_the_bot_marker_deserialises_as_unknown() {
+        let json = r#"{"id": 1, "name": "John Doe"}"#;
+        let contact: ContactInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(contact.is_bot, None);
+    }
+
+    #[test]
     fn print_messages_table_renders_without_panic() {
         let msgs = vec![MessageInfo {
             id: 1,
             chat_id: 123,
             sender_id: Some(400),
             sender: "John".to_string(),
+            sender_is_bot: Some(false),
             text: "[Photo: 720x1280]".to_string(),
             date: "2026-02-25T17:45:12Z".to_string(),
             timestamp: 0,
@@ -1055,6 +1171,7 @@ mod tests {
             chat_id: 123,
             sender_id: Some(300),
             sender: "Alice".to_string(),
+            sender_is_bot: Some(false),
             text: "[Emoji: 😀]".to_string(),
             date: "2026-02-25T17:45:12Z".to_string(),
             timestamp: 0,
@@ -1084,6 +1201,7 @@ mod tests {
             chat_id: 123,
             sender_id: Some(300),
             sender: "Alice".to_string(),
+            sender_is_bot: Some(false),
             text: "Audio: Song".to_string(),
             date: "1h ago".to_string(),
             timestamp: 0,
@@ -1131,6 +1249,7 @@ mod tests {
             chat_id: -1001234567890,
             sender_id: None,
             sender: "Tech Channel".to_string(),
+            sender_is_bot: Some(false),
             text: "Channel announcement".to_string(),
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
@@ -1153,6 +1272,7 @@ mod tests {
             chat_id: -1001234567890,
             sender_id: None,
             sender: "Tech Channel".to_string(),
+            sender_is_bot: Some(false),
             text: "Channel announcement".to_string(),
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
@@ -1215,6 +1335,7 @@ mod tests {
             chat_id: 123,
             sender_id: Some(300),
             sender: "Alice".to_string(),
+            sender_is_bot: Some(false),
             text: "Hello".to_string(),
             date: "2024-01-01T00:00:00Z".to_string(),
             timestamp: 0,
@@ -1236,6 +1357,7 @@ mod tests {
             chat_id: 123,
             sender_id: Some(300),
             sender: "Alice".to_string(),
+            sender_is_bot: Some(false),
             text: "Hello (edited)".to_string(),
             date: "2024-01-01T00:00:00Z".to_string(),
             timestamp: 0,

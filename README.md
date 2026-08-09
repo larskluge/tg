@@ -171,6 +171,15 @@ Output is always JSON, keyed by chat ID. Each value is an array of messages or a
 
 The HWM boundary message itself is excluded from results (it was already consumed). Exit code is 0 if all chats succeeded, 1 if any chat had an error (successful results are still in the output).
 
+### Bot markers
+
+Every JSON surface carries Telegram's own bot flag, so consumers never have to guess from a display name (a person can be surnamed "Talbot"; a bot can be named anything):
+
+- `sender_is_bot` on each message (`tg messages --json`, `tg sync`)
+- `is_bot` on each chat (`tg chats --json`, `tg groups --json`, `tg unread --json`), contact (`tg search --json`) and user (`tg whoami --json`)
+
+The value is `true` or `false` when `tg` could determine it, and `null` when it could not. `null` means unknown, never "not a bot": the sender's user object was unreadable (the same case that leaves `sender` as `"Unknown"`), the chat has no single user counterpart (groups and channels), or the payload came from a `tg` older than 0.4.4. A message sent by a channel or group rather than by a user account is `false` — a chat sender carries no bot marker either way. Deleted and inaccessible accounts also report `false`: Telegram reports them as `userTypeDeleted`/`userTypeUnknown` and no longer says whether they were bots.
+
 ## Testing
 
 ```bash

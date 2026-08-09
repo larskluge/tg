@@ -207,6 +207,7 @@ mod tests {
             chat_id,
             sender_id: Some(100),
             sender: "Alice".to_string(),
+            sender_is_bot: Some(false),
             text: format!("msg {id}"),
             date: "1h ago".to_string(),
             timestamp,
