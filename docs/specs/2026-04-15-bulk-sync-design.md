@@ -95,7 +95,7 @@ pub enum SyncResult {
 **Reconcile sweep (`--reconcile-days N`):**
 
 1. Compute `now - N days` as a Unix timestamp.
-2. For each chat: use timestamp-based boundary lookup (`get_boundary_message_id`) with warmup fetch and retry, same as `tg messages --since-utc`.
+2. For each chat: use timestamp-based boundary lookup (`get_boundary_message_id`) with warmup fetch, same as `tg messages --since-utc`. (The 300 ms retry this originally specified was removed in 0.4.5, once the lookup stopped missing.)
 3. Otherwise same as normal flow.
 
 ### Reused components

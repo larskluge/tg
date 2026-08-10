@@ -46,9 +46,6 @@ pub async fn handle<C: TelegramClient>(
     Ok(sync_chats(client, hwm_map, req.limit, req.reconcile_days).await)
 }
 
-/// Milliseconds to wait before a single retry of `get_boundary_message_id`.
-const BOUNDARY_RETRY_DELAY_MS: u64 = 300;
-
 /// Per-chat sync outcome: either messages or an error description.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -161,35 +158,20 @@ async fn sync_single_chat_by_timestamp<C: TelegramClient>(
         }
     };
 
-    let (until_message_id, no_boundary) = match boundary {
-        BoundaryResult::Empty => return SyncResult::Messages(vec![]),
-        BoundaryResult::BoundAt(id) => (Some(id), false),
-        BoundaryResult::None => {
-            tokio::time::sleep(tokio::time::Duration::from_millis(BOUNDARY_RETRY_DELAY_MS)).await;
-            match client.get_boundary_message_id(chat_id, timestamp).await {
-                Ok(BoundaryResult::BoundAt(id)) => (Some(id), false),
-                Ok(_) => (None, true),
-                Err(e) => {
-                    return SyncResult::Error {
-                        error: e.to_string(),
-                    };
-                }
-            }
-        }
+    let until_message_id = match boundary {
+        BoundaryResult::BoundAt(id) => Some(id),
+        BoundaryResult::None => None,
     };
 
     match client.get_messages(chat_id, limit, until_message_id).await {
-        Ok(messages) => {
-            let messages = if no_boundary {
-                messages
-                    .into_iter()
-                    .filter(|m| m.timestamp >= timestamp)
-                    .collect()
-            } else {
-                messages
-            };
-            SyncResult::Messages(messages)
-        }
+        // The boundary orders by message id; the cutoff is a date. Filter to make
+        // the requested window the one that is actually returned.
+        Ok(messages) => SyncResult::Messages(
+            messages
+                .into_iter()
+                .filter(|m| m.timestamp >= timestamp)
+                .collect(),
+        ),
         Err(e) => SyncResult::Error {
             error: e.to_string(),
         },
@@ -366,9 +348,11 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reconcile_days_uses_timestamp_path() {
+        // Inside the 7-day reconcile window, so it survives the cutoff filter.
+        let within_window = (chrono::Utc::now() - chrono::Duration::days(1)).timestamp() as i32;
         let client = MockClient {
             boundary_result: BoundaryResult::BoundAt(1),
-            messages: vec![make_message(1, 1, 1000)],
+            messages: vec![make_message(1, 1, within_window)],
             ..MockClient::default()
         };
 
@@ -378,6 +362,30 @@ mod tests {
         let results = sync_chats(&client, hwm_map, 20, Some(7)).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => assert!(!msgs.is_empty()),
+            SyncResult::Error { error } => panic!("unexpected error: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_reconcile_days_drops_messages_before_the_cutoff() {
+        // A message older than the reconcile window must not come back, even
+        // though the id boundary would have admitted it.
+        let before_window = (chrono::Utc::now() - chrono::Duration::days(30)).timestamp() as i32;
+        let client = MockClient {
+            boundary_result: BoundaryResult::BoundAt(1),
+            messages: vec![make_message(1, 1, before_window)],
+            ..MockClient::default()
+        };
+
+        let mut hwm_map = HashMap::new();
+        hwm_map.insert(1i64, 0i64);
+
+        let results = sync_chats(&client, hwm_map, 20, Some(7)).await;
+        match &results[&1] {
+            SyncResult::Messages(msgs) => assert!(
+                msgs.is_empty(),
+                "message older than the reconcile window must be dropped"
+            ),
             SyncResult::Error { error } => panic!("unexpected error: {error}"),
         }
     }

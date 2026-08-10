@@ -31,12 +31,39 @@ fn set_tdlib_log_verbosity(level: i32) {
 /// Result of looking up a boundary message via `get_boundary_message_id`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BoundaryResult {
-    /// No boundary — fetch most recent messages
+    /// No boundary — every message in the chat is at or after the cutoff, so
+    /// fetch the most recent messages unbounded.
     None,
-    /// Stop at this message id (inclusive)
+    /// Stop at this message id (inclusive). The id is one above the newest
+    /// message that predates the cutoff, so that message is itself excluded.
     BoundAt(i64),
-    /// No messages exist at or after the requested timestamp — return empty immediately
-    Empty,
+}
+
+/// The date to hand `getChatMessageByDate` when looking for the boundary of `cutoff`.
+///
+/// TDLib returns "the last message sent no later than the specified date", so probing
+/// at `cutoff - 1` lands on the newest message *strictly* older than the cutoff.
+/// Probing at `cutoff` itself would return a message sent exactly at the cutoff —
+/// which `--since-utc` includes, so it must not become an exclusive bound.
+///
+/// The clamp keeps the probe date non-negative for cutoffs at or before the epoch
+/// (`--since-utc 1960-01-01` parses fine). No Telegram message predates the epoch, so
+/// probing at 0 finds nothing there either and the lookup correctly reports no bound.
+fn boundary_probe_date(cutoff: i32) -> i32 {
+    cutoff.saturating_sub(1).max(0)
+}
+
+/// Turn the probe result into a fetch boundary.
+///
+/// `probe_id` is the id of the newest message older than the cutoff, or `None` when
+/// TDLib reports 404 (no message predates the cutoff — the whole chat qualifies).
+/// Message ids are integers, so `probe_id + 1` is the smallest id that can belong to
+/// a message newer than the probe, giving an exclusive bound with an inclusive test.
+fn boundary_from_probe(probe_id: Option<i64>) -> BoundaryResult {
+    match probe_id {
+        Some(id) if id > 0 => BoundaryResult::BoundAt(id + 1),
+        _ => BoundaryResult::None,
+    }
 }
 
 #[async_trait]
@@ -64,10 +91,8 @@ pub trait TelegramClient: Send + Sync {
         until_message_id: Option<i64>,
     ) -> Result<Vec<MessageInfo>>;
 
-    /// Find the boundary message for `--since-utc` filtering.
-    ///
-    /// Uses TDLib's `getChatMessageByDate(timestamp)` which returns the nearest
-    /// message at or before the given timestamp.
+    /// Find the fetch boundary for `--since-utc` filtering: the lowest message id
+    /// that can belong to a message sent at or after `timestamp`.
     async fn get_boundary_message_id(&self, chat_id: i64, timestamp: i32)
     -> Result<BoundaryResult>;
 
@@ -2273,20 +2298,13 @@ impl TelegramClient for TdLibClient {
         timestamp: i32,
     ) -> Result<BoundaryResult> {
         let client_id = self.get_client_id().await?;
-        match tdlib_rs::functions::get_chat_message_by_date(chat_id, timestamp, client_id).await {
-            Ok(msg_enum) => {
-                let msg = unwrap_message(msg_enum);
-                if msg.id == 0 {
-                    Ok(BoundaryResult::None)
-                } else if msg.date >= timestamp {
-                    Ok(BoundaryResult::BoundAt(msg.id))
-                } else {
-                    // TDLib returned a message older than the requested timestamp —
-                    // all messages in this chat are before the cutoff.
-                    Ok(BoundaryResult::Empty)
-                }
-            }
-            Err(_) => Ok(BoundaryResult::None),
+        let probe_date = boundary_probe_date(timestamp);
+        match tdlib_rs::functions::get_chat_message_by_date(chat_id, probe_date, client_id).await {
+            Ok(msg_enum) => Ok(boundary_from_probe(Some(unwrap_message(msg_enum).id))),
+            // 404 is the documented "no such message" answer: nothing in this chat
+            // predates the cutoff. Anything else is a real failure — surface it.
+            Err(e) if e.code == 404 => Ok(boundary_from_probe(None)),
+            Err(e) => Err(TgError::TdLib(e.message)),
         }
     }
 
@@ -2738,6 +2756,8 @@ pub mod mock {
         pub boundary_result: BoundaryResult,
         /// Tracks how many times `get_messages` has been called
         pub get_messages_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Tracks how many times `get_boundary_message_id` has been called
+        pub get_boundary_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl MockClient {
@@ -2800,6 +2820,9 @@ pub mod mock {
                 inaccessible_chat_ids: vec![],
                 boundary_result: BoundaryResult::None,
                 get_messages_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+                    0,
+                )),
+                get_boundary_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                     0,
                 )),
                 messages: vec![
@@ -2960,6 +2983,8 @@ pub mod mock {
             _chat_id: i64,
             _timestamp: i32,
         ) -> Result<BoundaryResult> {
+            self.get_boundary_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(self.boundary_result.clone())
         }
 
@@ -3762,6 +3787,61 @@ mod tests {
             "message before boundary (id=6) must be excluded"
         );
         assert_eq!(ids, vec![10, 9, 8, 7]);
+    }
+
+    #[tokio::test]
+    async fn collect_messages_boundary_excludes_the_probe_message() {
+        // `boundary_from_probe` returns probe_id + 1, so the probed message (the
+        // newest one *before* the cutoff) is itself excluded while everything
+        // newer is kept.
+        let source = TestMessageSource::new(vec![vec![msg(10), msg(9), msg(8), msg(7), msg(6)]]);
+        let boundary = match boundary_from_probe(Some(8)) {
+            BoundaryResult::BoundAt(id) => Some(id),
+            other => panic!("expected BoundAt, got {other:?}"),
+        };
+        let result = collect_messages_paginated(&source, 0, 20, boundary)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = result.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![10, 9],
+            "probe message (id=8) is before the cutoff and must be excluded"
+        );
+    }
+
+    #[test]
+    fn boundary_probe_date_is_one_second_before_the_cutoff() {
+        // TDLib answers "last message no later than date", so probing at cutoff-1
+        // lands on the newest message strictly older than the cutoff. Probing at
+        // the cutoff itself would return a message *at* the cutoff, which
+        // `--since-utc` must include, not use as an exclusive bound.
+        assert_eq!(boundary_probe_date(1772323200), 1772323199);
+        assert_eq!(boundary_probe_date(1), 0);
+        assert_eq!(boundary_probe_date(0), 0, "must not probe a negative date");
+        // `--since-utc 1960-01-01` parses to a negative timestamp.
+        assert_eq!(
+            boundary_probe_date(-315619200),
+            0,
+            "pre-epoch cutoffs clamp instead of probing a negative date"
+        );
+    }
+
+    #[test]
+    fn boundary_from_probe_bounds_just_above_the_probe_message() {
+        // The old mapping required the probed message's date to be >= the cutoff,
+        // which TDLib's contract makes impossible — so it never produced a bound.
+        assert_eq!(
+            boundary_from_probe(Some(22311600128)),
+            BoundaryResult::BoundAt(22311600129)
+        );
+    }
+
+    #[test]
+    fn boundary_from_probe_without_a_match_is_unbounded() {
+        // TDLib 404s when no message predates the cutoff: the whole chat qualifies.
+        assert_eq!(boundary_from_probe(None), BoundaryResult::None);
+        assert_eq!(boundary_from_probe(Some(0)), BoundaryResult::None);
     }
 
     #[test]

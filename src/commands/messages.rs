@@ -47,11 +47,6 @@ impl From<MessagesArgs> for MessagesRequest {
     }
 }
 
-/// Milliseconds to wait before a single retry of `get_boundary_message_id`.
-/// The warmup fetch and `wait_for_sync()` handle most sync cases, but
-/// TDLib's boundary index may still lag briefly — one retry covers that race.
-const BOUNDARY_RETRY_DELAY_MS: u64 = 300;
-
 pub enum ChatTarget {
     Id(i64),
     Name(String),
@@ -105,31 +100,9 @@ pub async fn get_messages<C: TelegramClient>(
         // triggers getChatHistory(only_local=false), forcing TDLib to sync from the
         // server. Without this, getChatMessageByDate and subsequent getChatHistory
         // calls may return stale data from the local cache.
-        let warmup = client.get_messages(chat_id, 1, None).await?;
-        let warmup_has_newer = warmup
-            .first()
-            .map(|m| m.timestamp > timestamp)
-            .unwrap_or(false);
+        client.get_messages(chat_id, 1, None).await?;
 
-        let mut boundary = client.get_boundary_message_id(chat_id, timestamp).await?;
-        if matches!(boundary, BoundaryResult::None) {
-            tokio::time::sleep(tokio::time::Duration::from_millis(BOUNDARY_RETRY_DELAY_MS)).await;
-            boundary = client.get_boundary_message_id(chat_id, timestamp).await?;
-        }
-        match boundary {
-            BoundaryResult::Empty => {
-                if warmup_has_newer {
-                    // getChatMessageByDate's index is stale but getChatHistory found
-                    // newer messages. Fetch without a boundary — the caller will
-                    // filter by timestamp.
-                    None
-                } else {
-                    return Ok(MessagesResult {
-                        chat_id,
-                        messages: vec![],
-                    });
-                }
-            }
+        match client.get_boundary_message_id(chat_id, timestamp).await? {
             BoundaryResult::BoundAt(id) => Some(id),
             BoundaryResult::None => None,
         }
@@ -137,28 +110,25 @@ pub async fn get_messages<C: TelegramClient>(
         None
     };
 
-    let messages = if oldest_first {
-        // Fetch all messages by using i32::MAX as the limit, then reverse
-        let mut all = client
-            .get_messages(chat_id, i32::MAX, until_message_id)
-            .await?;
-        all.reverse();
-        all.truncate(limit as usize);
-        all
-    } else {
-        client
-            .get_messages(chat_id, limit, until_message_id)
-            .await?
-    };
+    // `--oldest-first` needs the whole qualifying range before it can pick the
+    // oldest `limit` of it; the boundary keeps that walk bounded when there is one.
+    let fetch_limit = if oldest_first { i32::MAX } else { limit };
+    let mut messages = client
+        .get_messages(chat_id, fetch_limit, until_message_id)
+        .await?;
 
-    // When --since-utc was specified but the boundary lookup failed (stale index),
-    // we fetched without a message-ID boundary. Filter by timestamp so callers
-    // never receive messages older than the requested cutoff.
-    let messages = if let (Some(ts), None) = (since_timestamp, until_message_id) {
-        messages.into_iter().filter(|m| m.timestamp >= ts).collect()
-    } else {
-        messages
-    };
+    // The boundary orders by message id; `--since-utc` is a claim about dates.
+    // Filtering here is what actually guarantees the cutoff, and it must happen
+    // before `limit` is applied or `--oldest-first` would spend its budget on
+    // messages that are about to be discarded.
+    if let Some(ts) = since_timestamp {
+        messages.retain(|m| m.timestamp >= ts);
+    }
+
+    if oldest_first {
+        messages.reverse();
+        messages.truncate(limit as usize);
+    }
 
     Ok(MessagesResult { chat_id, messages })
 }
@@ -191,6 +161,26 @@ pub async fn handle<C: TelegramClient>(
 mod tests {
     use super::*;
     use crate::client::mock::MockClient;
+
+    /// A chat-1 message with the given id and Unix timestamp.
+    fn make_message(id: i64, timestamp: i32) -> MessageInfo {
+        MessageInfo {
+            id,
+            chat_id: 1,
+            sender_id: Some(300),
+            sender: "Alice".to_string(),
+            sender_is_bot: Some(false),
+            text: format!("msg {id}"),
+            date: "1h ago".to_string(),
+            timestamp,
+            is_outgoing: false,
+            edit_date: None,
+            content_type: Some("text".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+        }
+    }
 
     #[test]
     fn parse_since_date_valid() {
@@ -324,10 +314,12 @@ mod tests {
 
     #[tokio::test]
     async fn since_utc_future_date_returns_empty() {
-        // When since_utc is in the future, BoundaryResult::Empty short-circuits
-        // and returns an empty result without fetching messages at all.
+        // A cutoff after the newest message: the probe lands on that newest
+        // message, so the bound sits above every id in the chat.
+        let cutoff = 1774483200; // 2026-03-20 00:00 UTC
         let client = MockClient {
-            boundary_result: BoundaryResult::Empty,
+            boundary_result: BoundaryResult::BoundAt(3),
+            messages: vec![make_message(2, cutoff - 60), make_message(1, cutoff - 120)],
             ..MockClient::default()
         };
         let result = get_messages(
@@ -341,16 +333,81 @@ mod tests {
         .unwrap();
         assert!(
             result.messages.is_empty(),
-            "BoundaryResult::Empty should short-circuit to empty result"
+            "a cutoff newer than every message must return nothing"
         );
     }
 
     #[tokio::test]
+    async fn boundary_alone_excludes_messages_below_it() {
+        // Every message here is inside the window, so the timestamp filter is a
+        // no-op and the id bound is the only thing that can exclude anything.
+        // This is what pins the bound itself rather than the filter behind it.
+        let cutoff = 1772323200; // 2026-03-01 00:00 UTC
+        let client = MockClient {
+            boundary_result: BoundaryResult::BoundAt(3),
+            messages: vec![
+                make_message(4, cutoff + 240),
+                make_message(3, cutoff + 180),
+                make_message(2, cutoff + 120),
+                make_message(1, cutoff + 60),
+            ],
+            ..MockClient::default()
+        };
+        let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-03-01"), false)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = result.messages.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![4, 3], "only ids at or above the bound may return");
+    }
+
+    #[tokio::test]
+    async fn oldest_first_with_boundary_returns_oldest_of_the_window() {
+        // The production shape once the boundary lookup works: bounded fetch,
+        // then the oldest `limit` of what the bound admitted.
+        let cutoff = 1772323200; // 2026-03-01 00:00 UTC
+        let client = MockClient {
+            boundary_result: BoundaryResult::BoundAt(3),
+            messages: vec![
+                make_message(5, cutoff + 300),
+                make_message(4, cutoff + 240),
+                make_message(3, cutoff + 180),
+                make_message(2, cutoff - 60),
+                make_message(1, cutoff - 120),
+            ],
+            ..MockClient::default()
+        };
+        let result = get_messages(&client, ChatTarget::Id(1), 2, Some("2026-03-01"), true)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = result.messages.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![3, 4], "oldest two inside the bounded window");
+    }
+
+    #[tokio::test]
+    async fn since_utc_looks_the_boundary_up_exactly_once() {
+        // The lookup used to be retried after a 300ms sleep whenever it came back
+        // None. It no longer misses by construction, and None is now a definitive
+        // answer, so a second probe would be pure latency.
+        let client = MockClient {
+            boundary_result: BoundaryResult::None,
+            ..MockClient::default()
+        };
+        let boundary_calls = client.get_boundary_call_count.clone();
+
+        let _ = get_messages(&client, ChatTarget::Id(1), 20, Some("2020-01-01"), false).await;
+
+        let count = boundary_calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(count, 1, "expected exactly 1 boundary lookup, got {count}");
+    }
+
+    #[tokio::test]
     async fn since_utc_date_only_is_inclusive() {
-        // Mock has messages with id=1 and id=2; set boundary to id=1
-        // Inclusive behavior: id=1 (boundary) AND id=2 (newer) should both be returned
+        // A message sent exactly at the cutoff is inside the window, as is
+        // everything newer. Boundary id=1 covers both mock messages.
+        let cutoff = 1767225600; // 2026-01-01 00:00 UTC
         let client = MockClient {
             boundary_result: BoundaryResult::BoundAt(1),
+            messages: vec![make_message(2, cutoff + 60), make_message(1, cutoff)],
             ..MockClient::default()
         };
         let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-01-01"), false)
@@ -358,7 +415,7 @@ mod tests {
             .unwrap();
         assert!(
             result.messages.iter().any(|m| m.id == 1),
-            "boundary message (id=1) should be included (inclusive)"
+            "message sent exactly at the cutoff should be included (inclusive)"
         );
         assert!(
             result.messages.iter().any(|m| m.id == 2),
@@ -368,16 +425,15 @@ mod tests {
 
     #[tokio::test]
     async fn since_utc_iso8601_with_time_is_inclusive() {
-        // Tests that a full ISO 8601 timestamp (with time component) is accepted
-        // and that the message at exactly that timestamp is included.
-        // The mock maps the parsed timestamp to boundary id=1 regardless of value,
-        // so this verifies both: (a) the full datetime string is parsed without error,
-        // and (b) the boundary message is included in results.
+        // Same inclusivity rule, expressed as a full ISO 8601 timestamp — this
+        // verifies the datetime string parses and that second-level equality
+        // still counts as inside the window.
+        let cutoff = 1773826445; // 2026-03-18T09:34:05Z
         let client = MockClient {
             boundary_result: BoundaryResult::BoundAt(1),
+            messages: vec![make_message(2, cutoff + 60), make_message(1, cutoff)],
             ..MockClient::default()
         };
-        // Full ISO 8601 with time — would fail in the old date-only parser
         let result = get_messages(
             &client,
             ChatTarget::Id(1),
@@ -389,7 +445,7 @@ mod tests {
         .unwrap();
         assert!(
             result.messages.iter().any(|m| m.id == 1),
-            "boundary message (id=1) should be included with ISO 8601 timestamp"
+            "message at exactly the ISO 8601 cutoff should be included"
         );
         assert!(
             result.messages.iter().any(|m| m.id == 2),
@@ -410,67 +466,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn since_utc_empty_boundary_with_newer_warmup_falls_through() {
-        // When BoundaryResult::Empty but the warmup fetch found a message newer
-        // than the requested timestamp, the function should NOT short-circuit to
-        // empty. Instead it fetches without a boundary and filters by timestamp.
-        use crate::output::MessageInfo;
-        let newer_ts = 1772323200 + 3600; // 1h after 2026-03-01 00:00 UTC
-        let older_ts = 1772323200 - 3600; // 1h before
+    async fn since_utc_without_boundary_filters_by_timestamp() {
+        // A 404 from the boundary probe means no message predates the cutoff, so
+        // the fetch runs unbounded. The timestamp filter still has to hold.
+        let cutoff = 1772323200; // 2026-03-01 00:00 UTC
         let client = MockClient {
-            boundary_result: BoundaryResult::Empty,
+            boundary_result: BoundaryResult::None,
             messages: vec![
-                MessageInfo {
-                    id: 10,
-                    chat_id: 1,
-                    sender_id: Some(300),
-                    sender: "Alice".to_string(),
-                    sender_is_bot: Some(false),
-                    text: "new msg".to_string(),
-                    date: "1h ago".to_string(),
-                    timestamp: newer_ts,
-                    is_outgoing: false,
-                    edit_date: None,
-                    content_type: Some("text".to_string()),
-                    is_downloadable: false,
-                    download_files: vec![],
-                    content: None,
-                },
-                MessageInfo {
-                    id: 9,
-                    chat_id: 1,
-                    sender_id: Some(300),
-                    sender: "Alice".to_string(),
-                    sender_is_bot: Some(false),
-                    text: "old msg".to_string(),
-                    date: "2h ago".to_string(),
-                    timestamp: older_ts,
-                    is_outgoing: false,
-                    edit_date: None,
-                    content_type: Some("text".to_string()),
-                    is_downloadable: false,
-                    download_files: vec![],
-                    content: None,
-                },
+                make_message(10, cutoff + 3600),
+                make_message(9, cutoff - 3600),
             ],
             ..MockClient::default()
         };
         let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-03-01"), false)
             .await
             .unwrap();
-        // Should include the newer message, exclude the older one
-        assert_eq!(
-            result.messages.len(),
-            1,
-            "should filter to only messages >= since timestamp"
-        );
-        assert_eq!(result.messages[0].id, 10);
+        let ids: Vec<i64> = result.messages.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![10], "only messages >= the cutoff may be returned");
     }
 
     #[tokio::test]
-    async fn since_utc_no_retry_when_boundary_found() {
-        // When boundary is found immediately, no retry nudge calls should happen.
-        use crate::client::mock::MockClient;
+    async fn oldest_first_with_since_filters_before_truncating() {
+        // History (newest-first): ids 4, 3 are at/after the cutoff; 2, 1 are before it.
+        // With --oldest-first --limit 2 the answer is the two OLDEST messages that
+        // are still at or after the cutoff — ids 3 then 4. Truncating before
+        // filtering picks the two oldest of the whole history (1, 2) and then
+        // filters both away, yielding nothing.
+        let cutoff = 1772323200; // 2026-03-01 00:00 UTC
+        let client = MockClient {
+            boundary_result: BoundaryResult::None,
+            messages: vec![
+                make_message(4, cutoff + 7200),
+                make_message(3, cutoff + 3600),
+                make_message(2, cutoff - 3600),
+                make_message(1, cutoff - 7200),
+            ],
+            ..MockClient::default()
+        };
+        let result = get_messages(&client, ChatTarget::Id(1), 2, Some("2026-03-01"), true)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = result.messages.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![3, 4],
+            "--oldest-first must filter by timestamp before applying the limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn since_utc_never_returns_messages_older_than_cutoff() {
+        // Even when the boundary lookup succeeds, the timestamp filter is the
+        // guarantee: a message id boundary orders by id, and message dates are
+        // not strictly monotonic with ids (imported history).
+        let cutoff = 1772323200; // 2026-03-01 00:00 UTC
+        let client = MockClient {
+            boundary_result: BoundaryResult::BoundAt(2),
+            messages: vec![
+                make_message(3, cutoff + 3600),
+                make_message(2, cutoff - 3600),
+            ],
+            ..MockClient::default()
+        };
+        let result = get_messages(&client, ChatTarget::Id(1), 20, Some("2026-03-01"), false)
+            .await
+            .unwrap();
+        let ids: Vec<i64> = result.messages.iter().map(|m| m.id).collect();
+        assert_eq!(
+            ids,
+            vec![3],
+            "messages older than the cutoff must be dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn since_utc_with_boundary_fetches_twice() {
         let client = MockClient {
             boundary_result: BoundaryResult::BoundAt(1),
             ..MockClient::default()
@@ -479,18 +549,17 @@ mod tests {
 
         let _ = get_messages(&client, ChatTarget::Id(1), 20, Some("2020-01-01"), false).await;
 
-        // 1 warm-up fetch + 1 actual fetch — no retry nudges
         let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
             count, 2,
-            "expected 1 warm-up + 1 actual fetch when boundary found immediately, got {count}"
+            "expected 1 warm-up + 1 actual fetch when a boundary is found, got {count}"
         );
     }
 
     #[tokio::test]
-    async fn since_utc_retries_when_boundary_none() {
-        // When boundary returns None (stale cache), one retry is attempted
-        // but get_messages is only called for warm-up + the final actual fetch.
+    async fn since_utc_without_boundary_fetches_twice() {
+        // An unbounded fetch costs the same two calls — the missing boundary
+        // must not turn into extra round trips.
         let client = MockClient {
             boundary_result: BoundaryResult::None,
             ..MockClient::default()
@@ -499,14 +568,13 @@ mod tests {
 
         let _ = get_messages(&client, ChatTarget::Id(1), 20, Some("2020-01-01"), false).await;
 
-        // 1 warm-up fetch + 1 actual fetch (boundary retry doesn't call get_messages)
         let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(count, 2, "expected 1 warm-up + 1 actual fetch, got {count}");
     }
 
     #[tokio::test]
-    async fn no_since_utc_skips_retry_loop() {
-        // Without --since-utc, no boundary lookup or retry nudges occur.
+    async fn no_since_utc_skips_the_warm_up_fetch() {
+        // Without --since-utc there is no boundary lookup, so no warm-up either.
         let client = MockClient::default();
         let call_count = client.get_messages_call_count.clone();
 
