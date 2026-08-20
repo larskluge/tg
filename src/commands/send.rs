@@ -7,6 +7,7 @@ use crate::client::TelegramClient;
 use crate::error::{Result, TgError};
 use crate::output::SendResult;
 use crate::parse_mode::ParseMode;
+use crate::resolve::Recipient;
 
 pub enum SendTarget {
     Id(i64),
@@ -117,6 +118,42 @@ pub async fn send_message<C: TelegramClient>(
     };
 
     client.send_message(chat_id, message, parse_mode).await
+}
+
+/// Plan a bot (`--as`) send: validate the request and say which recipient form
+/// was asked for, doing no I/O at all.
+///
+/// Bot sends go out over the HTTP Bot API and never reach [`handle`], so this is
+/// the bot path's copy of the same invariant: a malformed request must never
+/// cost a round trip. It matters more here than on the socket, because
+/// `resolve::resolve_recipient` cold-starts TDLib, performs a Telegram lookup
+/// for an unknown `@username` and writes the resolved contact back to
+/// `credentials.json` — side effects a rejected request must not pay for.
+///
+/// Returning the recipient *from the call that validates* is what enforces the
+/// ordering: `run_bot_send` cannot resolve a recipient it has not been handed.
+pub fn plan_bot_send(args: &SendArgs) -> Result<(Recipient, Option<ParseMode>)> {
+    let parse_mode = args
+        .parse_mode
+        .as_deref()
+        .map(ParseMode::parse)
+        .transpose()?;
+
+    let recipient = if let Some(ref to) = args.to {
+        Recipient::To(to.clone())
+    } else if let Some(id) = args.id {
+        Recipient::Id(id)
+    } else if let Some(ref group) = args.group {
+        Recipient::Group(group.clone())
+    } else if let Some(ref name) = args.name {
+        Recipient::Name(name.clone())
+    } else {
+        return Err(TgError::Other(
+            "send: one of `id`, `to`, `group`, or `name` is required".to_string(),
+        ));
+    };
+
+    Ok((recipient, parse_mode))
 }
 
 pub async fn handle<C: TelegramClient>(client: &C, req: SendRequest) -> Result<SendResult> {
@@ -376,8 +413,13 @@ mod tests {
 
     #[test]
     fn send_request_accepts_explicit_null_parse_mode() {
-        // This is literally what the `tg` CLI serialises when the flag is absent
-        // (SendRequest has no `skip_serializing_if`), so it must not be an error.
+        // `null` means absent, deliberately, even though `""` is refused. It is
+        // what an unset optional serialises to in Go (`map[string]any` with a
+        // missing key, or a `*string` without `omitempty`), in Python, and in
+        // `tg`'s own CLI proxy, which has no `skip_serializing_if`. Refusing it
+        // would turn every plain-text send from those callers into a hard error
+        // while closing nothing: a caller that omits the key entirely still gets
+        // a plain send, and "absent means plain" is the contract.
         let req = send_req(json!({"message": "hi", "id": 1, "parse_mode": null})).unwrap();
         assert!(req.parse_mode.is_none());
     }
@@ -393,6 +435,116 @@ mod tests {
         for field in ["message", "name", "id", "to", "group", "parse_mode"] {
             assert!(err.contains(field), "error should name `{field}`: {err}");
         }
+    }
+
+    fn bot_args(argv: &[&str]) -> SendArgs {
+        use clap::Parser;
+        match crate::cli::Cli::parse_from(argv).command {
+            crate::cli::Command::Send(args) => args,
+            _ => panic!("expected a send command"),
+        }
+    }
+
+    #[test]
+    fn plan_bot_send_validates_parse_mode_before_naming_a_recipient() {
+        // The bot path's copy of `handle`'s invariant. `resolve_recipient` cold-starts
+        // TDLib, hits the network for an unknown @username and persists the resolved
+        // contact to credentials.json — a malformed request must cost none of that.
+        // The ordering is enforced by the data dependency: `run_bot_send` cannot
+        // resolve a recipient it has not been handed, and it is handed one only
+        // after the parse mode has been checked.
+        let err = plan_bot_send(&bot_args(&[
+            "tg",
+            "send",
+            "--as",
+            "@mybot",
+            "--to",
+            "@someone",
+            "--parse-mode",
+            "html",
+            "-m",
+            "<b>x</b>",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert_eq!(
+            err,
+            "invalid parse_mode 'html'. Expected `HTML` or `MarkdownV2`"
+        );
+    }
+
+    #[test]
+    fn plan_bot_send_reports_the_parse_mode_before_a_missing_recipient() {
+        // Both are caller bugs; reporting the parse mode first is what proves the
+        // check runs before the recipient is even looked at.
+        let err = plan_bot_send(&bot_args(&[
+            "tg",
+            "send",
+            "--as",
+            "@mybot",
+            "--id",
+            "42",
+            "--parse-mode",
+            "md",
+            "-m",
+            "x",
+        ]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("invalid parse_mode 'md'"), "{err}");
+    }
+
+    #[test]
+    fn plan_bot_send_returns_recipient_and_mode() {
+        let (recipient, mode) = plan_bot_send(&bot_args(&[
+            "tg",
+            "send",
+            "--as",
+            "@mybot",
+            "--to",
+            "@someone",
+            "--parse-mode",
+            "HTML",
+            "-m",
+            "<b>x</b>",
+        ]))
+        .expect("a well-formed bot send must plan");
+        assert_eq!(mode, Some(ParseMode::Html));
+        match recipient {
+            Recipient::To(to) => assert_eq!(to, "@someone"),
+            _ => panic!("--to must produce Recipient::To"),
+        }
+    }
+
+    #[test]
+    fn plan_bot_send_requires_a_recipient() {
+        let mut args = bot_args(&["tg", "send", "--as", "@mybot", "--id", "42", "-m", "x"]);
+        args.id = None;
+        let err = plan_bot_send(&args).unwrap_err().to_string();
+        assert!(err.contains("one of"), "{err}");
+    }
+
+    #[test]
+    fn plan_bot_send_recipient_ladder_matches_the_socket_path() {
+        // `--to` wins over `--id`, `--id` over `--group`, `--group` over a bare
+        // name — the same order `handle` uses, so the two paths cannot drift.
+        let mut args = bot_args(&[
+            "tg", "send", "Jane", "--as", "@b", "--to", "@x", "--id", "7", "--group", "G", "-m",
+            "m",
+        ]);
+        assert!(matches!(plan_bot_send(&args).unwrap().0, Recipient::To(_)));
+        args.to = None;
+        assert!(matches!(plan_bot_send(&args).unwrap().0, Recipient::Id(7)));
+        args.id = None;
+        assert!(matches!(
+            plan_bot_send(&args).unwrap().0,
+            Recipient::Group(_)
+        ));
+        args.group = None;
+        assert!(matches!(
+            plan_bot_send(&args).unwrap().0,
+            Recipient::Name(_)
+        ));
     }
 
     #[tokio::test]

@@ -116,15 +116,23 @@ tg serve
 
 `--parse-mode` (socket arg `parse_mode`) accepts exactly `HTML` and `MarkdownV2`,
 case-sensitive. Absent means plain text — byte-for-byte the behaviour `tg` has always had.
-Any other value, including `html` or an empty string, is refused with
+An explicit JSON `null` on the socket means the same as absent, because that is what an
+unset optional serialises to in Go, in Python and in `tg`'s own CLI proxy. Any other value,
+including `html` or an empty string, is refused with
 
 ```
 invalid parse_mode '<value>'. Expected `HTML` or `MarkdownV2`
 ```
 
 and **nothing is sent** — `tg` never quietly downgrades a formatted body to plain text.
-Telegram parses the markup, so malformed markup comes back as Telegram's own error (it names
-the offending byte offset) and nothing is sent then either.
+
+TDLib parses the markup **locally** (`parseTextEntities` is a static request: no Telegram
+round trip, nothing to rate-limit or retry), so malformed markup comes back as TDLib's own
+error text and nothing is sent then either. Errors are prefixed `parse_mode <MODE>: ` so a
+caller can tell a permanent markup fault from a transient send failure; retrying the same
+body will fail identically. Only some errors name a byte offset — the unsupported-tag and
+unterminated-entity classes do, the "character is reserved" class does not — so do not build
+a repair loop that depends on finding one.
 
 **Use `HTML`.** It is the safer of the two by a wide margin, and it is the recommended default.
 
@@ -136,30 +144,55 @@ the offending byte offset) and nothing is sent then either.
 
 There are no headings, lists, `hr`, `p` or `br` tags: `<h1>`, `<p>`, `<br>` and `<span>` are
 errors, not ignored markup. Use `\n` for line breaks. Tag names are case-insensitive
-(`<B>` works). Only three characters need escaping — `&`, `<`, `>` — as `&amp;`, `&lt;`,
-`&gt;`; those four entities (`lt`, `gt`, `amp`, `quot`) are the only ones decoded, so
-`&nbsp;` stays literal. A bare `<` in prose (`a < b`) is an error; a bare `&` (`AT&T`)
-happens to pass through.
+(`<B>` works).
+
+**Escape `&`, `<` and `>` as `&amp;`, `&lt;`, `&gt;` on every body before setting
+`parse_mode=HTML` — all three, unconditionally.** Escaping selectively is the trap: a bare
+`<` in prose (`a < b`) is a loud error, but two other paths are silent, and both are shapes
+an agent writes often:
+
+- **A matched pair of whitelisted tags anywhere in the body becomes formatting.**
+  `wrap it in <b>...</b> tags` is delivered as `wrap it in ... tags` with "..." bolded, and
+  `the <code>--parse-mode</code> flag` loses its tags the same way. `ok:true`, no error.
+- **Entity decoding runs exactly once**, so text that was already escaped upstream is
+  un-escaped: `type &lt;b&gt;` arrives as `type <b>`, and `&amp;amp;` arrives as `&amp;`.
+
+Which entities decode is narrower than it looks, and is *not* a reason to skip escaping `&`:
+only four **named** entities decode (`lt`, `gt`, `amp`, `quot`), so `&nbsp;`, `&apos;` and
+`&copy;` stay literal — but **every numeric character reference decodes**, decimal and hex
+alike (`&#8364;` → `€`, `&#x41;` → `A`, `&#x1F600;` → 😀). An unmatched surrogate escape such
+as `&#xD800;` is a hard error, so a body merely *discussing* one fails the send. A bare `&`
+not followed by an entity (`AT&T`) does pass through unchanged.
 
 **`MarkdownV2` is dangerous for text that was not written as MarkdownV2**, which is why it
 is not the recommendation. It reserves eighteen characters —
-``_ * [ ] ( ) ~ ` > # + - = | { } . !`` — and splits into two very different failure modes:
+``_ * [ ] ( ) ~ ` > # + - = | { } . !`` — plus the backslash, which the character list
+conventionally omits because it is the escape character itself. Two failure modes:
 
-- Thirteen of them hard-error on ordinary prose, which is loud and safe:
+- **Loud:** a reserved character on its own hard-errors — including the pairable ones, whose
+  error is about the unterminated entity rather than the character:
   `hello. world!` → ``Character '.' is reserved and must be escaped``,
-  `5 * 3 = 15` → `'=' is reserved`, `cost is $5 (approx)` → `'(' is reserved`.
-- The five pairable ones — `` _ * ~ | ` `` — **corrupt the message silently, with no error at
-  all**, because two of them pair into an entity:
+  `5 * 3 = 15` → `'=' is reserved`, `cost is $5 (approx)` → `'(' is reserved`,
+  `a | b` → `'|' is reserved`, `x_y` → ``Can't find end of Italic entity``.
+- **Silent:** the pairable ones **corrupt the message with no error at all** when the body
+  happens to contain a matching pair — `` _ `` (italic), `*` (bold), `~` (strikethrough),
+  `` ` `` (code), `__` (underline), `||` (spoiler) and `[…]` (deleted outright without a
+  following `(url)`, a link with one). So does a `>` at the **start of a line** (blockquote —
+  the one reserved character that is silent even alone; mid-line it errors), and a backslash
+  anywhere, which is eaten always, even singly.
 
   ```
-  in:  path /usr/local/bin/x_y_z
-  out: path /usr/local/bin/xyz      ← two characters deleted, "y" italicised, ok:true
+  in:  path /usr/local/bin/x_y_z      out: path /usr/local/bin/xyz   ← "y" italicised
+  in:  see [attachment] for details   out: see attachment for details
+  in:  backup is at C:\Data\2026      out: backup is at C:Data2026
+  in:  > he said the deal is off      out: " he said the deal is off" ← blockquote
   ```
 
-  Paths, `snake_case` identifiers and table pipes are the most common shapes in an
-  agent-written technical message, so this is not a corner case. Under `MarkdownV2` the
-  **caller** carries 100% of the escaping burden: `tg` passes the body to Telegram verbatim
-  and computes no offsets and escapes nothing on the caller's behalf.
+  All four are `ok:true` with characters deleted. Paths, `snake_case` identifiers, Windows
+  paths, bracketed asides and quoted lines are the most common shapes in an agent-written
+  message, so this is not a corner case. Under `MarkdownV2` the **caller** carries 100% of
+  the escaping burden: `tg` passes the body to TDLib verbatim and computes no offsets and
+  escapes nothing on the caller's behalf.
 
 ## Machine use
 

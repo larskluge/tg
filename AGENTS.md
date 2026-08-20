@@ -138,8 +138,8 @@ whitelist — `b`/`strong`, `i`/`em`, `u`/`ins`, `s`/`strike`/`del`, `a href`, `
 (+ `code class="language-x"`), `blockquote` (optionally `expandable`), `tg-spoiler`,
 `tg-emoji`. There are no headings, lists, `hr`, `p` or `br`. TDLib **errors** on any tag
 outside the set (it does not strip it), so `<h1>x</h1>` fails the send rather than degrading.
-Tag names are case-insensitive. Only `&`, `<`, `>` need escaping, and only `lt`/`gt`/`amp`/
-`quot` decode. Related facts, all measured against TDLib 1.8.61:
+Tag names are case-insensitive. Only `&`, `<`, `>` need escaping; escape all three
+unconditionally, never selectively. Related facts, all measured against TDLib 1.8.61:
 
 - `parse_text_entities` returns `enums::FormattedText`, so it needs `unwrap_formatted_text()`
   before it can go into `InputMessageText` (see **TDLib types** above). It also takes an
@@ -149,8 +149,11 @@ Tag names are case-insensitive. Only `&`, `<`, `>` need escaping, and only `lt`/
   for years, and why a parse mode has to be requested explicitly.
 - Entity offsets are UTF-16 and TDLib computes them. Never hand-roll them: always call
   `parse_text_entities`. Verified exact across emoji, umlauts, combining marks, ZWJ sequences
-  and regional indicators (🚀 = 2 units, 👩‍💻 = 5, 🇩🇪 = 2), and the tdlib-rs hop is lossless
-  because `types::FormattedText` and `enums::TextEntityType` both round-trip through serde.
+  and regional indicators (🚀 = 2 units, 👩‍💻 = 5, 🇩🇪 = 4 — that last one is 2 *code points*,
+  and reading the code-point count as the unit count is a two-unit error exactly where flags
+  appear), and the tdlib-rs hop is lossless because `types::FormattedText` and
+  `enums::TextEntityType` both round-trip through serde. Pinned end to end by
+  `entity_offsets_are_utf16_and_tg_never_touches_them`.
 - `MarkdownV2` is parser `version: 2`. Versions 0 and 1 are the legacy, laxer "Markdown"
   mode: picking one by mistake parses the body under the wrong rules with no error anywhere
   (pinned by `tdlib_parse_mode_markdown_is_version_2`).
@@ -158,9 +161,37 @@ Tag names are case-insensitive. Only `&`, `<`, `>` need escaping, and only `lt`/
   called `setTdlibParameters`, needs no authorization, makes no network call, and costs
   ~17 µs. Calling it before `create_private_chat` therefore leaves zero residue when the
   markup is bad: no message, no draft, no opened chat.
-- MarkdownV2's five pairable reserved characters (`` _ * ~ | ` ``) **corrupt silently**:
-  `path /usr/local/bin/x_y_z` parses `Ok` to `path /usr/local/bin/xyz` with an italic entity.
-  The other thirteen hard-error. Prefer `HTML`.
+- Neither mode is free of silent corruption; `HTML` is safer, not safe. Under `HTML` a
+  matched pair of whitelisted tags anywhere in the body becomes formatting
+  (`wrap it in <b>...</b> tags` → `wrap it in ... tags`, `ok:true`), and entity decoding runs
+  exactly once, so pre-escaped prose is un-escaped. Under `MarkdownV2` a reserved character
+  alone hard-errors, but a matching *pair* is eaten silently — `` _ * ~ ` __ || […] `` — as is
+  a line-leading `>` (blockquote) and a backslash anywhere, even singly. `\` is not in the
+  documented eighteen at all. `path /usr/local/bin/x_y_z` → `path /usr/local/bin/xyz`,
+  `C:\Data\2026` → `C:Data2026`. Prefer `HTML`, and escape unconditionally.
+- HTML entity decoding is narrower than the docs suggest for *named* entities and wider for
+  numeric ones: only `lt`/`gt`/`amp`/`quot` decode by name (`&nbsp;`, `&apos;`, `&copy;` stay
+  literal), but **every** numeric character reference decodes (`&#8364;` → `€`,
+  `&#x41;` → `A`). `&#xD800;` is a hard error ("unmatched surrogate code units"). This is why
+  `&` must be escaped unconditionally rather than only before a known entity name.
+- Errors are TDLib's own text, prefixed `parse_mode <MODE>: `. Only the unsupported-tag and
+  unterminated-entity classes name a byte offset; `Character 'x' is reserved` does not. Do
+  not write a caller-side repair loop that depends on finding one.
+
+**Testing against real TDLib:** static requests (`parseTextEntities`, `getMarkdownText`,
+`setLogVerbosityLevel`) answer on a client that has never called `setTdlibParameters`, so a
+test needs `tdlib_rs::create_client()` and a receive thread and nothing else — no credentials,
+no database files, no network. tdlib-rs 1.3.0 exposes no synchronous `td_execute`, so the
+receive loop is mandatory even for a static request. Two rules, both learned by hitting them:
+
+- **Exactly one receive loop per process.** TDLib aborts ("Receive must not be called
+  simultaneously from two different threads") as soon as `cargo test` runs two loop-owning
+  tests in parallel. `client::tdlib_parse_tests` shares one refcounted loop behind a mutex.
+- **Join the loop; never leak it.** A thread parked inside `td_receive` at process teardown
+  segfaults the test binary, failing `cargo test` even when every test passed. Hold the lock
+  across the join, or a replacement loop starts while the old one is still parked.
+
+`td_receive` has a 2s internal timeout, so the join costs up to that once per loop.
 
 **Serve request strictness:** `SendRequest` is the only serve request struct carrying
 `#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs
@@ -168,5 +199,13 @@ the container's `HealthCmd` (`tg whoami`, `HealthStartupTimeout=2m`), so tighten
 the health gate for no benefit, and the remaining structs have caller sets that were never
 audited. `dispatch_other_commands_still_ignore_unknown_args` pins the decision so a later
 blanket change has to be deliberate.
+
+An explicit `"parse_mode": null` is accepted and means plain text, exactly like an absent
+key. That asymmetry with `""` (refused) is deliberate: `null` is what an unset optional
+serialises to in Go (`map[string]any` with a missing key, or a `*string` without
+`omitempty`), in Python (`json.dumps`) and in `tg`'s own CLI proxy, so refusing it would
+turn every plain-text send from those callers into a hard error while closing nothing — a
+caller that omits the key entirely still gets a plain send, and "absent means plain" is the
+contract. Pinned by `send_request_accepts_explicit_null_parse_mode`.
 
 **Clap negative IDs:** Telegram supergroup IDs are negative (e.g. `-1001666847309`). Any `--id` arg that accepts `i64` needs `#[arg(long, allow_hyphen_values = true)]` or clap will treat the leading `-` as a flag.

@@ -117,7 +117,9 @@ conscious act.
 
 ## Testing
 
-31 new tests. What they cover, and what they cannot:
+42 new tests. Most run against mocks; six run against real TDLib.
+
+Mock- and pure-level:
 
 - `ParseMode::parse` — both literals, wrong case, unknown values (including `Markdown`, so the
   legacy laxer mode stays unreachable), empty and whitespace, and the exact error string, which
@@ -130,13 +132,39 @@ conscious act.
 - Socket dispatch — a good mode succeeds, a bad mode and an unknown arg both fail in-band with
   the id echoed.
 - Bot payload — the key is *absent*, not `null`, when no mode is set.
+- `plan_bot_send` — the bot path validates the mode *before* it will name a recipient, so a
+  malformed request cannot reach `resolve_recipient` (TDLib cold start, network lookup, a
+  `credentials.json` write). The ordering is enforced by the data dependency, not by comment.
 
-**Not coverable here:** malformed-markup errors and UTF-16 offset correctness, because
-`parse_text_entities` in tdlib-rs 1.3.0 routes through `send_request` → observer → a live
-receive loop rather than a synchronous `td_execute`. Both were verified out-of-band against
-real libtdjson 1.8.61 and the findings are recorded in AGENTS.md. The structural reason the
-offset class of bug is absent is that `tg` computes no offsets and escapes nothing: it hands
-the raw string to TDLib.
+TDLib-level (`client::tdlib_parse_tests`): the mock records the mode but never parses, so
+nothing above proves that the *parsed* `FormattedText` — rather than the raw markup — is what
+lands in `InputMessageText`. That is the whole point of the change, and the only failure mode
+that is worse than the asterisks it replaces. `build_text_content` is split out of
+`send_message` so a test can reach it, and six tests cover it against real libtdjson 1.8.61:
+parsed-not-raw content, plain bodies carried verbatim, parser version 2 end to end (`__x__` is
+Underline in v2 and nothing in v1), UTF-16 offsets across a 2-unit emoji / 5-unit ZWJ sequence /
+4-unit regional-indicator pair, `TgError::Other` (not `TgError::TdLib`) for markup faults, and
+the empty-after-markup guard including the clause that keeps a whitespace-only body sendable.
+
+Each of those was verified by reintroducing the regression it targets and watching it fail.
+
+An earlier draft of this document claimed the class was "not coverable here" because tdlib-rs
+1.3.0 routes `parse_text_entities` through `send_request` → observer → a live receive loop
+rather than a synchronous `td_execute`. The premise is true; the conclusion was not.
+`parseTextEntities` is a static request, so the test harness needs a client and a receive
+thread and nothing else — no credentials, no `setTdlibParameters`, no database, no network.
+Two constraints make the harness non-obvious, and both were found by hitting them:
+
+- **One receive loop, process-wide.** TDLib aborts the process outright ("Receive must not be
+  called simultaneously from two different threads") the moment `cargo test` runs two
+  loop-owning tests in parallel. The tests share one refcounted loop behind a mutex.
+- **The loop must be joined, not leaked.** A thread left parked inside `td_receive` while the
+  process tears down segfaults the test binary at exit, failing `cargo test` even when every
+  test passed. The lock is held across the join so a new loop cannot start while the old one
+  is still parked.
+
+The structural reason the offset class of bug is absent remains that `tg` computes no offsets
+and escapes nothing: it hands the raw string to TDLib.
 
 ## Deploy
 
