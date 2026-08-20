@@ -4412,26 +4412,65 @@ mod tests {
 #[cfg(test)]
 mod tdlib_parse_tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    use tdlib_rs::enums::{AuthorizationState, Update};
+
+    /// How long teardown will wait for TDLib to confirm the client is closed.
+    /// Generous: it is a backstop against a hang, not a tuning knob.
+    const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 
     /// The one receive loop the whole test binary is allowed to have.
     ///
-    /// Two threads inside `td_receive` at once is not merely wasteful — TDLib
-    /// detects it and aborts the process ("Receive must not be called
-    /// simultaneously from two different threads"), so a harness that starts a
-    /// loop per test SIGABRTs as soon as `cargo test` runs two of them in
-    /// parallel. Users are counted instead, and the loop is stopped and
-    /// **joined** when the last one leaves: a thread left parked inside
-    /// `td_receive` while the process tears down segfaults the binary at exit,
-    /// which fails `cargo test` even when every test passed.
+    /// Two constraints shape this, and both abort the process rather than
+    /// failing a test, so neither is optional:
+    ///
+    /// * **Two threads inside `td_receive` at once.** TDLib detects it and
+    ///   aborts ("Receive must not be called simultaneously from two different
+    ///   threads"), so a harness that starts a loop per test SIGABRTs as soon
+    ///   as `cargo test` runs two of them in parallel. Users are counted
+    ///   instead, and the lock below is held across teardown so a replacement
+    ///   loop cannot start while this one is still parked in `td_receive`.
+    ///
+    /// * **A client that is never closed.** TDLib frees a client's resources
+    ///   only after it has reported `authorizationStateClosed` — "All resources
+    ///   will be freed only after authorizationStateClosed has been received" —
+    ///   and a process that exits with one still open aborts inside TDLib's own
+    ///   teardown, *after* every test has already reported ok. That is not
+    ///   theoretical: it turned `main` red on a commit whose PR run was green,
+    ///   with `test result: ok. 319 passed` immediately followed by SIGABRT and
+    ///   no image published. Measured by running this very binary in a loop on
+    ///   4 cores against libtdjson 1.8.61: 15 of 100 runs aborted without the
+    ///   close, 0 of 100 with it. So the last user out closes the client, and
+    ///   the loop runs until TDLib confirms `Closed` rather than until a
+    ///   shutdown flag is set.
     static RECEIVE_LOOP: Mutex<Option<ReceiveLoop>> = Mutex::new(None);
 
     struct ReceiveLoop {
         users: usize,
         client_id: i32,
-        shutdown: Arc<AtomicBool>,
-        handle: Option<std::thread::JoinHandle<()>>,
+        /// `true` once TDLib confirmed the client reached `Closed`.
+        handle: Option<std::thread::JoinHandle<bool>>,
+    }
+
+    /// Pump TDLib's global receive queue until `client_id` reports
+    /// `authorizationStateClosed`, and report whether it did.
+    ///
+    /// The deadline is a backstop so a lost update can never hang CI; missing
+    /// the confirmation is surfaced by the caller rather than ignored, because
+    /// it means the process is once again exiting with a live client.
+    fn receive_until_closed(client_id: i32) -> bool {
+        let deadline = Instant::now() + CLOSE_TIMEOUT;
+        while Instant::now() < deadline {
+            if let Some((Update::AuthorizationState(update), id)) = tdlib_rs::receive()
+                && id == client_id
+                && matches!(update.authorization_state, AuthorizationState::Closed)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// Keeps the shared receive loop alive for as long as it is held.
@@ -4445,18 +4484,16 @@ mod tdlib_parse_tests {
                 return (Self, existing.client_id);
             }
 
+            // Silence TDLib's default (very chatty) logging before the client
+            // exists, so none of it reaches the test output. The async
+            // `setLogVerbosityLevel` cannot: it only takes effect once TDLib is
+            // already up and has logged its startup banner.
+            set_tdlib_log_verbosity(0);
             let client_id = tdlib_rs::create_client();
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let flag = shutdown.clone();
-            let handle = std::thread::spawn(move || {
-                while !flag.load(Ordering::Relaxed) {
-                    let _ = tdlib_rs::receive();
-                }
-            });
+            let handle = std::thread::spawn(move || receive_until_closed(client_id));
             *slot = Some(ReceiveLoop {
                 users: 1,
                 client_id,
-                shutdown,
                 handle: Some(handle),
             });
             (Self, client_id)
@@ -4465,19 +4502,52 @@ mod tdlib_parse_tests {
 
     impl Drop for TdlibGuard {
         fn drop(&mut self) {
-            // The lock is deliberately held across the join: releasing it first
-            // would let the next test start a second loop while this one is
-            // still parked in `td_receive`, which is the abort above.
+            // The lock is deliberately held across the close and the join:
+            // releasing it first would let the next test start a second loop
+            // while this one is still parked in `td_receive`.
             let mut slot = RECEIVE_LOOP.lock().unwrap_or_else(|e| e.into_inner());
             let running = slot.as_mut().expect("loop must outlive its users");
             running.users -= 1;
             if running.users > 0 {
                 return;
             }
-            running.shutdown.store(true, Ordering::Relaxed);
+            let client_id = running.client_id;
             let handle = running.handle.take().expect("loop is joined exactly once");
             *slot = None;
-            handle.join().expect("receive loop must not panic");
+
+            // `close` is async, `drop` is not, and we are already inside the
+            // `#[tokio::test]` runtime, so `block_on` here would panic — hence a
+            // short-lived thread with its own runtime. The receive loop is still
+            // up, which is what delivers this request's response and, after it,
+            // the `Closed` update the loop is waiting for. The timeout only
+            // guards against that response never arriving; it is not a poll.
+            let closed_ack = std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("closer runtime must build")
+                    .block_on(async {
+                        tokio::time::timeout(CLOSE_TIMEOUT, tdlib_rs::functions::close(client_id))
+                            .await
+                    })
+            })
+            .join()
+            .expect("closer thread must not panic");
+
+            let saw_closed = handle.join().expect("receive loop must not panic");
+
+            // Both failures mean the process is about to exit with a live TDLib
+            // client, i.e. back to the intermittent abort. Fail loudly here,
+            // where the cause is still legible, rather than at exit where it is
+            // an unattributed SIGABRT after every test has passed.
+            closed_ack
+                .unwrap_or_else(|_| panic!("TDLib did not answer close within {CLOSE_TIMEOUT:?}"))
+                .expect("TDLib rejected close");
+            assert!(
+                saw_closed,
+                "TDLib client {client_id} never reported authorizationStateClosed within \
+                 {CLOSE_TIMEOUT:?}"
+            );
         }
     }
 
@@ -4488,9 +4558,6 @@ mod tdlib_parse_tests {
         Fut: std::future::Future<Output = R>,
     {
         let (_guard, client_id) = TdlibGuard::acquire();
-        // Silence TDLib's default (very chatty) logging. Idempotent, so it is
-        // simpler to repeat than to thread through the loop's construction.
-        let _ = tdlib_rs::functions::set_log_verbosity_level(0, client_id).await;
         f(client_id).await
     }
 
