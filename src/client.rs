@@ -13,6 +13,7 @@ use crate::output::{
     ChatInfo, ContactInfo, DownloadReport, DownloadStatus, DownloadedFileResult,
     MessageContentDetails, MessageFileRef, MessageInfo, SendResult,
 };
+use crate::parse_mode::ParseMode;
 
 // Direct FFI to TDLib's synchronous log functions (not exposed by tdlib-rs)
 #[link(name = "tdjson")]
@@ -82,7 +83,12 @@ pub trait TelegramClient: Send + Sync {
     async fn find_chat_by_username(&self, username: &str) -> Result<i64>;
     async fn find_group_by_name(&self, name: &str) -> Result<i64>;
 
-    async fn send_message(&self, chat_id: i64, text: &str) -> Result<SendResult>;
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+    ) -> Result<SendResult>;
 
     async fn get_messages(
         &self,
@@ -615,11 +621,104 @@ fn unwrap_messages(msgs: tdlib_rs::enums::Messages) -> tdlib_rs::types::Messages
     }
 }
 
+// Helper to extract FormattedText fields from the enum
+fn unwrap_formatted_text(text: tdlib_rs::enums::FormattedText) -> tdlib_rs::types::FormattedText {
+    match text {
+        tdlib_rs::enums::FormattedText::FormattedText(t) => t,
+    }
+}
+
 // Helper to extract File fields from the enum
 fn unwrap_file(file: tdlib_rs::enums::File) -> tdlib_rs::types::File {
     match file {
         tdlib_rs::enums::File::File(f) => f,
     }
+}
+
+// Telegram Bot API "MarkdownV2" is TDLib markdown parser version 2. Versions 0
+// and 1 are the legacy "Markdown" mode with different, laxer syntax — passing
+// either would silently parse the body under the wrong rules.
+fn tdlib_parse_mode(mode: ParseMode) -> tdlib_rs::enums::TextParseMode {
+    match mode {
+        ParseMode::Html => tdlib_rs::enums::TextParseMode::Html,
+        ParseMode::MarkdownV2 => {
+            tdlib_rs::enums::TextParseMode::Markdown(tdlib_rs::types::TextParseModeMarkdown {
+                version: 2,
+            })
+        }
+    }
+}
+
+/// Build the message content for a send: parse the markup when a parse mode is
+/// set, and carry the parsed `FormattedText` — entities and all — straight into
+/// `InputMessageText`.
+///
+/// Split out of `send_message` rather than inlined because this is the only part
+/// of the send path a test can reach: `MockClient` records
+/// `(chat_id, text, parse_mode)` and never parses, so nothing else can prove
+/// that the *parsed* text, not the raw markup, is what reaches TDLib. See
+/// `tdlib_parse_tests`.
+///
+/// `parseTextEntities` is a local TDLib computation (a static request — no
+/// Telegram round trip), so calling it before `create_private_chat` leaves zero
+/// residue when the markup is bad. TDLib owns the markup rules and computes the
+/// UTF-16 entity offsets itself — `tg` never touches offsets and never escapes
+/// on the caller's behalf.
+async fn build_text_content(
+    text: &str,
+    parse_mode: Option<ParseMode>,
+    client_id: i32,
+) -> Result<tdlib_rs::enums::InputMessageContent> {
+    use tdlib_rs::enums::InputMessageContent;
+    use tdlib_rs::types::{FormattedText, InputMessageText};
+
+    let formatted = match parse_mode {
+        None => FormattedText {
+            text: text.to_string(),
+            entities: vec![],
+        },
+        Some(mode) => {
+            let parsed = unwrap_formatted_text(
+                tdlib_rs::functions::parse_text_entities(
+                    text.to_string(),
+                    tdlib_parse_mode(mode),
+                    client_id,
+                )
+                .await
+                .map_err(|e| {
+                    // Deliberately not `TgError::TdLib`: the send call maps to that
+                    // variant too, and a caller (or a human staring at an errored
+                    // approval) must be able to tell a permanent markup fault from a
+                    // transient send failure. Retrying the identical body can never
+                    // succeed, so the message says so.
+                    TgError::Other(format!(
+                        "parse_mode {}: {} — nothing was sent; the markup must be fixed and re-proposed, retrying the same body will fail identically",
+                        mode.as_str(),
+                        e.message
+                    ))
+                })?,
+            );
+
+            // Markup-only bodies (`<b></b>`, `**`) parse to the empty string
+            // without error. `resolve_message` guarantees a non-empty body, so
+            // preserve that invariant here rather than letting TDLib reject an
+            // empty message later with an opaque error, after a chat was opened.
+            if !text.trim().is_empty() && parsed.text.trim().is_empty() {
+                return Err(TgError::Other(format!(
+                    "parse_mode {}: message body is empty after parsing markup; nothing was sent",
+                    mode.as_str()
+                )));
+            }
+
+            parsed
+        }
+    };
+
+    Ok(InputMessageContent::InputMessageText(InputMessageText {
+        text: formatted,
+        link_preview_options: None,
+        clear_draft: true,
+    }))
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -2205,23 +2304,23 @@ impl TelegramClient for TdLibClient {
         Err(TgError::ChatNotFound(name.to_string()))
     }
 
-    async fn send_message(&self, chat_id: i64, text: &str) -> Result<SendResult> {
-        use tdlib_rs::enums::{InputMessageContent, Update};
-        use tdlib_rs::types::{FormattedText, InputMessageText};
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+    ) -> Result<SendResult> {
+        use tdlib_rs::enums::Update;
 
         let client_id = self.get_client_id().await?;
 
+        // Build the content before anything with a side effect, so a malformed
+        // body returns here with no message sent, no draft left and no chat
+        // opened.
+        let content = build_text_content(text, parse_mode, client_id).await?;
+
         // First, ensure we have a chat open (creates private chat if needed)
         let _ = tdlib_rs::functions::create_private_chat(chat_id, true, client_id).await;
-
-        let content = InputMessageContent::InputMessageText(InputMessageText {
-            text: FormattedText {
-                text: text.to_string(),
-                entities: vec![],
-            },
-            link_preview_options: None,
-            clear_draft: true,
-        });
 
         // Subscribe to updates before sending
         let mut receiver = self.update_sender.subscribe();
@@ -2758,6 +2857,8 @@ pub mod mock {
         pub get_messages_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         /// Tracks how many times `get_boundary_message_id` has been called
         pub get_boundary_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Records every send as `(chat_id, text, parse_mode)`
+        pub sent: std::sync::Mutex<Vec<(i64, String, Option<ParseMode>)>>,
     }
 
     impl MockClient {
@@ -2825,6 +2926,7 @@ pub mod mock {
                 get_boundary_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                     0,
                 )),
+                sent: std::sync::Mutex::new(Vec::new()),
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -2944,7 +3046,16 @@ pub mod mock {
                 .ok_or_else(|| TgError::ChatNotFound(name.to_string()))
         }
 
-        async fn send_message(&self, chat_id: i64, _text: &str) -> Result<SendResult> {
+        async fn send_message(
+            &self,
+            chat_id: i64,
+            text: &str,
+            parse_mode: Option<ParseMode>,
+        ) -> Result<SendResult> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((chat_id, text.to_string(), parse_mode));
             Ok(SendResult {
                 message_id: 12345,
                 chat_id,
@@ -3061,6 +3172,27 @@ mod tests {
                 uploaded_size: 1234,
             },
         }
+    }
+
+    #[test]
+    fn tdlib_parse_mode_html_is_unit_variant() {
+        assert_eq!(
+            tdlib_parse_mode(ParseMode::Html),
+            tdlib_rs::enums::TextParseMode::Html
+        );
+    }
+
+    #[test]
+    fn tdlib_parse_mode_markdown_is_version_2() {
+        // Versions 0 and 1 are the legacy, laxer "Markdown" mode. Picking one by
+        // mistake parses the body under the wrong rules with no error anywhere,
+        // so the version number is pinned rather than merely the variant.
+        assert_eq!(
+            tdlib_parse_mode(ParseMode::MarkdownV2),
+            tdlib_rs::enums::TextParseMode::Markdown(tdlib_rs::types::TextParseModeMarkdown {
+                version: 2
+            })
+        );
     }
 
     #[test]
@@ -4260,5 +4392,269 @@ mod tests {
             inner.unwrap_err().contains("channel lagged"),
             "error should mention channel lag"
         );
+    }
+}
+
+/// Tests that exercise the real TDLib markup parser rather than a mock.
+///
+/// `parseTextEntities` is a TDLib **static** request: it answers on a client
+/// that has never called `setTdlibParameters`, so these tests need no
+/// credentials, open no database, touch no files and make no network call.
+/// tdlib-rs 1.3.0 exposes no synchronous `td_execute` binding, so the response
+/// still comes back through the global receive queue and a receive loop has to
+/// be running — hence the harness below.
+///
+/// Everything here covers what a mock cannot: `MockClient` records
+/// `(chat_id, text, parse_mode)` and never parses, so without these tests a
+/// refactor could keep the parse call for validation, put the *raw* markup back
+/// into `InputMessageText`, and stay green while every formatted message went
+/// out with literal `<b>` tags.
+#[cfg(test)]
+mod tdlib_parse_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// The one receive loop the whole test binary is allowed to have.
+    ///
+    /// Two threads inside `td_receive` at once is not merely wasteful — TDLib
+    /// detects it and aborts the process ("Receive must not be called
+    /// simultaneously from two different threads"), so a harness that starts a
+    /// loop per test SIGABRTs as soon as `cargo test` runs two of them in
+    /// parallel. Users are counted instead, and the loop is stopped and
+    /// **joined** when the last one leaves: a thread left parked inside
+    /// `td_receive` while the process tears down segfaults the binary at exit,
+    /// which fails `cargo test` even when every test passed.
+    static RECEIVE_LOOP: Mutex<Option<ReceiveLoop>> = Mutex::new(None);
+
+    struct ReceiveLoop {
+        users: usize,
+        client_id: i32,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    /// Keeps the shared receive loop alive for as long as it is held.
+    struct TdlibGuard;
+
+    impl TdlibGuard {
+        fn acquire() -> (Self, i32) {
+            let mut slot = RECEIVE_LOOP.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = slot.as_mut() {
+                existing.users += 1;
+                return (Self, existing.client_id);
+            }
+
+            let client_id = tdlib_rs::create_client();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let flag = shutdown.clone();
+            let handle = std::thread::spawn(move || {
+                while !flag.load(Ordering::Relaxed) {
+                    let _ = tdlib_rs::receive();
+                }
+            });
+            *slot = Some(ReceiveLoop {
+                users: 1,
+                client_id,
+                shutdown,
+                handle: Some(handle),
+            });
+            (Self, client_id)
+        }
+    }
+
+    impl Drop for TdlibGuard {
+        fn drop(&mut self) {
+            // The lock is deliberately held across the join: releasing it first
+            // would let the next test start a second loop while this one is
+            // still parked in `td_receive`, which is the abort above.
+            let mut slot = RECEIVE_LOOP.lock().unwrap_or_else(|e| e.into_inner());
+            let running = slot.as_mut().expect("loop must outlive its users");
+            running.users -= 1;
+            if running.users > 0 {
+                return;
+            }
+            running.shutdown.store(true, Ordering::Relaxed);
+            let handle = running.handle.take().expect("loop is joined exactly once");
+            *slot = None;
+            handle.join().expect("receive loop must not panic");
+        }
+    }
+
+    /// Run `f` against a live TDLib client id with the shared receive loop up.
+    async fn with_tdlib<F, Fut, R>(f: F) -> R
+    where
+        F: FnOnce(i32) -> Fut,
+        Fut: std::future::Future<Output = R>,
+    {
+        let (_guard, client_id) = TdlibGuard::acquire();
+        // Silence TDLib's default (very chatty) logging. Idempotent, so it is
+        // simpler to repeat than to thread through the loop's construction.
+        let _ = tdlib_rs::functions::set_log_verbosity_level(0, client_id).await;
+        f(client_id).await
+    }
+
+    /// The `FormattedText` actually handed to TDLib, i.e. what the recipient gets.
+    fn sent_text(
+        content: &tdlib_rs::enums::InputMessageContent,
+    ) -> &tdlib_rs::types::FormattedText {
+        match content {
+            tdlib_rs::enums::InputMessageContent::InputMessageText(t) => &t.text,
+            other => panic!("expected InputMessageText, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn html_body_reaches_input_message_text_parsed_not_raw() {
+        // The one property no mock can prove: the *parsed* FormattedText —
+        // entities and all — is what lands in `InputMessageText`, not the raw
+        // markup. A refactor that keeps the parse call only for validation and
+        // rebuilds `FormattedText { text, entities: vec![] }` for the send is
+        // exactly the "literal <b> tags reach the recipient" regression this
+        // branch exists to prevent, and this test is what catches it.
+        with_tdlib(|cid| async move {
+            let content = build_text_content("<b>🚀 ok</b>", Some(ParseMode::Html), cid)
+                .await
+                .expect("valid HTML must parse");
+            let text = sent_text(&content);
+
+            assert_eq!(text.text, "🚀 ok", "markup must be stripped from the body");
+            assert_eq!(
+                text.entities.len(),
+                1,
+                "the bold run must survive as an entity"
+            );
+            let entity = &text.entities[0];
+            assert_eq!(entity.r#type, tdlib_rs::enums::TextEntityType::Bold);
+            // UTF-16 units, computed by TDLib: 🚀 is 2 units, so "🚀 ok" is 5.
+            assert_eq!(entity.offset, 0);
+            assert_eq!(entity.length, 5);
+
+            match content {
+                tdlib_rs::enums::InputMessageContent::InputMessageText(t) => {
+                    assert!(t.clear_draft, "clear_draft must stay set");
+                    assert!(t.link_preview_options.is_none());
+                }
+                other => panic!("expected InputMessageText, got {other:?}"),
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn absent_parse_mode_carries_the_body_verbatim() {
+        // The contract's "absent means today's behaviour, byte-for-byte": no
+        // parse, no entities, and markup-looking characters left untouched.
+        with_tdlib(|cid| async move {
+            let raw = "**not markdown** <b>not html</b> _x_";
+            let content = build_text_content(raw, None, cid)
+                .await
+                .expect("plain text is never refused");
+            let text = sent_text(&content);
+            assert_eq!(text.text, raw);
+            assert!(text.entities.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn markdown_v2_parses_under_version_2_rules() {
+        // `tdlib_parse_mode_markdown_is_version_2` pins the enum; this pins the
+        // behaviour end to end. `__x__` is Underline under parser version 2 and
+        // is not an entity at all under the legacy version 0/1 parser, so a
+        // silent downgrade to the laxer mode fails here.
+        with_tdlib(|cid| async move {
+            let content = build_text_content("__x__", Some(ParseMode::MarkdownV2), cid)
+                .await
+                .expect("valid MarkdownV2 must parse");
+            let text = sent_text(&content);
+            assert_eq!(text.text, "x");
+            assert_eq!(text.entities.len(), 1, "version 1 would yield no entity");
+            assert_eq!(
+                text.entities[0].r#type,
+                tdlib_rs::enums::TextEntityType::Underline
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn entity_offsets_are_utf16_and_tg_never_touches_them() {
+        // Offsets come from TDLib and are passed through unmodified. The body
+        // mixes a 2-unit emoji, a 5-unit ZWJ sequence and a 4-unit regional
+        // indicator pair precisely so that any hand-rolled byte or char
+        // arithmetic sneaking in would land on a different number.
+        with_tdlib(|cid| async move {
+            let content = build_text_content(
+                "🚀 x <b>👩‍💻 bold</b> 🇩🇪 <i>i</i>",
+                Some(ParseMode::Html),
+                cid,
+            )
+            .await
+            .expect("valid HTML must parse");
+            let text = sent_text(&content);
+
+            assert_eq!(text.text, "🚀 x 👩‍💻 bold 🇩🇪 i");
+            assert_eq!(text.text.encode_utf16().count(), 22);
+            let offsets: Vec<(i32, i32)> =
+                text.entities.iter().map(|e| (e.offset, e.length)).collect();
+            // 🚀(2) + " x "(3) = 5; "👩‍💻 bold" = 5 + 5 = 10; then " "(1), 🇩🇪(4),
+            // " "(1) put the italic at 21.
+            assert_eq!(offsets, vec![(5, 10), (21, 1)]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn malformed_markup_is_a_permanent_error_not_a_tdlib_error() {
+        // The variant is load-bearing: the send call maps to `TgError::TdLib`,
+        // so a caller telling a permanent markup fault from a transient send
+        // failure has only this to go on. Reverting it to `TgError::TdLib`
+        // must fail a test.
+        with_tdlib(|cid| async move {
+            let err = build_text_content("<h1>x</h1>", Some(ParseMode::Html), cid)
+                .await
+                .expect_err("an unsupported tag must be refused");
+            assert!(
+                matches!(err, TgError::Other(_)),
+                "markup faults must not be TgError::TdLib: {err:?}"
+            );
+            let msg = err.to_string();
+            assert!(msg.starts_with("parse_mode HTML: "), "{msg}");
+            // TDLib's own wording, quoted so the caller can act on it.
+            assert!(msg.contains("Unsupported start tag"), "{msg}");
+            assert!(msg.contains("nothing was sent"), "{msg}");
+            assert!(
+                msg.contains("retrying the same body will fail identically"),
+                "{msg}"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn markup_only_body_is_refused_but_whitespace_body_is_not() {
+        // `<b></b>` parses `Ok` to the empty string, which TDLib would later
+        // reject with an opaque error after a chat was already opened. The
+        // guard turns that into a clear refusal *before* any side effect.
+        //
+        // The second half pins the `!text.trim().is_empty() &&` clause: a body
+        // that was already whitespace before parsing is not something the markup
+        // ate, so it must still go through exactly as it did before this branch.
+        // Dropping that clause turns it into a refusal and only this assert says so.
+        with_tdlib(|cid| async move {
+            let err = build_text_content("<b></b>", Some(ParseMode::Html), cid)
+                .await
+                .expect_err("a markup-only body must be refused");
+            let msg = err.to_string();
+            assert!(msg.contains("empty after parsing markup"), "{msg}");
+            assert!(msg.contains("nothing was sent"), "{msg}");
+
+            let content = build_text_content("   ", Some(ParseMode::Html), cid)
+                .await
+                .expect("a whitespace body is not something the markup ate");
+            assert_eq!(sent_text(&content).text, "   ");
+        })
+        .await;
     }
 }

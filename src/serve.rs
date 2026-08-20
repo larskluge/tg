@@ -217,6 +217,72 @@ mod tests {
         assert_eq!(r["chat_id"], 42);
     }
 
+    #[tokio::test]
+    async fn dispatch_send_with_parse_mode_succeeds() {
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "8",
+                "send",
+                json!({"message": "hi", "id": 42, "parse_mode": "HTML"}),
+            ),
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        assert_eq!(res.result.unwrap()["chat_id"], 42);
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_rejects_unknown_arg() {
+        // `send` is a closed set: an unsupported arg is refused in-band instead
+        // of being dropped while `tg` still answers ok.
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "9",
+                "send",
+                json!({"message": "hi", "id": 42, "as": "@bot"}),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        assert_eq!(res.id, json!("9"));
+        let err = res.error.unwrap();
+        assert!(err.contains("invalid args"), "{err}");
+        assert!(err.contains("unknown field `as`"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_rejects_bad_parse_mode() {
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "10",
+                "send",
+                json!({"message": "hi", "id": 42, "parse_mode": "markdown"}),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        assert_eq!(res.id, json!("10"));
+        let err = res.error.unwrap();
+        assert!(err.contains("invalid parse_mode"), "{err}");
+        assert!(err.contains("HTML"), "{err}");
+        assert!(err.contains("MarkdownV2"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_other_commands_still_ignore_unknown_args() {
+        // Only `send` is strict. `whoami` in particular backs the container's
+        // health check, so tightening the rest has to be a conscious act.
+        let client = MockClient::default();
+        let res = dispatch(&client, req("11", "chats", json!({"limit": 5, "bogus": 1}))).await;
+        assert!(res.ok, "{:?}", res.error);
+    }
+
     // Env-var-mutating tests are gathered into one to avoid cross-test races on
     // the shared process environment.
     #[test]

@@ -4,6 +4,7 @@ use crate::error::{Result, TgError};
 use std::path::Path;
 
 /// Parsed recipient from CLI args, decoupled from clap types.
+#[derive(Debug)]
 pub enum Recipient {
     To(String),
     Id(i64),

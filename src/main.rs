@@ -17,7 +17,7 @@ use tg::output::{
     UserInfo, print_chats_table, print_contacts_table, print_error, print_list,
     print_messages_table, print_output, print_success,
 };
-use tg::resolve::{self, Recipient};
+use tg::resolve;
 use tg::serve_client;
 use tokio::net::UnixStream;
 
@@ -338,6 +338,14 @@ async fn run_bot_send(
     data_dir: &std::path::Path,
     format: OutputFormat,
 ) -> Result<()> {
+    // Validate first. Bot sends bypass TDLib entirely, so this path validates
+    // the mode itself (the Bot API takes the same two literals natively) — and
+    // it must happen before `resolve_recipient`, which cold-starts TDLib, hits
+    // the network for an unknown @username and persists the result to
+    // credentials.json. `plan_bot_send` hands back the recipient so the check
+    // cannot be reordered behind that work.
+    let (recipient, parse_mode) = send::plan_bot_send(args)?;
+
     let send_as = args.send_as.as_ref().unwrap();
     let creds_file = credentials::load_credentials_file(data_dir)?;
 
@@ -350,23 +358,13 @@ async fn run_bot_send(
     .ok_or_else(|| TgError::Other(format!("Bot {send_as} not found. Run `tg auth bot` first.")))?
     .clone();
 
-    // Resolve the recipient
-    let recipient = if let Some(ref to) = args.to {
-        Recipient::To(to.clone())
-    } else if let Some(id) = args.id {
-        Recipient::Id(id)
-    } else if let Some(ref group) = args.group {
-        Recipient::Group(group.clone())
-    } else {
-        Recipient::Name(args.name.clone().unwrap())
-    };
     let chat_id = resolve::resolve_recipient(recipient, &creds_file, data_dir).await?;
 
     let message = args
         .message
         .as_deref()
         .expect("send message must be resolved before run_bot_send");
-    let message_id = bot_api::send_message(&bot.token, chat_id, message).await?;
+    let message_id = bot_api::send_message(&bot.token, chat_id, message, parse_mode).await?;
 
     let result = SendResult {
         message_id,
@@ -465,28 +463,10 @@ async fn run_command(
 
         Command::Send(args) => {
             // --as bot sends are handled before run_command, so this is always user send.
+            // The target ladder and parse-mode validation live in `send::handle`,
+            // shared with the socket path so the two cannot diverge.
             client.start().await?;
-            let target = if let Some(ref to) = args.to {
-                if let Ok(id) = to.parse::<i64>() {
-                    send::SendTarget::Id(id)
-                } else if let Some(username) = to.strip_prefix('@') {
-                    send::SendTarget::Username(username.to_string())
-                } else {
-                    send::SendTarget::Name(to.clone())
-                }
-            } else if let Some(id) = args.id {
-                send::SendTarget::Id(id)
-            } else if let Some(group) = args.group {
-                send::SendTarget::Group(group)
-            } else {
-                send::SendTarget::Name(args.name.unwrap())
-            };
-
-            let message = args
-                .message
-                .as_deref()
-                .expect("send message must be resolved before run_command");
-            let result = send::send_message(client, target, message).await?;
+            let result = send::handle(client, send::SendRequest::from(args)).await?;
             print_output(format, &result);
         }
 
