@@ -6,6 +6,7 @@ pub mod commands;
 pub mod credentials;
 pub mod error;
 pub mod output;
+pub mod parse_mode;
 pub mod resolve;
 pub mod serve;
 pub mod serve_client;

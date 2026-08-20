@@ -13,6 +13,7 @@ use crate::output::{
     ChatInfo, ContactInfo, DownloadReport, DownloadStatus, DownloadedFileResult,
     MessageContentDetails, MessageFileRef, MessageInfo, SendResult,
 };
+use crate::parse_mode::ParseMode;
 
 // Direct FFI to TDLib's synchronous log functions (not exposed by tdlib-rs)
 #[link(name = "tdjson")]
@@ -82,7 +83,12 @@ pub trait TelegramClient: Send + Sync {
     async fn find_chat_by_username(&self, username: &str) -> Result<i64>;
     async fn find_group_by_name(&self, name: &str) -> Result<i64>;
 
-    async fn send_message(&self, chat_id: i64, text: &str) -> Result<SendResult>;
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+    ) -> Result<SendResult>;
 
     async fn get_messages(
         &self,
@@ -615,10 +621,31 @@ fn unwrap_messages(msgs: tdlib_rs::enums::Messages) -> tdlib_rs::types::Messages
     }
 }
 
+// Helper to extract FormattedText fields from the enum
+fn unwrap_formatted_text(text: tdlib_rs::enums::FormattedText) -> tdlib_rs::types::FormattedText {
+    match text {
+        tdlib_rs::enums::FormattedText::FormattedText(t) => t,
+    }
+}
+
 // Helper to extract File fields from the enum
 fn unwrap_file(file: tdlib_rs::enums::File) -> tdlib_rs::types::File {
     match file {
         tdlib_rs::enums::File::File(f) => f,
+    }
+}
+
+// Telegram Bot API "MarkdownV2" is TDLib markdown parser version 2. Versions 0
+// and 1 are the legacy "Markdown" mode with different, laxer syntax — passing
+// either would silently parse the body under the wrong rules.
+fn tdlib_parse_mode(mode: ParseMode) -> tdlib_rs::enums::TextParseMode {
+    match mode {
+        ParseMode::Html => tdlib_rs::enums::TextParseMode::Html,
+        ParseMode::MarkdownV2 => {
+            tdlib_rs::enums::TextParseMode::Markdown(tdlib_rs::types::TextParseModeMarkdown {
+                version: 2,
+            })
+        }
     }
 }
 
@@ -2205,20 +2232,69 @@ impl TelegramClient for TdLibClient {
         Err(TgError::ChatNotFound(name.to_string()))
     }
 
-    async fn send_message(&self, chat_id: i64, text: &str) -> Result<SendResult> {
+    async fn send_message(
+        &self,
+        chat_id: i64,
+        text: &str,
+        parse_mode: Option<ParseMode>,
+    ) -> Result<SendResult> {
         use tdlib_rs::enums::{InputMessageContent, Update};
         use tdlib_rs::types::{FormattedText, InputMessageText};
 
         let client_id = self.get_client_id().await?;
 
+        // Parse before anything with a side effect. `parseTextEntities` is a local
+        // TDLib computation (no Telegram round trip), so a malformed body returns
+        // here with no message sent, no draft left, and no chat opened. TDLib owns
+        // the markup rules and computes the UTF-16 entity offsets itself — `tg`
+        // never touches offsets and never escapes on the caller's behalf.
+        let formatted = match parse_mode {
+            None => FormattedText {
+                text: text.to_string(),
+                entities: vec![],
+            },
+            Some(mode) => {
+                let parsed = unwrap_formatted_text(
+                    tdlib_rs::functions::parse_text_entities(
+                        text.to_string(),
+                        tdlib_parse_mode(mode),
+                        client_id,
+                    )
+                    .await
+                    .map_err(|e| {
+                        // Deliberately not `TgError::TdLib`: the send call below maps
+                        // to that variant too, and a caller (or a human staring at an
+                        // errored approval) must be able to tell a permanent markup
+                        // fault from a transient send failure. Retrying the identical
+                        // body can never succeed, so the message says so.
+                        TgError::Other(format!(
+                            "parse_mode {}: {} — nothing was sent; the markup must be fixed and re-proposed, retrying the same body will fail identically",
+                            mode.as_str(),
+                            e.message
+                        ))
+                    })?,
+                );
+
+                // Markup-only bodies (`<b></b>`, `**`) parse to the empty string
+                // without error. `resolve_message` guarantees a non-empty body, so
+                // preserve that invariant here rather than letting TDLib reject an
+                // empty message later with an opaque error, after a chat was opened.
+                if !text.trim().is_empty() && parsed.text.trim().is_empty() {
+                    return Err(TgError::Other(format!(
+                        "parse_mode {}: message body is empty after parsing markup; nothing was sent",
+                        mode.as_str()
+                    )));
+                }
+
+                parsed
+            }
+        };
+
         // First, ensure we have a chat open (creates private chat if needed)
         let _ = tdlib_rs::functions::create_private_chat(chat_id, true, client_id).await;
 
         let content = InputMessageContent::InputMessageText(InputMessageText {
-            text: FormattedText {
-                text: text.to_string(),
-                entities: vec![],
-            },
+            text: formatted,
             link_preview_options: None,
             clear_draft: true,
         });
@@ -2758,6 +2834,8 @@ pub mod mock {
         pub get_messages_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         /// Tracks how many times `get_boundary_message_id` has been called
         pub get_boundary_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Records every send as `(chat_id, text, parse_mode)`
+        pub sent: std::sync::Mutex<Vec<(i64, String, Option<ParseMode>)>>,
     }
 
     impl MockClient {
@@ -2825,6 +2903,7 @@ pub mod mock {
                 get_boundary_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                     0,
                 )),
+                sent: std::sync::Mutex::new(Vec::new()),
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -2944,7 +3023,16 @@ pub mod mock {
                 .ok_or_else(|| TgError::ChatNotFound(name.to_string()))
         }
 
-        async fn send_message(&self, chat_id: i64, _text: &str) -> Result<SendResult> {
+        async fn send_message(
+            &self,
+            chat_id: i64,
+            text: &str,
+            parse_mode: Option<ParseMode>,
+        ) -> Result<SendResult> {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((chat_id, text.to_string(), parse_mode));
             Ok(SendResult {
                 message_id: 12345,
                 chat_id,
@@ -3061,6 +3149,27 @@ mod tests {
                 uploaded_size: 1234,
             },
         }
+    }
+
+    #[test]
+    fn tdlib_parse_mode_html_is_unit_variant() {
+        assert_eq!(
+            tdlib_parse_mode(ParseMode::Html),
+            tdlib_rs::enums::TextParseMode::Html
+        );
+    }
+
+    #[test]
+    fn tdlib_parse_mode_markdown_is_version_2() {
+        // Versions 0 and 1 are the legacy, laxer "Markdown" mode. Picking one by
+        // mistake parses the body under the wrong rules with no error anywhere,
+        // so the version number is pinned rather than merely the variant.
+        assert_eq!(
+            tdlib_parse_mode(ParseMode::MarkdownV2),
+            tdlib_rs::enums::TextParseMode::Markdown(tdlib_rs::types::TextParseModeMarkdown {
+                version: 2
+            })
+        );
     }
 
     #[test]

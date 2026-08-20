@@ -17,6 +17,7 @@ use tg::output::{
     UserInfo, print_chats_table, print_contacts_table, print_error, print_list,
     print_messages_table, print_output, print_success,
 };
+use tg::parse_mode::ParseMode;
 use tg::resolve::{self, Recipient};
 use tg::serve_client;
 use tokio::net::UnixStream;
@@ -366,7 +367,14 @@ async fn run_bot_send(
         .message
         .as_deref()
         .expect("send message must be resolved before run_bot_send");
-    let message_id = bot_api::send_message(&bot.token, chat_id, message).await?;
+    // Bot sends bypass TDLib entirely, so this path validates the mode itself.
+    // The Bot API takes the same two literals natively.
+    let parse_mode = args
+        .parse_mode
+        .as_deref()
+        .map(ParseMode::parse)
+        .transpose()?;
+    let message_id = bot_api::send_message(&bot.token, chat_id, message, parse_mode).await?;
 
     let result = SendResult {
         message_id,
@@ -465,28 +473,10 @@ async fn run_command(
 
         Command::Send(args) => {
             // --as bot sends are handled before run_command, so this is always user send.
+            // The target ladder and parse-mode validation live in `send::handle`,
+            // shared with the socket path so the two cannot diverge.
             client.start().await?;
-            let target = if let Some(ref to) = args.to {
-                if let Ok(id) = to.parse::<i64>() {
-                    send::SendTarget::Id(id)
-                } else if let Some(username) = to.strip_prefix('@') {
-                    send::SendTarget::Username(username.to_string())
-                } else {
-                    send::SendTarget::Name(to.clone())
-                }
-            } else if let Some(id) = args.id {
-                send::SendTarget::Id(id)
-            } else if let Some(group) = args.group {
-                send::SendTarget::Group(group)
-            } else {
-                send::SendTarget::Name(args.name.unwrap())
-            };
-
-            let message = args
-                .message
-                .as_deref()
-                .expect("send message must be resolved before run_command");
-            let result = send::send_message(client, target, message).await?;
+            let result = send::handle(client, send::SendRequest::from(args)).await?;
             print_output(format, &result);
         }
 

@@ -89,9 +89,14 @@ tg send --id 123456789 -m "Hello!"
 tg send --to @username -m "Hello!"
 tg send --group "Family" -m "Hi all!"
 
-# Send as a bot (plain text only, no Markdown/HTML formatting)
+# Formatted messages (see "Message formatting" below)
+tg send --to @username --parse-mode HTML -m "<b>bold</b> and <code>code</code>"
+printf '<b>bold</b>\n<i>italic</i>' | tg send --to @username --parse-mode HTML
+
+# Send as a bot
 tg send --as @mybot --to @someone -m "Hello from bot!"
 tg send --as @mybot --to 123456789 -m "Hello!"
+tg send --as @mybot --to @someone --parse-mode HTML -m "<b>Hello</b>"
 
 # Download media
 tg download --chat -1001666847309 --message 42 [--output-dir .] [--priority 16]
@@ -106,6 +111,55 @@ tg mark-unread --id 123456789
 # Run the long-lived server so other commands skip cold start
 tg serve
 ```
+
+### Message formatting
+
+`--parse-mode` (socket arg `parse_mode`) accepts exactly `HTML` and `MarkdownV2`,
+case-sensitive. Absent means plain text — byte-for-byte the behaviour `tg` has always had.
+Any other value, including `html` or an empty string, is refused with
+
+```
+invalid parse_mode '<value>'. Expected `HTML` or `MarkdownV2`
+```
+
+and **nothing is sent** — `tg` never quietly downgrades a formatted body to plain text.
+Telegram parses the markup, so malformed markup comes back as Telegram's own error (it names
+the offending byte offset) and nothing is sent then either.
+
+**Use `HTML`.** It is the safer of the two by a wide margin, and it is the recommended default.
+
+`HTML` is not general HTML — it is Telegram's tiny tag whitelist:
+
+`b`/`strong`, `i`/`em`, `u`/`ins`, `s`/`strike`/`del`, `a href`, `code`,
+`pre` (and `pre` + `code class="language-rust"`), `blockquote` (optionally `expandable`),
+`tg-spoiler`, `tg-emoji`.
+
+There are no headings, lists, `hr`, `p` or `br` tags: `<h1>`, `<p>`, `<br>` and `<span>` are
+errors, not ignored markup. Use `\n` for line breaks. Tag names are case-insensitive
+(`<B>` works). Only three characters need escaping — `&`, `<`, `>` — as `&amp;`, `&lt;`,
+`&gt;`; those four entities (`lt`, `gt`, `amp`, `quot`) are the only ones decoded, so
+`&nbsp;` stays literal. A bare `<` in prose (`a < b`) is an error; a bare `&` (`AT&T`)
+happens to pass through.
+
+**`MarkdownV2` is dangerous for text that was not written as MarkdownV2**, which is why it
+is not the recommendation. It reserves eighteen characters —
+``_ * [ ] ( ) ~ ` > # + - = | { } . !`` — and splits into two very different failure modes:
+
+- Thirteen of them hard-error on ordinary prose, which is loud and safe:
+  `hello. world!` → ``Character '.' is reserved and must be escaped``,
+  `5 * 3 = 15` → `'=' is reserved`, `cost is $5 (approx)` → `'(' is reserved`.
+- The five pairable ones — `` _ * ~ | ` `` — **corrupt the message silently, with no error at
+  all**, because two of them pair into an entity:
+
+  ```
+  in:  path /usr/local/bin/x_y_z
+  out: path /usr/local/bin/xyz      ← two characters deleted, "y" italicised, ok:true
+  ```
+
+  Paths, `snake_case` identifiers and table pipes are the most common shapes in an
+  agent-written technical message, so this is not a corner case. Under `MarkdownV2` the
+  **caller** carries 100% of the escaping burden: `tg` passes the body to Telegram verbatim
+  and computes no offsets and escapes nothing on the caller's behalf.
 
 ## Machine use
 
@@ -142,6 +196,16 @@ Response (success): `{"id": "<echoed>", "ok": true, "result": <value>}`
 Response (failure): `{"id": "<echoed>", "ok": false, "error": "<message>"}`
 
 `cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `send`, `download`, `mark_read`, `mark_unread`, `sync`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today.
+
+`send` rejects unknown `args` keys rather than ignoring them:
+
+```json
+{"id": "1", "ok": false, "error": "invalid args: unknown field `x`, expected one of `message`, `name`, `id`, `to`, `group`, `parse_mode`"}
+```
+
+The other commands still ignore unknown keys. For a recipient or identity field, a silent drop
+means a message delivered to the wrong place with `ok: true`, which is worse than a refusal the
+caller can retry.
 
 ### One-shot bulk sync
 

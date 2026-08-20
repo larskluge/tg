@@ -90,6 +90,8 @@ tg send --id 123456789 -m "Hello!"
 tg send --group "Family" -m "Hi all!"
 tg send --to @username -m "Hi!"
 echo "Hello from stdin" | tg send --to @username   # omit -m to read the body from stdin
+tg send --to @username --parse-mode HTML -m "<b>bold</b> and <code>code</code>"
+tg send --as @mybot --to @someone --parse-mode HTML -m "<b>Hello</b>"
 tg messages "John Doe" [--limit 20] [--since-utc 2026-03-01]
 tg messages --chat -1001666847309 [--limit 20] [--since-utc 2026-03-01]
 tg download --chat -1001666847309 --message 42 [--output-dir .] [--priority 16]
@@ -130,5 +132,41 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 **TDLib `getChatHistory` quirk:** May return fewer messages than `limit` on the first call while syncing from the server. Always use a retry+pagination loop: retry on empty responses (up to 5×), and page using the oldest returned message ID as the next `from_message_id`.
 
 **TDLib `getChatMessageByDate` direction:** It returns the last message sent **no later than** the given date — the returned message's date is always `<= date` — and a **404** when the chat has no such message. It does not find the first message *after* a date. To turn a `--since-utc` cutoff into a fetch boundary, probe at `cutoff - 1` and use the returned message's `id + 1` as an exclusive lower bound (`boundary_probe_date` / `boundary_from_probe` in `client.rs`). Reading it as "at or after the date" makes the lookup silently never match.
+
+**TDLib HTML parse mode is not HTML:** `textParseModeHTML` accepts only Telegram's tag
+whitelist — `b`/`strong`, `i`/`em`, `u`/`ins`, `s`/`strike`/`del`, `a href`, `code`, `pre`
+(+ `code class="language-x"`), `blockquote` (optionally `expandable`), `tg-spoiler`,
+`tg-emoji`. There are no headings, lists, `hr`, `p` or `br`. TDLib **errors** on any tag
+outside the set (it does not strip it), so `<h1>x</h1>` fails the send rather than degrading.
+Tag names are case-insensitive. Only `&`, `<`, `>` need escaping, and only `lt`/`gt`/`amp`/
+`quot` decode. Related facts, all measured against TDLib 1.8.61:
+
+- `parse_text_entities` returns `enums::FormattedText`, so it needs `unwrap_formatted_text()`
+  before it can go into `InputMessageText` (see **TDLib types** above). It also takes an
+  owned `String`.
+- TDLib does **not** auto-detect bold/italic/code server-side — its entity auto-detection
+  covers only link-ish entities. That is why `entities: vec![]` delivered literal asterisks
+  for years, and why a parse mode has to be requested explicitly.
+- Entity offsets are UTF-16 and TDLib computes them. Never hand-roll them: always call
+  `parse_text_entities`. Verified exact across emoji, umlauts, combining marks, ZWJ sequences
+  and regional indicators (🚀 = 2 units, 👩‍💻 = 5, 🇩🇪 = 2), and the tdlib-rs hop is lossless
+  because `types::FormattedText` and `enums::TextEntityType` both round-trip through serde.
+- `MarkdownV2` is parser `version: 2`. Versions 0 and 1 are the legacy, laxer "Markdown"
+  mode: picking one by mistake parses the body under the wrong rules with no error anywhere
+  (pinned by `tdlib_parse_mode_markdown_is_version_2`).
+- `parseTextEntities` is a TDLib **static request** — it answers on a client that has never
+  called `setTdlibParameters`, needs no authorization, makes no network call, and costs
+  ~17 µs. Calling it before `create_private_chat` therefore leaves zero residue when the
+  markup is bad: no message, no draft, no opened chat.
+- MarkdownV2's five pairable reserved characters (`` _ * ~ | ` ``) **corrupt silently**:
+  `path /usr/local/bin/x_y_z` parses `Ok` to `path /usr/local/bin/xyz` with an italic entity.
+  The other thirteen hard-error. Prefer `HTML`.
+
+**Serve request strictness:** `SendRequest` is the only serve request struct carrying
+`#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs
+the container's `HealthCmd` (`tg whoami`, `HealthStartupTimeout=2m`), so tightening it risks
+the health gate for no benefit, and the remaining structs have caller sets that were never
+audited. `dispatch_other_commands_still_ignore_unknown_args` pins the decision so a later
+blanket change has to be deliberate.
 
 **Clap negative IDs:** Telegram supergroup IDs are negative (e.g. `-1001666847309`). Any `--id` arg that accepts `i64` needs `#[arg(long, allow_hyphen_values = true)]` or clap will treat the leading `-` as a flag.

@@ -106,6 +106,10 @@ pub struct SendArgs {
     /// Group name to send to
     #[arg(long)]
     pub group: Option<String>,
+
+    /// Format the message body: `HTML` or `MarkdownV2` (default: plain text)
+    #[arg(long)]
+    pub parse_mode: Option<String>,
 }
 
 #[derive(Parser, Debug)]
@@ -257,6 +261,57 @@ mod tests {
                 assert_eq!(args.id, None);
                 assert_eq!(args.group, None);
                 assert_eq!(args.message.as_deref(), Some("Hello!"));
+            }
+            _ => panic!("Expected Send command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_with_parse_mode() {
+        let cli = Cli::parse_from([
+            "tg",
+            "send",
+            "--to",
+            "@x",
+            "--parse-mode",
+            "HTML",
+            "-m",
+            "hi",
+        ]);
+        match cli.command {
+            Command::Send(args) => assert_eq!(args.parse_mode.as_deref(), Some("HTML")),
+            _ => panic!("Expected Send command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_without_parse_mode_is_none() {
+        let cli = Cli::parse_from(["tg", "send", "John Doe", "-m", "Hello!"]);
+        match cli.command {
+            Command::Send(args) => assert_eq!(args.parse_mode, None),
+            _ => panic!("Expected Send command"),
+        }
+    }
+
+    #[test]
+    fn parse_send_as_bot_with_parse_mode() {
+        // No clap conflict: the bot HTTP path honours the mode too.
+        let cli = Cli::parse_from([
+            "tg",
+            "send",
+            "--as",
+            "@mybot",
+            "--to",
+            "@someone",
+            "--parse-mode",
+            "HTML",
+            "-m",
+            "hi",
+        ]);
+        match cli.command {
+            Command::Send(args) => {
+                assert_eq!(args.send_as.as_deref(), Some("@mybot"));
+                assert_eq!(args.parse_mode.as_deref(), Some("HTML"));
             }
             _ => panic!("Expected Send command"),
         }
