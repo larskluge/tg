@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::cli::SendArgs;
 use crate::client::TelegramClient;
 use crate::error::{Result, TgError};
+use crate::media::{MediaFile, SendFile, validate_files};
 use crate::output::SendResult;
 use crate::parse_mode::ParseMode;
 use crate::resolve::Recipient;
@@ -38,6 +39,11 @@ pub struct SendRequest {
     /// validation happens in [`handle`].
     #[serde(default)]
     pub parse_mode: Option<String>,
+    /// 1-10 local files to send as one message, with `message` as the caption.
+    /// Absent is a text-only send and is byte-identical to the pre-`files`
+    /// contract; an empty array is refused. Validated in [`handle`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<SendFile>>,
 }
 
 /// Convert clap args to a `SendRequest`. Panics if `--as <bot>` is set, because
@@ -58,6 +64,10 @@ impl From<SendArgs> for SendRequest {
             to: args.to,
             group: args.group,
             parse_mode: args.parse_mode,
+            // The CLI has no attachment flag; attachments are a socket-protocol
+            // feature. `skip_serializing_if` keeps the key off the wire
+            // entirely, so a new CLI still talks to an older daemon.
+            files: None,
         }
     }
 }
@@ -104,20 +114,44 @@ fn resolve_message_from<R: Read>(
     Ok(trimmed.to_string())
 }
 
+/// Turn a [`SendTarget`] into a chat id. This is the step that costs TDLib
+/// contact and public-chat searches, which is why every request check runs
+/// before it.
+async fn resolve_chat_id<C: TelegramClient>(client: &C, target: SendTarget) -> Result<i64> {
+    match target {
+        SendTarget::Id(id) => Ok(id),
+        SendTarget::Name(name) => client.find_chat_by_name(&name).await,
+        SendTarget::Username(username) => client.find_chat_by_username(&username).await,
+        SendTarget::Group(name) => client.find_group_by_name(&name).await,
+    }
+}
+
 pub async fn send_message<C: TelegramClient>(
     client: &C,
     target: SendTarget,
     message: &str,
     parse_mode: Option<ParseMode>,
 ) -> Result<SendResult> {
-    let chat_id = match target {
-        SendTarget::Id(id) => id,
-        SendTarget::Name(name) => client.find_chat_by_name(&name).await?,
-        SendTarget::Username(username) => client.find_chat_by_username(&username).await?,
-        SendTarget::Group(name) => client.find_group_by_name(&name).await?,
-    };
+    let chat_id = resolve_chat_id(client, target).await?;
 
     client.send_message(chat_id, message, parse_mode).await
+}
+
+/// Send 1-10 validated files as one message, `caption` being the message's
+/// caption. Kept separate from [`send_message`] so the text path's call into
+/// the client is unchanged.
+pub async fn send_media<C: TelegramClient>(
+    client: &C,
+    target: SendTarget,
+    caption: &str,
+    parse_mode: Option<ParseMode>,
+    files: &[MediaFile],
+) -> Result<SendResult> {
+    let chat_id = resolve_chat_id(client, target).await?;
+
+    client
+        .send_media_message(chat_id, caption, parse_mode, files)
+        .await
 }
 
 /// Plan a bot (`--as`) send: validate the request and say which recipient form
@@ -169,6 +203,13 @@ pub async fn handle<C: TelegramClient>(client: &C, req: SendRequest) -> Result<S
         .map(ParseMode::parse)
         .transpose()?;
 
+    // Attachments are checked here for the same reason, plus one of their own:
+    // TDLib uploads a file *after* the send call returns, so a path it cannot
+    // read would otherwise surface as a failed send on a message the caller was
+    // already told about. Pinned by
+    // `handle_validates_files_before_resolving_target`.
+    let files = validate_files(req.files.as_deref())?;
+
     let target = if let Some(ref to) = req.to {
         if let Ok(id) = to.parse::<i64>() {
             SendTarget::Id(id)
@@ -189,7 +230,11 @@ pub async fn handle<C: TelegramClient>(client: &C, req: SendRequest) -> Result<S
         ));
     };
 
-    send_message(client, target, &req.message, parse_mode).await
+    if files.is_empty() {
+        send_message(client, target, &req.message, parse_mode).await
+    } else {
+        send_media(client, target, &req.message, parse_mode, &files).await
+    }
 }
 
 #[cfg(test)]
@@ -432,7 +477,15 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown field `as`"), "{err}");
-        for field in ["message", "name", "id", "to", "group", "parse_mode"] {
+        for field in [
+            "message",
+            "name",
+            "id",
+            "to",
+            "group",
+            "parse_mode",
+            "files",
+        ] {
             assert!(err.contains(field), "error should name `{field}`: {err}");
         }
     }
@@ -666,6 +719,374 @@ mod tests {
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0].0, 1);
         assert_eq!(sent[0].2, Some(crate::parse_mode::ParseMode::Html));
+    }
+
+    fn media_dir() -> tempfile::TempDir {
+        tempfile::TempDir::new().unwrap()
+    }
+
+    fn media_file(dir: &tempfile::TempDir, name: &str) -> String {
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"bytes").unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn send_request_without_files_deserialises_and_means_text() {
+        // The whole back-compat guarantee: an existing caller's exact payload
+        // still parses, and nothing about it says "media".
+        let req = send_req(json!({"message": "hi", "id": 1})).unwrap();
+        assert!(req.files.is_none());
+    }
+
+    #[test]
+    fn send_request_accepts_explicit_null_files() {
+        // Same reasoning as `parse_mode: null`: an unset optional serialises to
+        // `null` in Go and Python, and refusing it would turn every text send
+        // from those callers into a hard error while closing nothing.
+        let req = send_req(json!({"message": "hi", "id": 1, "files": null})).unwrap();
+        assert!(req.files.is_none());
+    }
+
+    #[test]
+    fn send_request_from_args_never_carries_files() {
+        // The CLI has no attachment flag, and the key must stay off the wire so
+        // a new CLI still talks to a daemon that predates `files`.
+        use clap::Parser;
+        let req = SendRequest::from(SendArgs::parse_from(["send", "--id", "1", "-m", "hi"]));
+        assert!(req.files.is_none());
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(
+            wire.get("files").is_none(),
+            "`files` must be omitted, not null: {wire}"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_only_request_still_reaches_the_text_send_path() {
+        // Byte-identical behaviour: the same recording, and nothing on the
+        // media path.
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            id: Some(123),
+            ..Default::default()
+        };
+        handle(&client, req).await.unwrap();
+        assert_eq!(
+            *client.sent.lock().unwrap(),
+            vec![(123, "hi".to_string(), None)]
+        );
+        assert!(client.media_sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_sends_a_single_file_with_the_body_as_caption() {
+        let dir = media_dir();
+        let path = media_file(&dir, "Q3 report.pdf");
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "here it is".to_string(),
+            id: Some(123),
+            files: Some(vec![SendFile {
+                path: path.clone(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let res = handle(&client, req).await.unwrap();
+        assert_eq!(res.chat_id, 123);
+
+        let media = client.media_sent.lock().unwrap();
+        assert_eq!(media.len(), 1);
+        let (chat_id, caption, parse_mode, files) = &media[0];
+        assert_eq!(*chat_id, 123);
+        assert_eq!(caption, "here it is");
+        assert_eq!(*parse_mode, None);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path.to_string_lossy(), path);
+        assert_eq!(files[0].kind, crate::media::MediaKind::File);
+        // The basename is the only filename Telegram can show, so it must be
+        // carried through untouched — spaces included.
+        assert_eq!(files[0].display_name(), "Q3 report.pdf");
+        // A media send must not also be recorded as a text send.
+        assert!(client.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_sends_multiple_files_as_one_album_with_one_caption() {
+        // The caption is a property of the message, not of each file: the
+        // client is handed it once, alongside the ordered file set.
+        let dir = media_dir();
+        let first = media_file(&dir, "a.jpg");
+        let second = media_file(&dir, "b.jpg");
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "two photos".to_string(),
+            id: Some(123),
+            parse_mode: Some("HTML".to_string()),
+            files: Some(vec![
+                SendFile {
+                    path: first.clone(),
+                    kind: Some("photo".to_string()),
+                    width: Some(800),
+                    height: Some(600),
+                },
+                SendFile {
+                    path: second.clone(),
+                    kind: Some("photo".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        handle(&client, req).await.unwrap();
+
+        let media = client.media_sent.lock().unwrap();
+        assert_eq!(media.len(), 1, "one album is one send, not one per file");
+        let (_, caption, parse_mode, files) = &media[0];
+        assert_eq!(caption, "two photos");
+        assert_eq!(*parse_mode, Some(ParseMode::Html));
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path.to_string_lossy(), first);
+        assert_eq!(files[1].path.to_string_lossy(), second);
+        assert_eq!((files[0].width, files[0].height), (800, 600));
+        // Absent dimensions mean "let Telegram work it out".
+        assert_eq!((files[1].width, files[1].height), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn handle_refuses_mixed_kinds_and_sends_nothing() {
+        let dir = media_dir();
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            id: Some(123),
+            files: Some(vec![
+                SendFile {
+                    path: media_file(&dir, "a.jpg"),
+                    kind: Some("photo".to_string()),
+                    ..Default::default()
+                },
+                SendFile {
+                    path: media_file(&dir, "b.pdf"),
+                    kind: Some("file".to_string()),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let err = handle(&client, req).await.unwrap_err().to_string();
+        assert!(err.contains("mixes kind"), "{err}");
+        assert!(client.media_sent.lock().unwrap().is_empty());
+        assert!(client.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_refuses_more_than_ten_files_and_sends_nothing() {
+        let dir = media_dir();
+        let path = media_file(&dir, "a.pdf");
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            id: Some(123),
+            files: Some(
+                (0..11)
+                    .map(|_| SendFile {
+                        path: path.clone(),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let err = handle(&client, req).await.unwrap_err().to_string();
+        assert!(err.contains("at most 10"), "{err}");
+        assert!(client.media_sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_refuses_a_missing_file_and_sends_nothing() {
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            id: Some(123),
+            files: Some(vec![SendFile {
+                path: "/nonexistent/report.pdf".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let err = handle(&client, req).await.unwrap_err().to_string();
+        assert!(err.contains("unreadable"), "{err}");
+        assert!(client.media_sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_refuses_a_relative_path_and_sends_nothing() {
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            id: Some(123),
+            files: Some(vec![SendFile {
+                path: "report.pdf".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let err = handle(&client, req).await.unwrap_err().to_string();
+        assert!(err.contains("is not absolute"), "{err}");
+        assert!(client.media_sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_refuses_an_empty_files_array() {
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            id: Some(123),
+            files: Some(vec![]),
+            ..Default::default()
+        };
+        let err = handle(&client, req).await.unwrap_err().to_string();
+        assert!(err.contains("present but empty"), "{err}");
+        // Not re-read as a text send: the caller described a message it did not
+        // get, and a silent reinterpretation is what hides that.
+        assert!(client.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_validates_files_before_resolving_target() {
+        // The `files` half of `handle_validates_parse_mode_before_resolving_target`:
+        // a malformed attachment set with no recipient must report the files,
+        // not the missing recipient — no TDLib lookup is spent on a request
+        // already known to be bad.
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            files: Some(vec![SendFile {
+                path: "relative.pdf".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let err = handle(&client, req).await.unwrap_err().to_string();
+        assert!(err.contains("is not absolute"), "{err}");
+        assert!(!err.contains("one of"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handle_validates_files_before_contact_lookup() {
+        // Same invariant through the resolution path: no contact search is
+        // issued for a request whose attachments are already known to be bad.
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            name: Some("Unknown".to_string()),
+            files: Some(vec![SendFile {
+                path: "/nonexistent/a.pdf".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let err = handle(&client, req).await.unwrap_err();
+        assert!(matches!(err, TgError::Other(ref m) if m.contains("unreadable")));
+        assert!(!matches!(err, TgError::ContactNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn handle_validates_parse_mode_before_files() {
+        // Both are caller bugs and both are cheap, but the parse mode is
+        // reported first so the existing probe contract is unchanged by the
+        // arrival of `files`.
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            parse_mode: Some("markdown".to_string()),
+            files: Some(vec![SendFile {
+                path: "relative.pdf".to_string(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let err = handle(&client, req).await.unwrap_err().to_string();
+        assert!(err.contains("invalid parse_mode"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn media_send_resolves_the_recipient_the_same_way_text_does() {
+        // One ladder for both paths: an `@username` must resolve by username on
+        // a media send too, not by display name.
+        let dir = media_dir();
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            to: Some("@johndoe".to_string()),
+            files: Some(vec![SendFile {
+                path: media_file(&dir, "a.pdf"),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let res = handle(&client, req).await.unwrap();
+        assert_eq!(res.chat_id, 1);
+        assert_eq!(client.media_sent.lock().unwrap()[0].0, 1);
+    }
+
+    #[tokio::test]
+    async fn a_retry_of_the_one_remaining_file_is_a_single_file_send() {
+        // The caller's half of a partial-delivery retry: it resends only the
+        // elements that never arrived, which is commonly ONE file. Nothing here
+        // special-cases that — the request is an ordinary one-entry `files`
+        // array — and it must not become a one-element album, which TDLib
+        // refuses (see `client::tests::a_single_file_is_not_an_album` for the
+        // branch that keeps it off `sendMessageAlbum`).
+        let dir = media_dir();
+        let remaining = media_file(&dir, "chart.png");
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "the one that didn't arrive".to_string(),
+            id: Some(123),
+            files: Some(vec![SendFile {
+                path: remaining.clone(),
+                kind: Some("photo".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let res = handle(&client, req).await.unwrap();
+
+        let media = client.media_sent.lock().unwrap();
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].3.len(), 1, "one file is one element");
+        assert_eq!(media[0].3[0].path.to_string_lossy(), remaining);
+        assert!(client.sent.lock().unwrap().is_empty());
+
+        // The record is indexed within THIS request, not within the original
+        // send: the caller re-reads its own `files` order either way.
+        let elements = res.elements.expect("a media send reports its elements");
+        assert_eq!(elements.delivered.len(), 1);
+        assert_eq!(elements.delivered[0].index, 0);
+        assert_eq!(res.message_id, elements.delivered[0].message_id);
+    }
+
+    #[tokio::test]
+    async fn a_text_send_reports_no_per_element_data() {
+        // The text path is untouched by the media record: there is no element
+        // to report on, and a caller reading `elements` as "this was a media
+        // send" must not find one here.
+        let client = MockClient::default();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            id: Some(123),
+            ..Default::default()
+        };
+        let res = handle(&client, req).await.unwrap();
+        assert!(res.elements.is_none());
+        assert_eq!(
+            serde_json::to_value(&res).unwrap(),
+            json!({"message_id": 12345, "chat_id": 123})
+        );
     }
 
     #[test]

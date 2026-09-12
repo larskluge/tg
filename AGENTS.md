@@ -111,6 +111,7 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 - `credentials.rs` - API credential loading/saving (`TG_API_ID`/`TG_API_HASH` and `credentials.json`)
 - `error.rs` - Custom error types using thiserror; use `TgError` variants and `Result<T>` alias
 - `client.rs` - TDLib client wrapper with `TelegramClient` trait for mocking
+- `media.rs` - `send`'s attachments: the `SendFile` wire mirror, the validated `MediaFile`, and the one validator both go through
 - `output.rs` - Dual output formatting (plain text default, JSON with `--json`)
 - `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers)
 
@@ -209,15 +210,86 @@ Set log verbosity with the synchronous `set_tdlib_log_verbosity` **before** `cre
 The async `setLogVerbosityLevel` only takes effect once TDLib is already up, so it cannot
 suppress the startup banner, which otherwise floods CI logs.
 
-**Serve request strictness:** `SendRequest` is the only serve request struct carrying
-`#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs
+**Serve request strictness:** `SendRequest` and its nested `media::SendFile` are the only serve
+request structs carrying `#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs
 the container's `HealthCmd` (`tg whoami`, `HealthStartupTimeout=2m`), so tightening it risks
 the health gate for no benefit, and the remaining structs have caller sets that were never
 audited. `dispatch_other_commands_still_ignore_unknown_args` pins the decision so a later
 blanket change has to be deliberate.
 
+**Attachments (`args.files`, since 0.5.0):** 1-10 local files sent as ONE message, `args.message`
+being the caption. Validated in `send::handle` BEFORE the recipient ladder — same ordering and
+reason as `parse_mode`, plus one of its own: TDLib uploads a file *after* the send returns, so a
+path it cannot read would otherwise surface as a failed send on a message the caller was already
+told about. Three facts worth not re-deriving:
+
+- **No TDLib `Input*` type carries a filename or a MIME type.** The recipient sees the local
+  path's BASENAME, so the caller must materialise each file under the name it should arrive as;
+  `tg` renames nothing and cannot. `disable_content_type_detection: true` on documents is what
+  stops Telegram re-reading a `kind: file` and showing it as a photo — the caller's `kind` decides
+  how the message looks, so it must not be re-derived from the bytes.
+- **TDLib groups only same-typed contents into an album**, so a request mixing `photo` and `file`
+  is refused rather than split into two messages. One socket request is one Telegram message,
+  which is what makes a caller's retry safe.
+- **The media path's confirmation semantics are NOT the text path's**, and that is the point.
+  `sendMessage` with a local file returns a *pending* message id and uploads afterwards; the text
+  path's "timeout returns Ok with the temporary local id" would report a delivery that may never
+  happen, and a caller that records that id has already filed the send as done. So
+  `send_media_message` waits (`MEDIA_SEND_TIMEOUT_SECS` = 300 — it bounds an upload, not a round
+  trip) for `MessageSendSucceeded` on EVERY element, and an expired deadline is an ERROR, never an
+  Ok carrying a temporary id. `await_send_confirmations` is the seam that holds this, and it treats
+  a `broadcast` `Lagged` as "keep waiting": the text send loop conflates `Lagged` with a closed
+  channel, which would fail a send whose confirmation is still in the buffer — do not copy that
+  loop into a new path. The text path's own semantics are deliberately unchanged; other callers
+  depend on them.
+
+**A partial album is REPORTABLE, not an error (since 0.6.0):** `send_message_album` queues N
+INDEPENDENT TDLib messages, each confirmed by its own `updateMessageSendSucceeded` /
+`updateMessageSendFailed`, so "the send failed" is not a fact about *the message*. Elements already
+confirmed are in the recipient's chat and nothing takes them back. Collapsing that to a flat
+`ok:false` is what made the caller record the whole card failed and its retry resend EVERY element
+— the recipient got the delivered photos twice, which is the at-most-once guarantee broken by the
+one path where it cannot be repaired. Four facts hold the fix together:
+
+- **`await_send_confirmations` no longer returns on the first `MessageSendFailed`.** The other
+  elements are still uploading and that update says nothing about them, so the loop keeps waiting
+  until every element is resolved or the deadline expires, then reports the whole picture. Pinned
+  by `media_wait_keeps_waiting_after_the_first_failure` — reintroducing the early return fails five
+  tests.
+- **Three per-element states, not two**, because the actions they call for are opposite:
+  `delivered` (`{index, message_id}`) must NEVER be resent, `failed` (`{index, error}`) is the only
+  class safe to resend, and `unconfirmed` (bare indices — deadline expired or channel closed) is
+  neither: TDLib is still uploading, so a blind retry there is a possible duplicate rather than a
+  repair. `summarise` projects the loop's `ElementState`s into `MediaElements`, the three lists are
+  disjoint, and together they cover every element of the request — which is what makes "not in
+  `delivered`" a complete answer to what still has to be sent (`assert_covers`).
+- **A failure carries the record, and the prose leads with it.** `TgError::PartialSend` is the one
+  error in the enum with structured data on it, and `serve::dispatch` (via `error_response`) answers
+  it as `{"ok": false, "error": ..., "result": <partial>}` — the protocol's one failure with a
+  `result`. `ok` keeps its meaning, so no caller is told a failure succeeded; what it gains is
+  learning which elements arrived instead of assuming none did. The human half of the same fact is
+  the message text, which says `ALREADY DELIVERED, do not resend: files[0] ('a.jpg') as message 900`
+  BEFORE it says what failed — both come from the one `states` slice, so they cannot disagree. Every
+  path that has already handed an element to TDLib fails this way, including the two album
+  half-acceptances (`partly_queued_states`: what TDLib queued is `unconfirmed`, what it refused is
+  `failed`). A failure that reached Telegram with NOTHING queued stays a bare `ok:false`, so the
+  presence of `result` keeps meaning "this is what it nonetheless did".
+- **The result field is additive and absent for a text send.** `serve_client::send_request`
+  deserialises `SendResult` with a bare `serde_json::from_value`, so `elements` is
+  `Option` + `skip_serializing_if`: a text send's JSON stays exactly `{message_id, chat_id}`
+  (`a_text_send_result_carries_no_per_element_data`) and an old daemon's answer still parses. The
+  failure payload is a separate `PartialSendResult` with no `message_id` at all — there is no single
+  id for a send that did not complete, and inventing one is the laundered success this path exists
+  to avoid.
+
+**One file is not a one-element album.** TDLib's `sendMessageAlbum` carries 2-10 contents and
+refuses one, so `is_album(count) = count > 1` picks the plain `sendMessage` — which is also what
+makes a caller's retry of a single remaining element work with no special case at either end
+(`a_single_file_is_not_an_album`, `a_retry_of_the_one_remaining_file_is_a_single_file_send`).
+
 An explicit `"parse_mode": null` is accepted and means plain text, exactly like an absent
-key. That asymmetry with `""` (refused) is deliberate: `null` is what an unset optional
+key. `"files": null` is accepted the same way and for the same reason. That asymmetry with `""`
+(refused) is deliberate: `null` is what an unset optional
 serialises to in Go (`map[string]any` with a missing key, or a `*string` without
 `omitempty`), in Python (`json.dumps`) and in `tg`'s own CLI proxy, so refusing it would
 turn every plain-text send from those callers into a hard error while closing nothing — a

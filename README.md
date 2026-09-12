@@ -228,17 +228,151 @@ Request: `{"id": "<opaque>", "cmd": "<command>", "args": { ... }}`
 Response (success): `{"id": "<echoed>", "ok": true, "result": <value>}`
 Response (failure): `{"id": "<echoed>", "ok": false, "error": "<message>"}`
 
+One failure carries both: a media `send` that delivered some elements and then
+could not finish answers `ok: false` with the error **and** a `result` holding the
+per-element record — see [`send` with attachments](#send-with-attachments). `ok`
+keeps its meaning (the request did not do what was asked), so a caller that reads
+only `ok` is never told a failure succeeded; what it gains is being able to learn
+which elements arrived instead of assuming none did. Every other failure has no
+`result`.
+
 `cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `send`, `download`, `mark_read`, `mark_unread`, `sync`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today.
 
 `send` rejects unknown `args` keys rather than ignoring them:
 
 ```json
-{"id": "1", "ok": false, "error": "invalid args: unknown field `x`, expected one of `message`, `name`, `id`, `to`, `group`, `parse_mode`"}
+{"id": "1", "ok": false, "error": "invalid args: unknown field `x`, expected one of `message`, `name`, `id`, `to`, `group`, `parse_mode`, `files`"}
 ```
 
 The other commands still ignore unknown keys. For a recipient or identity field, a silent drop
 means a message delivered to the wrong place with `ok: true`, which is worse than a refusal the
 caller can retry.
+
+#### `send` with attachments
+
+`args.files` sends 1-10 local files as **one** Telegram message, with `args.message` as the
+caption. Omit the key entirely (or pass `null`) for a text-only send — that path is byte-identical
+to the pre-`files` contract, so a caller that never attaches anything needs no change.
+
+```json
+{"id": "1", "cmd": "send", "args": {
+  "to": "@someone",
+  "message": "Q3 numbers attached",
+  "parse_mode": "HTML",
+  "files": [
+    {"path": "/outbox/42/0/Q3 report.pdf", "kind": "file"},
+    {"path": "/outbox/42/1/chart.png", "kind": "photo", "width": 1024, "height": 768}
+  ]
+}}
+```
+
+Per entry:
+
+| field | meaning |
+|---|---|
+| `path` | **required**, absolute, must exist and be readable *by the daemon* |
+| `kind` | `"photo"` or `"file"`; absent means `"file"` |
+| `width`/`height` | photo pixel dimensions; `0` or absent lets Telegram work them out. Only read for `"photo"` |
+
+`files[]` is as closed as `send` itself — an unknown key is refused:
+
+```json
+{"id": "1", "ok": false, "error": "invalid args: unknown field `mime`, expected one of `path`, `kind`, `width`, `height`"}
+```
+
+**The recipient sees the path's basename.** No TDLib input type carries a filename or a MIME
+type, so the *only* way to control the delivered name is the name on disk; `tg` renames nothing.
+Materialise each file under the name it should arrive as (a per-file directory is the simplest way
+to keep two files with the same basename apart, as in the example above).
+
+Refused in-band, with nothing sent, before any Telegram lookup:
+
+- `files` present but empty (omit the key instead)
+- more than 10 entries (`a Telegram album carries at most 10`)
+- an unknown `kind`
+- `"photo"` and `"file"` mixed in one request — TDLib groups only same-typed contents, so there is
+  no single message to send; split it into two
+- a relative path, a missing file, a directory, or a file the daemon cannot open
+- a `width`/`height` on a `"file"` entry, or a negative dimension
+
+**Confirmation differs from a text send, deliberately.** A local file is uploaded *after* the send
+call returns, so `send` with `files` waits up to **300s** for Telegram to confirm every element and
+answers `ok: false` if it does not — it never returns a temporary message id as a success. A text
+send's 10s behaviour is unchanged (it still answers `ok: true` with the local id on timeout). On
+success, `result.message_id` is the real id of the first element, the one carrying the caption.
+
+##### Per-element outcomes (since 0.6.0)
+
+**An album is N independent Telegram messages**, each confirmed separately, so "the send failed"
+is not a fact about the message: elements Telegram already confirmed are in the recipient's chat
+and nothing takes them back. A media `send` therefore reports what happened **per element**, on
+success and on failure alike, under `result.elements`:
+
+| list | meaning | what to do |
+|---|---|---|
+| `delivered` | `[{"index": N, "message_id": M}]`, ascending by index — Telegram confirmed these | record them; **never resend** |
+| `failed` | `[{"index": N, "error": "..."}]` — Telegram reported these as failed | nothing was delivered, so these and only these are safe to resend |
+| `unconfirmed` | `[N, ...]` — bare indices whose outcome never arrived | TDLib may still be uploading; **do not resend blindly**, check the chat |
+
+`index` is the element's position in the request's `files` array. The three lists are disjoint and
+together cover every element of the request, so "not in `delivered`" is a complete answer to what
+still has to be sent. An empty list is omitted rather than sent as `[]`.
+
+Full success — every element confirmed:
+
+```json
+{"id": "1", "ok": true, "result": {
+  "message_id": 900,
+  "chat_id": 42,
+  "elements": {"delivered": [{"index": 0, "message_id": 900}, {"index": 1, "message_id": 901}]}
+}}
+```
+
+Partial delivery — `ok: false`, with the record of what arrived:
+
+```json
+{"id": "1", "ok": false,
+ "error": "send: 1 of 2 file(s) were not delivered; ALREADY DELIVERED, do not resend: files[0] ('a.jpg') as message 900; not delivered, safe to resend: files[1] ('b.jpg'): PHOTO_INVALID_DIMENSIONS",
+ "result": {
+   "chat_id": 42,
+   "elements": {
+     "delivered": [{"index": 0, "message_id": 900}],
+     "failed": [{"index": 1, "error": "PHOTO_INVALID_DIMENSIONS"}]
+   }
+ }}
+```
+
+The failure `result` has **no `message_id`**: there is no single id for a send that did not
+complete, and inventing one would report a delivery Telegram never confirmed. Read
+`result.elements`.
+
+An expired 300s deadline produces the same shape with `unconfirmed` in place of `failed` — the
+elements Telegram confirmed are still reported, and the rest are still uploading rather than
+known-lost:
+
+```json
+{"id": "1", "ok": false,
+ "error": "send: 1 of 2 file(s) were still uploading after 300s; ALREADY DELIVERED, do not resend: files[0] ('a.jpg') as message 900; still unconfirmed and may yet be delivered — check the chat before resending: files[1] ('b.jpg')",
+ "result": {
+   "chat_id": 42,
+   "elements": {"delivered": [{"index": 0, "message_id": 900}], "unconfirmed": [1]}
+ }}
+```
+
+**What a caller must branch on:** `ok` first (the request did not do what was asked), then
+`result.elements.delivered` for the indices already in the chat — present on a failure too. A
+retry sends a fresh `send` with only the elements left over; a one-element `files` array is an
+ordinary single-file send, so resending one remaining file needs nothing special.
+
+A failure carries no `result` at all when nothing reached Telegram — a refused request (every
+bullet above), an unknown recipient, or a `sendMessageAlbum` that errored outright. In that case
+nothing was delivered and nothing is queued.
+
+A text send's result is unchanged and carries no `elements` key, so its presence also tells a
+caller "this was a media send".
+
+A daemon that predates attachments refuses the key loudly — "unknown field \`files\`" — and
+delivers nothing, so no capability probe is needed.
 
 ### One-shot bulk sync
 

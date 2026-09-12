@@ -9,9 +9,11 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::credentials::tg_data_dir;
 use crate::error::{Result, TgError};
+use crate::media::{MediaFile, MediaKind};
 use crate::output::{
-    ChatInfo, ContactInfo, DownloadReport, DownloadStatus, DownloadedFileResult,
-    MessageContentDetails, MessageFileRef, MessageInfo, SendResult,
+    ChatInfo, ContactInfo, DeliveredElement, DownloadReport, DownloadStatus, DownloadedFileResult,
+    FailedElement, MediaElements, MessageContentDetails, MessageFileRef, MessageInfo,
+    PartialSendResult, SendResult,
 };
 use crate::parse_mode::ParseMode;
 
@@ -90,6 +92,22 @@ pub trait TelegramClient: Send + Sync {
         parse_mode: Option<ParseMode>,
     ) -> Result<SendResult>;
 
+    /// Send 1-10 already-validated local files as one Telegram message, with
+    /// `caption` as the message's caption.
+    ///
+    /// Deliberately not folded into [`TelegramClient::send_message`]: a media
+    /// send returns a *pending* message and uploads afterwards, so its
+    /// confirmation semantics differ (see the implementation), and the text
+    /// path's behaviour must stay byte-identical for the callers that rely on
+    /// it.
+    async fn send_media_message(
+        &self,
+        chat_id: i64,
+        caption: &str,
+        parse_mode: Option<ParseMode>,
+        files: &[MediaFile],
+    ) -> Result<SendResult>;
+
     async fn get_messages(
         &self,
         chat_id: i64,
@@ -142,6 +160,329 @@ pub struct TdLibClient {
 
 /// Maximum seconds to wait for TDLib to finish syncing updates from the server.
 const SYNC_TIMEOUT_SECS: u64 = 5;
+
+/// Maximum seconds to wait for Telegram to confirm a media send. A file is
+/// uploaded *after* the send call returns, so this bounds an upload over the
+/// caller's link, not a round trip — hence 5 minutes rather than the text
+/// path's 10 seconds. Expiry is an error: see `send_media_message`.
+const MEDIA_SEND_TIMEOUT_SECS: u64 = 300;
+
+/// Whether `count` elements go out as an album.
+///
+/// TDLib's `sendMessageAlbum` carries 2-10 contents and REFUSES a one-element
+/// album, so a single file is a plain `sendMessage`. This is also what makes a
+/// caller's retry of one remaining file work: a subset of one is not a
+/// degenerate album, it is the single-file path.
+fn is_album(count: usize) -> bool {
+    count > 1
+}
+
+/// How far one queued element has got, as far as Telegram has told us.
+///
+/// Three states, not two, because the actions they call for are opposite:
+/// `Delivered` must never be resent, `Failed` is the only class safe to resend,
+/// and `Pending` at the end of the wait is neither — TDLib is still uploading,
+/// so resending it risks the duplicate and not resending it risks nothing but a
+/// human having to look.
+#[derive(Debug, Clone, PartialEq)]
+enum ElementState {
+    Pending,
+    Delivered(i64),
+    Failed(String),
+}
+
+/// Project the per-element states into the wire record, ascending by index.
+fn summarise(states: &[ElementState]) -> MediaElements {
+    let mut elements = MediaElements::default();
+    for (index, state) in states.iter().enumerate() {
+        match state {
+            ElementState::Delivered(message_id) => elements.delivered.push(DeliveredElement {
+                index,
+                message_id: *message_id,
+            }),
+            ElementState::Failed(error) => elements.failed.push(FailedElement {
+                index,
+                error: error.clone(),
+            }),
+            ElementState::Pending => elements.unconfirmed.push(index),
+        }
+    }
+    elements
+}
+
+/// How an element is named to a human: `files[1] ('chart.png')`.
+fn element_label(index: usize, names: &[String]) -> String {
+    format!(
+        "files[{index}] ('{}')",
+        names.get(index).map(String::as_str).unwrap_or_default()
+    )
+}
+
+/// The ONE error a media send that did not deliver everything fails with.
+///
+/// `head` says what went wrong; everything after it says what that means for
+/// the recipient's chat, and the delivered clause comes first for a reason: an
+/// album is N independent messages, so a caller that reads a failure as
+/// "nothing arrived" resends the lot and the recipient keeps the delivered
+/// files twice — which no later report can undo. The prose is the half a human
+/// reads; `TgError::PartialSend`'s payload is the same facts in the form a
+/// caller acts on, and both come from the one `states` slice so they cannot
+/// disagree.
+fn incomplete_send_error(
+    head: String,
+    states: &[ElementState],
+    names: &[String],
+    chat_id: i64,
+) -> TgError {
+    let elements = summarise(states);
+    let mut parts = vec![head];
+
+    let clause = |label: &str, which: Vec<String>| format!("{label}: {}", which.join(", "));
+
+    if !elements.delivered.is_empty() {
+        let which = elements
+            .delivered
+            .iter()
+            .map(|d| {
+                format!(
+                    "{} as message {}",
+                    element_label(d.index, names),
+                    d.message_id
+                )
+            })
+            .collect();
+        parts.push(clause("ALREADY DELIVERED, do not resend", which));
+    }
+    if !elements.failed.is_empty() {
+        let which = elements
+            .failed
+            .iter()
+            .map(|f| format!("{}: {}", element_label(f.index, names), f.error))
+            .collect();
+        parts.push(clause("not delivered, safe to resend", which));
+    }
+    if !elements.unconfirmed.is_empty() {
+        let which = elements
+            .unconfirmed
+            .iter()
+            .map(|i| element_label(*i, names))
+            .collect();
+        parts.push(clause(
+            "still unconfirmed and may yet be delivered — check the chat before resending",
+            which,
+        ));
+    }
+
+    TgError::PartialSend {
+        message: parts.join("; "),
+        partial: Box::new(PartialSendResult { chat_id, elements }),
+    }
+}
+
+/// The head of the message for an expired media-send deadline.
+fn media_timeout_head(outstanding: usize, total: usize) -> String {
+    format!(
+        "send: {outstanding} of {total} file(s) were still uploading after {MEDIA_SEND_TIMEOUT_SECS}s"
+    )
+}
+
+/// The per-element states of an album TDLib only partly accepted: the first
+/// `queued` elements are uploading with nothing confirmed either way, and the
+/// rest carry `reason`, having never been queued at all.
+fn partly_queued_states(queued: usize, total: usize, reason: &str) -> Vec<ElementState> {
+    (0..total)
+        .map(|i| {
+            if i < queued {
+                ElementState::Pending
+            } else {
+                ElementState::Failed(reason.to_string())
+            }
+        })
+        .collect()
+}
+
+/// What a TDLib update says about one queued message.
+///
+/// Extracted from the update so the wait loop below can be exercised without
+/// TDLib: `types::Message` has no constructor a test can reasonably build, and
+/// the part worth testing is the loop's bookkeeping, not the field access.
+#[derive(Debug, Clone, PartialEq)]
+enum SendOutcome {
+    Succeeded {
+        old_message_id: i64,
+        message_id: i64,
+        chat_id: i64,
+    },
+    Failed {
+        old_message_id: i64,
+        error: String,
+    },
+}
+
+/// Read a send confirmation out of a TDLib update, or `None` for the updates
+/// that say nothing about a send.
+fn send_outcome(update: tdlib_rs::enums::Update) -> Option<SendOutcome> {
+    use tdlib_rs::enums::Update;
+    match update {
+        Update::MessageSendSucceeded(u) => Some(SendOutcome::Succeeded {
+            old_message_id: u.old_message_id,
+            message_id: u.message.id,
+            chat_id: u.message.chat_id,
+        }),
+        Update::MessageSendFailed(u) => Some(SendOutcome::Failed {
+            old_message_id: u.old_message_id,
+            error: u.error.message,
+        }),
+        _ => None,
+    }
+}
+
+/// Wait until Telegram has resolved EVERY queued element, then report the whole
+/// picture: the first element's real id on a clean send, or an error that still
+/// names what was delivered.
+///
+/// This is the media send's whole contract with its caller, and it differs from
+/// the text path on purpose. A local file is uploaded *after* `sendMessage`
+/// returns, so the pending message id the call hands back means only "TDLib
+/// accepted the job". Returning Ok with that id on a timeout — what the text
+/// path does — reports a delivery that may never happen, and a caller that
+/// records the id has already filed the send as done. So an Ok here means every
+/// element confirmed, never a temporary id.
+///
+/// **A failure does not return early.** An album is N independent messages with
+/// N independent confirmations: the first `MessageSendFailed` says nothing about
+/// the elements still uploading, and abandoning the wait there reported a flat
+/// failure for a send whose other elements then arrived — so the caller's retry
+/// delivered them a second time. The loop therefore keeps waiting until every
+/// element is resolved or the deadline expires, and reports all three classes
+/// (see [`incomplete_send_error`]).
+///
+/// `names` is parallel to `pending` and only supplies the filename the prose
+/// names.
+async fn await_send_confirmations<T: Clone>(
+    receiver: &mut broadcast::Receiver<T>,
+    classify: impl Fn(T) -> Option<SendOutcome>,
+    pending: &[i64],
+    names: &[String],
+    chat_id: i64,
+    timeout: tokio::time::Duration,
+) -> Result<SendResult> {
+    let total = pending.len();
+    let mut states = vec![ElementState::Pending; total];
+    let mut outstanding = total;
+    let mut result_chat_id = chat_id;
+    // Which element's confirmation `result_chat_id` came from. An album's
+    // elements share a chat, but the lowest index wins so that a partial whose
+    // first element failed still reports the chat Telegram named.
+    let mut chat_id_from: Option<usize> = None;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    // Both ways the deadline can expire — checked at the top of the loop, and
+    // reported by `tokio::time::timeout` — report the same thing.
+    let timed_out = |states: &[ElementState], outstanding: usize, chat: i64| {
+        incomplete_send_error(media_timeout_head(outstanding, total), states, names, chat)
+    };
+
+    while outstanding > 0 {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(timed_out(&states, outstanding, result_chat_id));
+        }
+
+        let received = match tokio::time::timeout(remaining, receiver.recv()).await {
+            Ok(Ok(update)) => update,
+            // Updates were dropped because this receiver fell behind; the
+            // confirmations being waited on may still be ahead of us. Treating
+            // a lag as a closed channel would fail a send about to succeed.
+            Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => {
+                let delivered = states
+                    .iter()
+                    .filter(|s| matches!(s, ElementState::Delivered(_)))
+                    .count();
+                return Err(incomplete_send_error(
+                    format!(
+                        "send: update channel closed after {delivered} of {total} file(s) were confirmed ({e})"
+                    ),
+                    &states,
+                    names,
+                    result_chat_id,
+                ));
+            }
+            Err(_) => return Err(timed_out(&states, outstanding, result_chat_id)),
+        };
+
+        let Some(outcome) = classify(received) else {
+            continue;
+        };
+
+        // TDLib announces one terminal outcome per message but is free to
+        // re-announce it, so the first resolution of an element wins: counting
+        // one twice would underflow `outstanding` and end the wait with
+        // elements still in flight.
+        let (index, state) = match outcome {
+            SendOutcome::Succeeded {
+                old_message_id,
+                message_id,
+                chat_id,
+            } => {
+                let Some(i) = pending.iter().position(|id| *id == old_message_id) else {
+                    continue;
+                };
+                if chat_id_from.is_none_or(|seen| i < seen) {
+                    result_chat_id = chat_id;
+                    chat_id_from = Some(i);
+                }
+                (i, ElementState::Delivered(message_id))
+            }
+            SendOutcome::Failed {
+                old_message_id,
+                error,
+            } => {
+                let Some(i) = pending.iter().position(|id| *id == old_message_id) else {
+                    continue;
+                };
+                (i, ElementState::Failed(error))
+            }
+        };
+
+        if states[index] == ElementState::Pending {
+            states[index] = state;
+            outstanding -= 1;
+        }
+    }
+
+    if states
+        .iter()
+        .any(|s| matches!(s, ElementState::Failed(_) | ElementState::Pending))
+    {
+        let failed = states
+            .iter()
+            .filter(|s| matches!(s, ElementState::Failed(_)))
+            .count();
+        return Err(incomplete_send_error(
+            format!("send: {failed} of {total} file(s) were not delivered"),
+            &states,
+            names,
+            result_chat_id,
+        ));
+    }
+
+    // The album's first message is the one carrying the caption, so its id is
+    // the one a caller records for the send as a whole.
+    let Some(ElementState::Delivered(message_id)) = states.first().cloned() else {
+        return Err(TgError::Other(
+            "send: nothing to confirm; a media send carries at least one file".to_string(),
+        ));
+    };
+
+    Ok(SendResult {
+        message_id,
+        chat_id: result_chat_id,
+        elements: Some(summarise(&states)),
+    })
+}
 
 /// Wait for TDLib's connection to reach `ConnectionState::Ready`, indicating
 /// that the server sync (downloading updates received while offline) is complete.
@@ -670,7 +1011,29 @@ async fn build_text_content(
     client_id: i32,
 ) -> Result<tdlib_rs::enums::InputMessageContent> {
     use tdlib_rs::enums::InputMessageContent;
-    use tdlib_rs::types::{FormattedText, InputMessageText};
+    use tdlib_rs::types::InputMessageText;
+
+    let formatted = build_formatted_body(text, parse_mode, client_id).await?;
+
+    Ok(InputMessageContent::InputMessageText(InputMessageText {
+        text: formatted,
+        link_preview_options: None,
+        clear_draft: true,
+    }))
+}
+
+/// Parse a body under `parse_mode` into TDLib's `FormattedText`.
+///
+/// Shared by the text send and the media caption deliberately: markup a human
+/// approved must behave identically whether it ends up as a message body or as
+/// a photo caption, and a second copy of these rules is exactly how the two
+/// come to disagree.
+async fn build_formatted_body(
+    text: &str,
+    parse_mode: Option<ParseMode>,
+    client_id: i32,
+) -> Result<tdlib_rs::types::FormattedText> {
+    use tdlib_rs::types::FormattedText;
 
     let formatted = match parse_mode {
         None => FormattedText {
@@ -714,11 +1077,68 @@ async fn build_text_content(
         }
     };
 
-    Ok(InputMessageContent::InputMessageText(InputMessageText {
-        text: formatted,
-        link_preview_options: None,
-        clear_draft: true,
-    }))
+    Ok(formatted)
+}
+
+/// Build the TDLib contents for a media send: one `InputMessage*` per file, in
+/// the caller's order.
+///
+/// The caption rides on the FIRST content only — Telegram shows one caption per
+/// album, and repeating it would either be shown once anyway or, worse, be
+/// shown per element depending on the client. `show_caption_above_media` is
+/// `false` on every photo because TDLib requires the flag to agree across an
+/// album, so it is fixed here rather than exposed.
+///
+/// `disable_content_type_detection: true` on documents is what makes the
+/// caller's `kind` authoritative: without it Telegram may re-read a `.jpg` sent
+/// as a file and present it as a photo, changing a payload a human already
+/// approved.
+async fn build_media_contents(
+    caption: &str,
+    parse_mode: Option<ParseMode>,
+    files: &[MediaFile],
+    client_id: i32,
+) -> Result<Vec<tdlib_rs::enums::InputMessageContent>> {
+    use tdlib_rs::enums::{InputFile, InputMessageContent};
+    use tdlib_rs::types::{InputFileLocal, InputMessageDocument, InputMessagePhoto};
+
+    let caption = if caption.trim().is_empty() {
+        None
+    } else {
+        Some(build_formatted_body(caption, parse_mode, client_id).await?)
+    };
+
+    Ok(files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| {
+            let caption = if i == 0 { caption.clone() } else { None };
+            let input = InputFile::Local(InputFileLocal {
+                path: file.path.to_string_lossy().into_owned(),
+            });
+            match file.kind {
+                MediaKind::Photo => InputMessageContent::InputMessagePhoto(InputMessagePhoto {
+                    photo: input,
+                    thumbnail: None,
+                    added_sticker_file_ids: vec![],
+                    width: file.width,
+                    height: file.height,
+                    caption,
+                    show_caption_above_media: false,
+                    self_destruct_type: None,
+                    has_spoiler: false,
+                }),
+                MediaKind::File => {
+                    InputMessageContent::InputMessageDocument(InputMessageDocument {
+                        document: input,
+                        thumbnail: None,
+                        disable_content_type_detection: true,
+                        caption,
+                    })
+                }
+            }
+        })
+        .collect())
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -2341,20 +2761,17 @@ impl TelegramClient for TdLibClient {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 // Timeout - message might still be sending, return local ID
-                return Ok(SendResult {
-                    message_id: local_message_id,
-                    chat_id: message.chat_id,
-                });
+                return Ok(SendResult::single(local_message_id, message.chat_id));
             }
 
             match tokio::time::timeout(remaining, receiver.recv()).await {
                 Ok(Ok(update)) => match update {
                     Update::MessageSendSucceeded(msg_update) => {
                         if msg_update.old_message_id == local_message_id {
-                            return Ok(SendResult {
-                                message_id: msg_update.message.id,
-                                chat_id: msg_update.message.chat_id,
-                            });
+                            return Ok(SendResult::single(
+                                msg_update.message.id,
+                                msg_update.message.chat_id,
+                            ));
                         }
                     }
                     Update::MessageSendFailed(msg_update) => {
@@ -2376,10 +2793,143 @@ impl TelegramClient for TdLibClient {
         }
 
         // Fallback - return local message ID
-        Ok(SendResult {
-            message_id: local_message_id,
-            chat_id: message.chat_id,
-        })
+        Ok(SendResult::single(local_message_id, message.chat_id))
+    }
+
+    /// Send local files as one message and report only what Telegram confirmed
+    /// — per element.
+    ///
+    /// This is where the media path deliberately parts company with the text
+    /// path above. `sendMessage` with a local file returns immediately with a
+    /// *pending* message and TDLib uploads the bytes afterwards, so the text
+    /// path's "timeout returns Ok with the temporary local id" would report a
+    /// success for a message that may never arrive — and a caller that records
+    /// that id has already filed the send as done. So here the confirmation is
+    /// mandatory: `MessageSendSucceeded` for every element or an error, and an
+    /// expired deadline is an error too, never a laundered Ok.
+    ///
+    /// An album is also N INDEPENDENT messages, which is why a failure here is
+    /// never bare: every path that has already handed an element to TDLib fails
+    /// with `TgError::PartialSend`, carrying which elements were delivered
+    /// (never resend those), which failed (only these are safe to resend) and
+    /// which are still unconfirmed (neither — check the chat). A flat failure
+    /// for a send that delivered three of four photos is what makes the
+    /// caller's retry deliver those three twice.
+    ///
+    /// The deadline is generous (`MEDIA_SEND_TIMEOUT_SECS`) because it is
+    /// bounding an upload, not a round trip.
+    async fn send_media_message(
+        &self,
+        chat_id: i64,
+        caption: &str,
+        parse_mode: Option<ParseMode>,
+        files: &[MediaFile],
+    ) -> Result<SendResult> {
+        // Belt and braces: `media::validate_files` is the gate, but this trait
+        // is public and TDLib's album limits are not recoverable mid-send.
+        if files.is_empty() {
+            return Err(TgError::Other(
+                "send: no files to send; use a text send instead".to_string(),
+            ));
+        }
+        if files.len() > crate::media::MAX_FILES {
+            return Err(TgError::Other(format!(
+                "send: {} files requested; a Telegram album carries at most {} — split the message",
+                files.len(),
+                crate::media::MAX_FILES
+            )));
+        }
+
+        let client_id = self.get_client_id().await?;
+
+        // Build the contents (and parse the caption's markup) before anything
+        // with a side effect, exactly as the text path does.
+        let contents = build_media_contents(caption, parse_mode, files, client_id).await?;
+
+        let _ = tdlib_rs::functions::create_private_chat(chat_id, true, client_id).await;
+
+        // Subscribe before sending, or a fast confirmation is missed.
+        let mut receiver = self.update_sender.subscribe();
+
+        let names: Vec<String> = files.iter().map(MediaFile::display_name).collect();
+
+        let pending: Vec<i64> = if is_album(contents.len()) {
+            let messages = unwrap_messages(
+                tdlib_rs::functions::send_message_album(
+                    chat_id, None, None, None, contents, client_id,
+                )
+                .await
+                .map_err(|e| TgError::TdLib(e.message))?,
+            );
+            let mut ids = Vec::with_capacity(files.len());
+            for (i, message) in messages.messages.iter().enumerate() {
+                let Some(message) = message else {
+                    // TDLib reports a per-element failure as a null message.
+                    // The earlier elements are already queued and uploading, so
+                    // the record must say so rather than implying the whole
+                    // album was refused.
+                    return Err(incomplete_send_error(
+                        format!(
+                            "send: TDLib did not accept {} into the album; {i} of {} element(s) were queued",
+                            element_label(i, &names),
+                            files.len()
+                        ),
+                        &partly_queued_states(
+                            i,
+                            files.len(),
+                            "TDLib did not accept this element into the album",
+                        ),
+                        &names,
+                        chat_id,
+                    ));
+                };
+                ids.push(message.id);
+            }
+            // A short list would mean waiting for fewer confirmations than
+            // there are files — i.e. reporting a delivery for an element
+            // nothing ever tracked.
+            if ids.len() != files.len() {
+                return Err(incomplete_send_error(
+                    format!(
+                        "send: TDLib queued {} of {} album element(s)",
+                        ids.len(),
+                        files.len()
+                    ),
+                    &partly_queued_states(
+                        ids.len().min(files.len()),
+                        files.len(),
+                        "TDLib never queued this element",
+                    ),
+                    &names,
+                    chat_id,
+                ));
+            }
+            ids
+        } else {
+            // One file is one plain `sendMessage`: TDLib refuses a one-element
+            // album, and this is also the shape a caller's retry of a single
+            // remaining file takes.
+            let content = contents
+                .into_iter()
+                .next()
+                .expect("send_media_message refuses an empty file set above");
+            let message = unwrap_message(
+                tdlib_rs::functions::send_message(chat_id, None, None, None, content, client_id)
+                    .await
+                    .map_err(|e| TgError::TdLib(e.message))?,
+            );
+            vec![message.id]
+        };
+
+        await_send_confirmations(
+            &mut receiver,
+            send_outcome,
+            &pending,
+            &names,
+            chat_id,
+            tokio::time::Duration::from_secs(MEDIA_SEND_TIMEOUT_SECS),
+        )
+        .await
     }
 
     async fn get_messages(
@@ -2859,7 +3409,14 @@ pub mod mock {
         pub get_boundary_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         /// Records every send as `(chat_id, text, parse_mode)`
         pub sent: std::sync::Mutex<Vec<(i64, String, Option<ParseMode>)>>,
+        /// Records every media send as `(chat_id, caption, parse_mode, files)`.
+        /// Separate from `sent` on purpose: a test that asserts a text send
+        /// happened must not pass because a media send did.
+        pub media_sent: std::sync::Mutex<Vec<MediaSendRecord>>,
     }
+
+    /// One recorded media send: `(chat_id, caption, parse_mode, files)`.
+    pub type MediaSendRecord = (i64, String, Option<ParseMode>, Vec<MediaFile>);
 
     impl MockClient {
         pub fn with_state(state: AuthState) -> Self {
@@ -2927,6 +3484,7 @@ pub mod mock {
                     0,
                 )),
                 sent: std::sync::Mutex::new(Vec::new()),
+                media_sent: std::sync::Mutex::new(Vec::new()),
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -3056,9 +3614,37 @@ pub mod mock {
                 .lock()
                 .unwrap()
                 .push((chat_id, text.to_string(), parse_mode));
-            Ok(SendResult {
-                message_id: 12345,
+            Ok(SendResult::single(12345, chat_id))
+        }
+
+        async fn send_media_message(
+            &self,
+            chat_id: i64,
+            caption: &str,
+            parse_mode: Option<ParseMode>,
+            files: &[MediaFile],
+        ) -> Result<SendResult> {
+            self.media_sent.lock().unwrap().push((
                 chat_id,
+                caption.to_string(),
+                parse_mode,
+                files.to_vec(),
+            ));
+            // One confirmed element per file, ids ascending from the album's
+            // first: the mock stands in for a clean send, which is the only
+            // outcome that has no per-element caveat.
+            Ok(SendResult {
+                message_id: 54321,
+                chat_id,
+                elements: Some(MediaElements {
+                    delivered: (0..files.len())
+                        .map(|index| DeliveredElement {
+                            index,
+                            message_id: 54321 + index as i64,
+                        })
+                        .collect(),
+                    ..Default::default()
+                }),
             })
         }
 
@@ -4170,6 +4756,448 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(result.unwrap().unwrap(), "failure");
+    }
+
+    fn succeeded(old: i64, new: i64, chat: i64) -> SendOutcome {
+        SendOutcome::Succeeded {
+            old_message_id: old,
+            message_id: new,
+            chat_id: chat,
+        }
+    }
+
+    fn names(count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("f{i}.pdf")).collect()
+    }
+
+    fn failed(old: i64, error: &str) -> SendOutcome {
+        SendOutcome::Failed {
+            old_message_id: old,
+            error: error.to_string(),
+        }
+    }
+
+    /// The per-element record a media failure must carry. A failure without one
+    /// is the defect itself: the caller reads `ok:false`, concludes nothing
+    /// arrived, and resends what is already in the recipient's chat.
+    fn partial_of(err: &TgError) -> PartialSendResult {
+        match err.partial_send() {
+            Some(partial) => partial.clone(),
+            None => panic!("a media failure must carry its per-element record: {err}"),
+        }
+    }
+
+    /// Every element of the request is accounted for exactly once, so "not in
+    /// `delivered`" is a complete answer to "what still has to be sent".
+    fn assert_covers(elements: &MediaElements, total: usize) {
+        let mut indices: Vec<usize> = elements
+            .delivered
+            .iter()
+            .map(|d| d.index)
+            .chain(elements.failed.iter().map(|f| f.index))
+            .chain(elements.unconfirmed.iter().copied())
+            .collect();
+        indices.sort_unstable();
+        assert_eq!(indices, (0..total).collect::<Vec<_>>());
+    }
+
+    /// Drive the media wait loop over a channel of pre-classified outcomes.
+    /// `classify` is `Some` here, so the test exercises the loop's bookkeeping
+    /// without needing a `types::Message` it cannot construct.
+    async fn await_outcomes(
+        outcomes: Vec<SendOutcome>,
+        capacity: usize,
+        pending: &[i64],
+        timeout_ms: u64,
+    ) -> Result<SendResult> {
+        let (sender, mut receiver) = broadcast::channel::<SendOutcome>(capacity);
+        for outcome in outcomes {
+            let _ = sender.send(outcome);
+        }
+        let names = names(pending.len());
+        await_send_confirmations(
+            &mut receiver,
+            Some,
+            pending,
+            &names,
+            7,
+            Duration::from_millis(timeout_ms),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn media_wait_returns_the_first_elements_real_id() {
+        // An album's caption is on its first element, so that is the id a
+        // caller records — and it must be the confirmed one, not the temporary.
+        // Confirmations arrive in reverse, because TDLib uploads in parallel
+        // and the record is indexed by the caller's `files` order, not arrival.
+        let res = await_outcomes(
+            vec![succeeded(-2, 901, 42), succeeded(-1, 900, 42)],
+            16,
+            &[-1, -2],
+            500,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.message_id, 900);
+        assert_eq!(res.chat_id, 42);
+
+        let elements = res.elements.expect("a media send reports its elements");
+        assert_eq!(
+            elements.delivered,
+            vec![
+                DeliveredElement {
+                    index: 0,
+                    message_id: 900
+                },
+                DeliveredElement {
+                    index: 1,
+                    message_id: 901
+                },
+            ]
+        );
+        assert!(elements.failed.is_empty());
+        assert!(elements.unconfirmed.is_empty());
+        assert_covers(&elements, 2);
+    }
+
+    #[tokio::test]
+    async fn media_wait_requires_every_element_to_be_confirmed() {
+        // One of two confirmed is not a sent album. The deadline expiring with
+        // an element outstanding is an ERROR — never an Ok with a temporary id,
+        // which is the whole difference from the text path.
+        //
+        // But the element that WAS confirmed is in the recipient's chat, and
+        // the failure has to say so: a caller that reads this as "nothing
+        // arrived" resends both files and the recipient keeps the first twice.
+        let err = await_outcomes(vec![succeeded(-1, 900, 42)], 16, &[-1, -2], 150)
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("1 of 2 file(s) were still uploading"),
+            "{text}"
+        );
+        assert!(text.contains("check the chat before resending"), "{text}");
+        assert!(text.contains("ALREADY DELIVERED"), "{text}");
+
+        let partial = partial_of(&err);
+        assert_eq!(partial.chat_id, 42);
+        assert_eq!(
+            partial.elements.delivered,
+            vec![DeliveredElement {
+                index: 0,
+                message_id: 900
+            }]
+        );
+        // The outstanding element is UNCONFIRMED, not failed: TDLib is still
+        // uploading it, so resending it is a possible duplicate and only a
+        // human looking at the chat can tell.
+        assert_eq!(partial.elements.unconfirmed, vec![1]);
+        assert!(partial.elements.failed.is_empty());
+        assert_covers(&partial.elements, 2);
+        // The property this exists for, stated as a caller would test it.
+        assert!(!partial.elements.delivered.is_empty());
+    }
+
+    #[tokio::test]
+    async fn media_wait_reports_which_element_failed() {
+        let err = await_outcomes(
+            vec![
+                succeeded(-1, 900, 42),
+                failed(-2, "PHOTO_INVALID_DIMENSIONS"),
+            ],
+            16,
+            &[-1, -2],
+            500,
+        )
+        .await
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("files[1]"), "{text}");
+        assert!(text.contains("f1.pdf"), "{text}");
+        assert!(text.contains("PHOTO_INVALID_DIMENSIONS"), "{text}");
+        // Naming the failure is not enough; the prose must lead with what the
+        // recipient already has.
+        assert!(text.contains("ALREADY DELIVERED"), "{text}");
+        assert!(text.contains("as message 900"), "{text}");
+
+        let partial = partial_of(&err);
+        assert_eq!(
+            partial.elements.delivered,
+            vec![DeliveredElement {
+                index: 0,
+                message_id: 900
+            }]
+        );
+        assert_eq!(
+            partial.elements.failed,
+            vec![FailedElement {
+                index: 1,
+                error: "PHOTO_INVALID_DIMENSIONS".to_string()
+            }]
+        );
+        assert!(partial.elements.unconfirmed.is_empty());
+        assert_covers(&partial.elements, 2);
+    }
+
+    #[tokio::test]
+    async fn media_wait_keeps_waiting_after_the_first_failure() {
+        // The defect, as a test. Element 1 fails BEFORE element 0 is confirmed;
+        // returning at the failure abandons element 0 while TDLib is still
+        // uploading it, so the caller is told the send failed, retries the whole
+        // album, and the recipient gets element 0 twice. The wait must run until
+        // every element is resolved.
+        let err = await_outcomes(
+            vec![
+                failed(-2, "PHOTO_INVALID_DIMENSIONS"),
+                succeeded(-1, 900, 42),
+            ],
+            16,
+            &[-1, -2],
+            500,
+        )
+        .await
+        .unwrap_err();
+
+        let partial = partial_of(&err);
+        assert_eq!(
+            partial.elements.delivered,
+            vec![DeliveredElement {
+                index: 0,
+                message_id: 900
+            }],
+            "the element confirmed AFTER the failure must still be reported"
+        );
+        assert_eq!(partial.elements.failed.len(), 1);
+        assert!(partial.elements.unconfirmed.is_empty());
+        assert_covers(&partial.elements, 2);
+    }
+
+    #[tokio::test]
+    async fn media_wait_reports_every_class_at_once() {
+        // Three elements, three outcomes: delivered, failed, and left
+        // uploading when the deadline expires. Each calls for a different
+        // action, so each has to be named separately — "2 of 3 failed" would
+        // hide that one of the two is safe to resend and the other is not.
+        let err = await_outcomes(
+            vec![succeeded(-1, 900, 42), failed(-2, "FILE_PARTS_INVALID")],
+            16,
+            &[-1, -2, -3],
+            150,
+        )
+        .await
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("ALREADY DELIVERED"), "{text}");
+        assert!(text.contains("safe to resend"), "{text}");
+        assert!(text.contains("still unconfirmed"), "{text}");
+
+        let partial = partial_of(&err);
+        assert_eq!(partial.elements.delivered.len(), 1);
+        assert_eq!(partial.elements.failed.len(), 1);
+        assert_eq!(partial.elements.unconfirmed, vec![2]);
+        assert_covers(&partial.elements, 3);
+    }
+
+    #[tokio::test]
+    async fn media_wait_reports_the_chat_even_when_the_first_element_failed() {
+        // `chat_id` comes from a confirmation, and the first element is the one
+        // that normally supplies it. When that element is the one that failed,
+        // the record must still name the chat Telegram confirmed the others in.
+        let err = await_outcomes(
+            vec![
+                failed(-1, "PHOTO_INVALID_DIMENSIONS"),
+                succeeded(-2, 901, 42),
+            ],
+            16,
+            &[-1, -2],
+            500,
+        )
+        .await
+        .unwrap_err();
+        let partial = partial_of(&err);
+        assert_eq!(partial.chat_id, 42);
+        assert_eq!(
+            partial.elements.delivered,
+            vec![DeliveredElement {
+                index: 1,
+                message_id: 901
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn media_wait_ignores_confirmations_for_other_messages() {
+        // Another caller's send must not confirm ours — and must not make the
+        // loop return early either.
+        let err = await_outcomes(vec![succeeded(-99, 1, 1)], 16, &[-1], 150)
+            .await
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("1 of 1 file(s) were still uploading"),
+            "{text}"
+        );
+        // Here "nothing was delivered" is TRUE, and the record says it the only
+        // way that is actionable: an empty `delivered` beside the index that is
+        // still in flight.
+        let partial = partial_of(&err);
+        assert!(partial.elements.delivered.is_empty());
+        assert_eq!(partial.elements.unconfirmed, vec![0]);
+        assert!(!text.contains("ALREADY DELIVERED"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn media_wait_counts_a_repeated_failure_once() {
+        // The `Delivered` half of this is `media_wait_tolerates_a_repeated_
+        // confirmation`; a re-announced FAILURE must not decrement the
+        // outstanding count twice either, which would end the wait with the
+        // other element still in flight and report it as failed.
+        let err = await_outcomes(
+            vec![
+                failed(-1, "PHOTO_INVALID_DIMENSIONS"),
+                failed(-1, "PHOTO_INVALID_DIMENSIONS"),
+            ],
+            16,
+            &[-1, -2],
+            150,
+        )
+        .await
+        .unwrap_err();
+        let partial = partial_of(&err);
+        assert_eq!(partial.elements.failed.len(), 1);
+        assert_eq!(partial.elements.unconfirmed, vec![1]);
+        assert_covers(&partial.elements, 2);
+    }
+
+    #[tokio::test]
+    async fn media_wait_survives_a_lagged_receiver() {
+        // The bug this exists to prevent: the text path treats a `Lagged` as a
+        // closed channel, which would fail a send whose confirmation is still
+        // in the buffer. Four outcomes into a 2-slot channel forces the first
+        // `recv` to report a lag; the confirmation is among the survivors.
+        let res = await_outcomes(
+            vec![
+                succeeded(-90, 1, 1),
+                succeeded(-91, 2, 1),
+                succeeded(-92, 3, 1),
+                succeeded(-1, 900, 42),
+            ],
+            2,
+            &[-1],
+            500,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.message_id, 900);
+    }
+
+    #[tokio::test]
+    async fn media_wait_reports_a_closed_channel_rather_than_succeeding() {
+        let (sender, mut receiver) = broadcast::channel::<SendOutcome>(4);
+        drop(sender);
+        let names = names(1);
+        let err = await_send_confirmations(
+            &mut receiver,
+            Some,
+            &[-1],
+            &names,
+            7,
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("update channel closed"), "{err}");
+        assert!(err.contains("0 of 1 file(s) were confirmed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn media_wait_reports_a_delivered_element_when_the_channel_closes() {
+        // A closed channel is as much a partial outcome as a deadline: the
+        // element already confirmed stays confirmed.
+        let (sender, mut receiver) = broadcast::channel::<SendOutcome>(4);
+        let _ = sender.send(succeeded(-1, 900, 42));
+        drop(sender);
+        let names = names(2);
+        let err = await_send_confirmations(
+            &mut receiver,
+            Some,
+            &[-1, -2],
+            &names,
+            7,
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("1 of 2 file(s) were confirmed"), "{text}");
+        assert!(text.contains("ALREADY DELIVERED"), "{text}");
+        let partial = partial_of(&err);
+        assert_eq!(
+            partial.elements.delivered,
+            vec![DeliveredElement {
+                index: 0,
+                message_id: 900
+            }]
+        );
+        assert_eq!(partial.elements.unconfirmed, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn media_wait_tolerates_a_repeated_confirmation() {
+        // TDLib is free to re-announce; counting the same element twice would
+        // underflow the outstanding count.
+        let res = await_outcomes(
+            vec![
+                succeeded(-1, 900, 42),
+                succeeded(-1, 900, 42),
+                succeeded(-2, 901, 42),
+            ],
+            16,
+            &[-1, -2],
+            500,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.message_id, 900);
+        let elements = res.elements.expect("a media send reports its elements");
+        assert_eq!(
+            elements.delivered.len(),
+            2,
+            "one record per element, not one per update"
+        );
+        assert_covers(&elements, 2);
+    }
+
+    #[test]
+    fn a_single_file_is_not_an_album() {
+        // TDLib's albums carry 2-10 contents and it REFUSES a one-element
+        // album, so one file — including the one file left over from a caller
+        // resending the rest of a partial send — goes out as a plain
+        // `sendMessage`.
+        assert!(!is_album(1));
+        assert!(is_album(2));
+        assert!(is_album(crate::media::MAX_FILES));
+    }
+
+    #[test]
+    fn a_partly_accepted_album_reports_the_queued_elements_as_unconfirmed() {
+        // TDLib accepted 0 and 1 and refused 2. The two it took are uploading:
+        // calling them failed would invite a resend of files that may yet
+        // arrive, and calling the refused one unconfirmed would leave a caller
+        // afraid to resend the one element it safely can.
+        let states = partly_queued_states(2, 4, "TDLib did not accept this element into the album");
+        let elements = summarise(&states);
+        assert_eq!(elements.unconfirmed, vec![0, 1]);
+        assert_eq!(
+            elements.failed.iter().map(|f| f.index).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert!(elements.delivered.is_empty());
+        assert_covers(&elements, 4);
     }
 
     #[tokio::test]

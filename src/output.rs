@@ -867,10 +867,90 @@ impl PlainText for UserInfo {
     }
 }
 
+/// One album element Telegram CONFIRMED, with the real id it went out under.
+///
+/// `index` is the element's position in the request's `files` array, which is
+/// the only join key a caller has: it materialised those files itself, so an
+/// index plus "delivered" is enough to record what arrived and to resend only
+/// the rest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveredElement {
+    pub index: usize,
+    pub message_id: i64,
+}
+
+/// One element Telegram reported as FAILED. Nothing was delivered for it, so
+/// it is the only class a retry may repeat without risking a duplicate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedElement {
+    pub index: usize,
+    pub error: String,
+}
+
+/// The per-element delivery record of a media send.
+///
+/// A `send` with `files` queues one INDEPENDENT Telegram message per element
+/// and each is confirmed separately, so "the send failed" is not a fact about
+/// the message: elements already confirmed are in the recipient's chat and no
+/// later report takes them back. Collapsing that into a flat failure is what
+/// makes a caller's retry deliver them twice, so every outcome of a media send
+/// carries this record — on success, and on a failure alongside the error.
+///
+/// The three lists are disjoint and together cover every element of the
+/// request, because the action a caller must take differs for each:
+/// `delivered` must never be resent, `failed` is safe to resend, and
+/// `unconfirmed` is neither — TDLib may still be uploading, so a blind retry
+/// there is a possible duplicate rather than a repair.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaElements {
+    /// Every element Telegram confirmed, ascending by index. These messages
+    /// ARE in the recipient's chat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered: Vec<DeliveredElement>,
+    /// Every element Telegram reported as failed, ascending by index.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<FailedElement>,
+    /// The indices whose outcome never arrived — the deadline expired, or the
+    /// update channel closed first. Bare indices because there is nothing else
+    /// to say about them: no id, and no error either.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unconfirmed: Vec<usize>,
+}
+
+/// What a media send delivered when it could NOT deliver everything.
+///
+/// Carried on the failure response beside the error, because the serve
+/// protocol's `{"ok": false, "error": "..."}` has nowhere else to put it — and
+/// a failure that cannot say what arrived is one a caller has to guess about.
+/// Deliberately not a [`SendResult`]: there is no single `message_id` for a
+/// send that did not complete, and inventing one is the laundered success the
+/// media path exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PartialSendResult {
+    pub chat_id: i64,
+    pub elements: MediaElements,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendResult {
     pub message_id: i64,
     pub chat_id: i64,
+    /// The per-element record of a media send. `None` — and absent from the
+    /// JSON — for a text send, which has no element to report on and whose
+    /// wire shape must stay byte-identical to the pre-`files` contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elements: Option<MediaElements>,
+}
+
+impl SendResult {
+    /// A send that is one message with one id: the text path, and the bot path.
+    pub fn single(message_id: i64, chat_id: i64) -> Self {
+        Self {
+            message_id,
+            chat_id,
+            elements: None,
+        }
+    }
 }
 
 impl PlainText for SendResult {
@@ -1374,22 +1454,119 @@ mod tests {
 
     #[test]
     fn send_result_plain_text() {
-        let result = SendResult {
-            message_id: 12345,
-            chat_id: 67890,
-        };
+        let result = SendResult::single(12345, 67890);
         assert_eq!(result.to_plain_text(), "Message sent (id: 12345)");
     }
 
     #[test]
     fn send_result_json() {
-        let result = SendResult {
-            message_id: 12345,
-            chat_id: 67890,
-        };
+        let result = SendResult::single(12345, 67890);
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"message_id\":12345"));
         assert!(json.contains("\"chat_id\":67890"));
+    }
+
+    #[test]
+    fn a_text_send_result_carries_no_per_element_data() {
+        // The back-compat guarantee on the result side: a text send's JSON is
+        // exactly the two keys it has always had. A caller that switches on
+        // `elements` being present is reading "this was a media send", so the
+        // key must never appear on a send that had no elements.
+        let json = serde_json::to_value(SendResult::single(12345, 67890)).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"message_id": 12345, "chat_id": 67890})
+        );
+    }
+
+    #[test]
+    fn an_old_clients_send_result_still_deserialises() {
+        // `serve_client::send_request` parses the result with a bare
+        // `from_value`, so every new field has to be optional: a daemon that
+        // answers without `elements` must still parse, and so must one that
+        // answers with it.
+        let plain: SendResult =
+            serde_json::from_value(serde_json::json!({"message_id": 7, "chat_id": 9})).unwrap();
+        assert!(plain.elements.is_none());
+
+        let media: SendResult = serde_json::from_value(serde_json::json!({
+            "message_id": 900,
+            "chat_id": 42,
+            "elements": {"delivered": [{"index": 0, "message_id": 900}]}
+        }))
+        .unwrap();
+        assert_eq!(
+            media.elements.unwrap().delivered,
+            vec![DeliveredElement {
+                index: 0,
+                message_id: 900
+            }]
+        );
+    }
+
+    #[test]
+    fn a_media_send_result_names_every_delivered_element() {
+        let result = SendResult {
+            message_id: 900,
+            chat_id: 42,
+            elements: Some(MediaElements {
+                delivered: vec![
+                    DeliveredElement {
+                        index: 0,
+                        message_id: 900,
+                    },
+                    DeliveredElement {
+                        index: 1,
+                        message_id: 901,
+                    },
+                ],
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "message_id": 900,
+                "chat_id": 42,
+                "elements": {"delivered": [
+                    {"index": 0, "message_id": 900},
+                    {"index": 1, "message_id": 901},
+                ]},
+            })
+        );
+        // The empty classes are omitted rather than serialised as `[]`: on a
+        // clean send there is nothing failed and nothing unconfirmed to act on.
+        assert!(!json["elements"].as_object().unwrap().contains_key("failed"));
+    }
+
+    #[test]
+    fn a_partial_send_result_reports_delivered_beside_the_failure() {
+        let partial = PartialSendResult {
+            chat_id: 42,
+            elements: MediaElements {
+                delivered: vec![DeliveredElement {
+                    index: 0,
+                    message_id: 900,
+                }],
+                failed: vec![FailedElement {
+                    index: 1,
+                    error: "PHOTO_INVALID_DIMENSIONS".to_string(),
+                }],
+                unconfirmed: vec![2],
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&partial).unwrap(),
+            serde_json::json!({
+                "chat_id": 42,
+                "elements": {
+                    "delivered": [{"index": 0, "message_id": 900}],
+                    "failed": [{"index": 1, "error": "PHOTO_INVALID_DIMENSIONS"}],
+                    "unconfirmed": [2],
+                },
+            })
+        );
     }
 
     #[test]

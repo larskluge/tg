@@ -48,6 +48,14 @@ pub struct RequestEnvelope {
 
 /// Outgoing response envelope. Either `{"ok": true, "result": ...}` or
 /// `{"ok": false, "error": "..."}`, with `id` always echoed.
+///
+/// One failure carries BOTH: a media `send` that put some elements in the
+/// recipient's chat and then could not finish answers `ok: false` with the
+/// error *and* a `result` holding the per-element record (see
+/// [`ResponseEnvelope::err_with_result`]). `ok` keeps its meaning — the
+/// request did not do what was asked — so a caller that reads only `ok` is
+/// never told a failure succeeded; what it gains is the ability to learn which
+/// elements arrived instead of assuming none did.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseEnvelope {
     pub id: serde_json::Value,
@@ -76,6 +84,42 @@ impl ResponseEnvelope {
             error: Some(message.into()),
         }
     }
+
+    /// A failure that still has something to report: the request did not do
+    /// what was asked, and `result` says what it nonetheless did.
+    pub fn err_with_result(
+        id: serde_json::Value,
+        message: impl Into<String>,
+        value: serde_json::Value,
+    ) -> Self {
+        Self {
+            id,
+            ok: false,
+            result: Some(value),
+            error: Some(message.into()),
+        }
+    }
+}
+
+/// Turn a handler error into a response, attaching the structured record when
+/// the error carries one.
+fn error_response(id: serde_json::Value, e: TgError) -> ResponseEnvelope {
+    let message = e.to_string();
+    match e.partial_send() {
+        None => ResponseEnvelope::err(id, message),
+        Some(partial) => match serde_json::to_value(partial) {
+            Ok(value) => ResponseEnvelope::err_with_result(id, message, value),
+            // Unreachable for a plain data struct, but a record that cannot be
+            // serialised must not vanish: the caller would read the failure as
+            // "nothing was delivered" and resend what is already delivered.
+            Err(serialise) => ResponseEnvelope::err(
+                id,
+                format!(
+                    "{message} (and the per-element record could not be serialised: {serialise} — do NOT resend blindly; check the chat)"
+                ),
+            ),
+        },
+    }
 }
 
 /// Dispatch a single request against a TelegramClient. Always returns a
@@ -103,7 +147,7 @@ pub async fn dispatch<C: TelegramClient>(client: &C, env: RequestEnvelope) -> Re
 
     match result {
         Ok(v) => ResponseEnvelope::ok(id, v),
-        Err(e) => ResponseEnvelope::err(id, e.to_string()),
+        Err(e) => error_response(id, e),
     }
 }
 
@@ -218,6 +262,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_send_reports_per_element_delivery_for_a_media_send() {
+        // A media send's result carries the record of every element Telegram
+        // confirmed, keyed by its index in the request's `files` array.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("a.pdf");
+        std::fs::write(&path, b"bytes").unwrap();
+
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "7p",
+                "send",
+                json!({
+                    "message": "two files",
+                    "id": 42,
+                    "files": [
+                        {"path": path.to_string_lossy()},
+                        {"path": path.to_string_lossy()},
+                    ]
+                }),
+            ),
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        let r = res.result.unwrap();
+        assert_eq!(r["elements"]["delivered"][0]["index"], 0);
+        assert_eq!(r["elements"]["delivered"][1]["index"], 1);
+        // The id a caller records for the send is the first element's, the one
+        // carrying the caption.
+        assert_eq!(r["message_id"], r["elements"]["delivered"][0]["message_id"]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_omits_the_element_record_for_a_text_send() {
+        // Back-compat, on the response side: a text send's result is exactly
+        // the two keys it has always been.
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req("7q", "send", json!({"message": "hi", "id": 42})),
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        assert_eq!(
+            res.result.unwrap(),
+            json!({"message_id": 12345, "chat_id": 42})
+        );
+    }
+
+    #[test]
+    fn a_partial_send_failure_answers_with_both_error_and_result() {
+        // The protocol's one `ok:false` that still carries data. Without it a
+        // caller has nowhere to read what arrived, reads the failure as
+        // "nothing arrived", and resends files already in the recipient's chat.
+        let err = TgError::PartialSend {
+            message: "send: 1 of 2 file(s) were not delivered".to_string(),
+            partial: Box::new(crate::output::PartialSendResult {
+                chat_id: 42,
+                elements: crate::output::MediaElements {
+                    delivered: vec![crate::output::DeliveredElement {
+                        index: 0,
+                        message_id: 900,
+                    }],
+                    failed: vec![crate::output::FailedElement {
+                        index: 1,
+                        error: "PHOTO_INVALID_DIMENSIONS".to_string(),
+                    }],
+                    unconfirmed: vec![],
+                },
+            }),
+        };
+        let res = error_response(json!("1"), err);
+        assert!(!res.ok, "a partial delivery is not a success");
+        assert!(res.error.unwrap().contains("1 of 2"));
+        let r = res.result.expect("a partial failure must carry its record");
+        assert_eq!(
+            r["elements"]["delivered"],
+            json!([{"index": 0, "message_id": 900}])
+        );
+        assert_eq!(r["elements"]["failed"][0]["index"], 1);
+        assert_eq!(r["chat_id"], 42);
+    }
+
+    #[test]
+    fn an_ordinary_failure_carries_no_result() {
+        // `result` on a failure means "this is what it nonetheless did". An
+        // error that did nothing must not grow one, or its presence stops
+        // meaning anything.
+        let res = error_response(json!("1"), TgError::Other("nope".to_string()));
+        assert!(!res.ok);
+        assert!(res.result.is_none());
+        assert_eq!(res.error.unwrap(), "nope");
+    }
+
+    #[tokio::test]
     async fn dispatch_send_with_parse_mode_succeeds() {
         let client = MockClient::default();
         let res = dispatch(
@@ -231,6 +371,78 @@ mod tests {
         .await;
         assert!(res.ok, "{:?}", res.error);
         assert_eq!(res.result.unwrap()["chat_id"], 42);
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_carries_files_through_the_envelope() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("Q3 report.pdf");
+        std::fs::write(&path, b"bytes").unwrap();
+
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "7f",
+                "send",
+                json!({
+                    "message": "here it is",
+                    "id": 42,
+                    "files": [{"path": path.to_string_lossy(), "kind": "file"}]
+                }),
+            ),
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        assert_eq!(res.result.unwrap()["chat_id"], 42);
+
+        let media = client.media_sent.lock().unwrap();
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].1, "here it is");
+        assert_eq!(media[0].3[0].display_name(), "Q3 report.pdf");
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_refuses_a_bad_file_in_band() {
+        // A malformed attachment set comes back as a normal error response, so
+        // the caller can retry; nothing is sent.
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "7g",
+                "send",
+                json!({"message": "hi", "id": 42, "files": [{"path": "relative.pdf"}]}),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        assert!(res.error.unwrap().contains("is not absolute"));
+        assert!(client.media_sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_send_rejects_an_unknown_file_field() {
+        // `files[]` is as closed as `send` itself: no TDLib input type carries a
+        // filename or a MIME type, so a caller that thinks it passed one must be
+        // told rather than have it silently dropped.
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "7h",
+                "send",
+                json!({
+                    "message": "hi",
+                    "id": 42,
+                    "files": [{"path": "/tmp/a.pdf", "filename": "b.pdf"}]
+                }),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        let err = res.error.unwrap();
+        assert!(err.contains("unknown field `filename`"), "{err}");
     }
 
     #[tokio::test]

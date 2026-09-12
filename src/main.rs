@@ -366,10 +366,7 @@ async fn run_bot_send(
         .expect("send message must be resolved before run_bot_send");
     let message_id = bot_api::send_message(&bot.token, chat_id, message, parse_mode).await?;
 
-    let result = SendResult {
-        message_id,
-        chat_id,
-    };
+    let result = SendResult::single(message_id, chat_id);
     print_output(format, &result);
     Ok(())
 }

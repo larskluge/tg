@@ -70,6 +70,11 @@ pub async fn send_request<A: Serialize, T: DeserializeOwned>(
         serde_json::from_value(value)
             .map_err(|e| TgError::Other(format!("tg serve: result parse error: {e}")))
     } else {
+        // A failure's `result` — the per-element record a partial media send
+        // carries — is deliberately dropped here: this is the CLI's own proxy,
+        // and the CLI has no attachment flag (`SendRequest::from(SendArgs)`
+        // never sets `files`), so it cannot receive one. A caller that sends
+        // attachments speaks the socket protocol directly and reads both keys.
         Err(TgError::Other(response.error.unwrap_or_else(|| {
             "tg serve: unknown server error".to_string()
         })))
