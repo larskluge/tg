@@ -44,6 +44,17 @@ pub struct SendRequest {
     /// contract; an empty array is refused. Validated in [`handle`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Vec<SendFile>>,
+    /// The TDLib id of a message in the DESTINATION chat to send this one as a
+    /// native Telegram reply to — the id `tg messages`/`tg sync` print, i.e.
+    /// `server_id << 20`, never the bare server id a `t.me` link shows. Absent is
+    /// an ordinary send and is byte-identical to the pre-reply contract.
+    ///
+    /// The target is proved to exist in that chat and to accept a reply
+    /// ([`TelegramClient::check_reply_target`]) before anything is sent, because
+    /// TDLib's own answer to a reply it cannot honour is to send the message
+    /// anyway, unthreaded — a delivery the caller cannot take back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<i64>,
 }
 
 /// Convert clap args to a `SendRequest`. Panics if `--as <bot>` is set, because
@@ -68,6 +79,9 @@ impl From<SendArgs> for SendRequest {
             // feature. `skip_serializing_if` keeps the key off the wire
             // entirely, so a new CLI still talks to an older daemon.
             files: None,
+            // Likewise for replies: a socket-protocol feature, absent from the
+            // wire unless set.
+            reply_to: None,
         }
     }
 }
@@ -131,10 +145,29 @@ pub async fn send_message<C: TelegramClient>(
     target: SendTarget,
     message: &str,
     parse_mode: Option<ParseMode>,
+    reply_to: Option<i64>,
 ) -> Result<SendResult> {
     let chat_id = resolve_chat_id(client, target).await?;
+    check_reply(client, chat_id, reply_to).await?;
 
-    client.send_message(chat_id, message, parse_mode).await
+    client
+        .send_message(chat_id, message, parse_mode, reply_to)
+        .await
+}
+
+/// Prove a reply target before the send that would reply to it. It runs after
+/// the chat is resolved because the check is "this message is in THAT chat": a
+/// TDLib message id is only meaningful within one chat, and the same number can
+/// name an unrelated message in another.
+async fn check_reply<C: TelegramClient>(
+    client: &C,
+    chat_id: i64,
+    reply_to: Option<i64>,
+) -> Result<()> {
+    match reply_to {
+        Some(message_id) => client.check_reply_target(chat_id, message_id).await,
+        None => Ok(()),
+    }
 }
 
 /// Send 1-10 validated files as one message, `caption` being the message's
@@ -146,11 +179,13 @@ pub async fn send_media<C: TelegramClient>(
     caption: &str,
     parse_mode: Option<ParseMode>,
     files: &[MediaFile],
+    reply_to: Option<i64>,
 ) -> Result<SendResult> {
     let chat_id = resolve_chat_id(client, target).await?;
+    check_reply(client, chat_id, reply_to).await?;
 
     client
-        .send_media_message(chat_id, caption, parse_mode, files)
+        .send_media_message(chat_id, caption, parse_mode, files, reply_to)
         .await
 }
 
@@ -210,6 +245,11 @@ pub async fn handle<C: TelegramClient>(client: &C, req: SendRequest) -> Result<S
     // `handle_validates_files_before_resolving_target`.
     let files = validate_files(req.files.as_deref())?;
 
+    // And the reply target's shape, for the same reason. Only its SHAPE: whether
+    // it names a message in the chat needs the chat, so that half runs after the
+    // ladder. Pinned by `handle_validates_reply_to_before_resolving_target`.
+    let reply_to = validate_reply_to(req.reply_to)?;
+
     let target = if let Some(ref to) = req.to {
         if let Ok(id) = to.parse::<i64>() {
             SendTarget::Id(id)
@@ -231,9 +271,26 @@ pub async fn handle<C: TelegramClient>(client: &C, req: SendRequest) -> Result<S
     };
 
     if files.is_empty() {
-        send_message(client, target, &req.message, parse_mode).await
+        send_message(client, target, &req.message, parse_mode, reply_to).await
     } else {
-        send_media(client, target, &req.message, parse_mode, &files).await
+        send_media(client, target, &req.message, parse_mode, &files, reply_to).await
+    }
+}
+
+/// TDLib gives a server message the id `server_id << 20`, so every id a reply
+/// can name is a positive multiple of 2^20. Anything else is a caller holding
+/// the wrong number — most likely the bare server id from a `t.me` link, which
+/// TDLib would read as a different (usually nonexistent) message. Refused by
+/// name rather than left to a lookup whose "not found" would not say why.
+fn validate_reply_to(reply_to: Option<i64>) -> Result<Option<i64>> {
+    const SERVER_ID_SHIFT: i64 = 1 << 20;
+    match reply_to {
+        None => Ok(None),
+        Some(id) if id > 0 && id % SERVER_ID_SHIFT == 0 => Ok(Some(id)),
+        Some(id) => Err(TgError::Other(format!(
+            "invalid reply_to {id}: expected a TDLib message id (server_id << 20, as `tg messages` prints it), \
+             not a bare server id or a local message id"
+        ))),
     }
 }
 
@@ -248,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn send_by_id() {
         let client = MockClient::default();
-        let result = send_message(&client, SendTarget::Id(123), "Hello", None).await;
+        let result = send_message(&client, SendTarget::Id(123), "Hello", None, None).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().chat_id, 123);
     }
@@ -256,8 +313,14 @@ mod tests {
     #[tokio::test]
     async fn send_by_name() {
         let client = MockClient::default();
-        let result =
-            send_message(&client, SendTarget::Name("John".to_string()), "Hello", None).await;
+        let result = send_message(
+            &client,
+            SendTarget::Name("John".to_string()),
+            "Hello",
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -268,6 +331,7 @@ mod tests {
             &client,
             SendTarget::Group("Family".to_string()),
             "Hello",
+            None,
             None,
         )
         .await;
@@ -281,6 +345,7 @@ mod tests {
             &client,
             SendTarget::Name("Unknown".to_string()),
             "Hello",
+            None,
             None,
         )
         .await;
@@ -379,6 +444,7 @@ mod tests {
             &client,
             SendTarget::Username("johndoe".to_string()),
             "Hello",
+            None,
             None,
         )
         .await;
@@ -485,9 +551,146 @@ mod tests {
             "group",
             "parse_mode",
             "files",
+            "reply_to",
         ] {
             assert!(err.contains(field), "error should name `{field}`: {err}");
         }
+    }
+
+    // Fictional TDLib ids: a DM with user 5550001 and a supergroup, each holding
+    // one message. TDLib numbers server messages `server_id << 20`, and the SAME
+    // number can exist in two chats — which is what the chat check is for.
+    const DM: i64 = 5_550_001;
+    const GROUP: i64 = -1_009_876_543_210;
+    const DM_MSG: i64 = 4_211 << 20;
+    const GROUP_MSG: i64 = 918 << 20;
+
+    fn client_with_reply_targets() -> MockClient {
+        let mut client = MockClient::default();
+        for (chat_id, id) in [(DM, DM_MSG), (GROUP, GROUP_MSG)] {
+            let mut m = client.messages[0].clone();
+            m.chat_id = chat_id;
+            m.id = id;
+            client.messages.push(m);
+        }
+        client
+    }
+
+    #[test]
+    fn send_request_reply_to_is_optional_and_off_the_wire_when_absent() {
+        let req = send_req(json!({"message": "hi", "id": 1})).unwrap();
+        assert!(req.reply_to.is_none());
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("reply_to").is_none(), "{wire}");
+
+        let req = send_req(json!({"message": "hi", "id": DM, "reply_to": DM_MSG})).unwrap();
+        assert_eq!(req.reply_to, Some(DM_MSG));
+    }
+
+    #[tokio::test]
+    async fn handle_validates_reply_to_before_resolving_target() {
+        // A bare server id (what a t.me link shows) is the likely mistake. With no
+        // recipient, the error must be about reply_to — so a malformed request
+        // costs no TDLib lookup, and a probe can tell this build from an older one.
+        let client = MockClient::default();
+        for bad in [4_211, 0, -(4_211 << 20)] {
+            let req = SendRequest {
+                message: "hi".to_string(),
+                reply_to: Some(bad),
+                ..Default::default()
+            };
+            let err = handle(&client, req).await.unwrap_err().to_string();
+            assert!(err.contains("invalid reply_to"), "{bad}: {err}");
+            assert!(!err.contains("one of"), "{bad}: {err}");
+        }
+        assert!(client.reply_checks.lock().unwrap().is_empty());
+        assert!(client.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_sends_a_native_reply_in_the_chat_that_holds_the_target() {
+        let client = client_with_reply_targets();
+        let req = SendRequest {
+            message: "thanks".to_string(),
+            id: Some(GROUP),
+            reply_to: Some(GROUP_MSG),
+            ..Default::default()
+        };
+        let res = handle(&client, req).await.unwrap();
+        assert_eq!(res.reply_to_message_id, Some(GROUP_MSG));
+        assert_eq!(
+            *client.reply_checks.lock().unwrap(),
+            vec![(GROUP, GROUP_MSG)]
+        );
+        assert_eq!(*client.replies_sent.lock().unwrap(), vec![Some(GROUP_MSG)]);
+        let wire = serde_json::to_value(&res).unwrap();
+        assert_eq!(wire["reply_to_message_id"], json!(GROUP_MSG));
+    }
+
+    #[tokio::test]
+    async fn handle_refuses_a_target_from_another_chat_and_sends_nothing() {
+        // DM_MSG is a real message — in the DM. Replying to it in the group is the
+        // mismatch TDLib would answer with an unthreaded message, so it must be
+        // refused before the send.
+        let client = client_with_reply_targets();
+        let req = SendRequest {
+            message: "thanks".to_string(),
+            id: Some(GROUP),
+            reply_to: Some(DM_MSG),
+            ..Default::default()
+        };
+        let err = handle(&client, req).await.unwrap_err().to_string();
+        assert!(err.contains("not accessible in chat"), "{err}");
+        assert!(client.sent.lock().unwrap().is_empty());
+        assert!(client.replies_sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_media_send_carries_the_reply_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("report.pdf");
+        std::fs::write(&path, b"%PDF-1.4 fictional").unwrap();
+        let client = client_with_reply_targets();
+        let req = SendRequest {
+            message: "the file you asked for".to_string(),
+            id: Some(DM),
+            reply_to: Some(DM_MSG),
+            files: Some(vec![SendFile {
+                path: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        let res = handle(&client, req).await.unwrap();
+        assert_eq!(res.reply_to_message_id, Some(DM_MSG));
+        assert_eq!(client.media_sent.lock().unwrap().len(), 1);
+        assert_eq!(*client.replies_sent.lock().unwrap(), vec![Some(DM_MSG)]);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_send_checks_nothing_and_replies_to_nothing() {
+        let client = client_with_reply_targets();
+        let req = SendRequest {
+            message: "hi".to_string(),
+            id: Some(DM),
+            ..Default::default()
+        };
+        let res = handle(&client, req).await.unwrap();
+        assert!(client.reply_checks.lock().unwrap().is_empty());
+        assert_eq!(*client.replies_sent.lock().unwrap(), vec![None]);
+        let wire = serde_json::to_value(&res).unwrap();
+        assert!(wire.get("reply_to_message_id").is_none(), "{wire}");
+    }
+
+    #[test]
+    fn the_cli_never_puts_reply_to_on_the_wire() {
+        use clap::Parser;
+        let req = SendRequest::from(SendArgs::parse_from([
+            "send", "--id", "5550001", "-m", "hi",
+        ]));
+        assert!(req.reply_to.is_none());
+        let wire = serde_json::to_value(&req).unwrap();
+        assert!(wire.get("reply_to").is_none(), "{wire}");
     }
 
     fn bot_args(argv: &[&str]) -> SendArgs {
@@ -712,6 +915,7 @@ mod tests {
             SendTarget::Username("johndoe".to_string()),
             "Hello",
             Some(crate::parse_mode::ParseMode::Html),
+            None,
         )
         .await
         .unwrap();

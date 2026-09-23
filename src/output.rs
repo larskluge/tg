@@ -935,6 +935,12 @@ pub struct PartialSendResult {
 pub struct SendResult {
     pub message_id: i64,
     pub chat_id: i64,
+    /// The message this one was sent as a native reply to, present only when
+    /// TDLib CONFIRMED it attached that reply. Absent on an ordinary send (whose
+    /// wire shape is unchanged) — and absent on a send that asked for a reply and
+    /// did not get one, which is the one case a caller must be able to tell apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
     /// The per-element record of a media send. `None` — and absent from the
     /// JSON — for a text send, which has no element to report on and whose
     /// wire shape must stay byte-identical to the pre-`files` contract.
@@ -948,8 +954,15 @@ impl SendResult {
         Self {
             message_id,
             chat_id,
+            reply_to_message_id: None,
             elements: None,
         }
+    }
+
+    /// Record the reply TDLib confirmed (see `reply_to_message_id`).
+    pub fn replying(mut self, reply_to_message_id: Option<i64>) -> Self {
+        self.reply_to_message_id = reply_to_message_id;
+        self
     }
 }
 
@@ -1509,6 +1522,7 @@ mod tests {
         let result = SendResult {
             message_id: 900,
             chat_id: 42,
+            reply_to_message_id: None,
             elements: Some(MediaElements {
                 delivered: vec![
                     DeliveredElement {

@@ -467,6 +467,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_send_refuses_a_reply_target_the_chat_does_not_hold() {
+        // Over the socket, the same-chat check answers in-band and sends nothing:
+        // the mock holds message 1 in chat 1 only, and 1 << 20 names nothing.
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "10",
+                "send",
+                json!({"message": "hi", "id": 1, "reply_to": 1_i64 << 20}),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        let err = res.error.unwrap();
+        assert!(err.contains("not accessible in chat 1"), "{err}");
+        assert!(client.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn dispatch_send_rejects_bad_parse_mode() {
         let client = MockClient::default();
         let res = dispatch(

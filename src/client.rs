@@ -85,12 +85,25 @@ pub trait TelegramClient: Send + Sync {
     async fn find_chat_by_username(&self, username: &str) -> Result<i64>;
     async fn find_group_by_name(&self, name: &str) -> Result<i64>;
 
+    /// `reply_to`, when set, is a TDLib message id in `chat_id` that this message
+    /// is sent as a native reply to. Callers prove it first with
+    /// [`TelegramClient::check_reply_target`].
     async fn send_message(
         &self,
         chat_id: i64,
         text: &str,
         parse_mode: Option<ParseMode>,
+        reply_to: Option<i64>,
     ) -> Result<SendResult>;
+
+    /// Prove `message_id` is a message in `chat_id` that TDLib will let this
+    /// account reply to, WITHOUT sending anything.
+    ///
+    /// It exists because the send cannot be trusted to refuse: given a reply
+    /// target it cannot honour, TDLib sends the message anyway, as an ordinary
+    /// unthreaded one. So the check is a separate call made before the send, and
+    /// its failure is the only way a bad target costs nothing.
+    async fn check_reply_target(&self, chat_id: i64, message_id: i64) -> Result<()>;
 
     /// Send 1-10 already-validated local files as one Telegram message, with
     /// `caption` as the message's caption.
@@ -106,6 +119,7 @@ pub trait TelegramClient: Send + Sync {
         caption: &str,
         parse_mode: Option<ParseMode>,
         files: &[MediaFile],
+        reply_to: Option<i64>,
     ) -> Result<SendResult>;
 
     async fn get_messages(
@@ -166,6 +180,11 @@ const SYNC_TIMEOUT_SECS: u64 = 5;
 /// caller's link, not a round trip — hence 5 minutes rather than the text
 /// path's 10 seconds. Expiry is an error: see `send_media_message`.
 const MEDIA_SEND_TIMEOUT_SECS: u64 = 300;
+
+/// Maximum seconds to prove a reply target before a send. The same budget as the
+/// text path's own confirmation wait, so a reply send still answers well inside a
+/// caller's socket deadline. Expiry refuses the send: see `check_reply_target`.
+const REPLY_CHECK_TIMEOUT_SECS: u64 = 10;
 
 /// Whether `count` elements go out as an album.
 ///
@@ -480,6 +499,7 @@ async fn await_send_confirmations<T: Clone>(
     Ok(SendResult {
         message_id,
         chat_id: result_chat_id,
+        reply_to_message_id: None,
         elements: Some(summarise(&states)),
     })
 }
@@ -524,6 +544,45 @@ async fn wait_for_connection_sync(
 }
 
 impl TdLibClient {
+    /// The reply-target proof itself, without the deadline `check_reply_target`
+    /// puts around it.
+    async fn check_reply_target_unbounded(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        let client_id = self.get_client_id().await?;
+        // The send opens a private chat before sending; the check must see the
+        // chat the send will, or a DM that is not yet loaded fails here for a
+        // reason that has nothing to do with the target.
+        let _ = tdlib_rs::functions::create_private_chat(chat_id, true, client_id).await;
+
+        // getMessage first: it is the call that fetches a message TDLib has not
+        // cached, and it answers 404 for an id that names nothing in this chat.
+        tdlib_rs::functions::get_message(chat_id, message_id, client_id)
+            .await
+            .map_err(|e| {
+                TgError::Other(format!(
+                    "send: reply_to message {message_id} is not accessible in chat {chat_id}: {}",
+                    e.message
+                ))
+            })?;
+        // TDLib's own precondition for inputMessageReplyToMessage: "a message can
+        // be replied in the same chat and forum topic only if
+        // messageProperties.can_be_replied".
+        let tdlib_rs::enums::MessageProperties::MessageProperties(props) =
+            tdlib_rs::functions::get_message_properties(chat_id, message_id, client_id)
+                .await
+                .map_err(|e| {
+                    TgError::Other(format!(
+                        "send: could not read whether message {message_id} in chat {chat_id} accepts a reply: {}",
+                        e.message
+                    ))
+                })?;
+        if !props.can_be_replied {
+            return Err(TgError::Other(format!(
+                "send: message {message_id} in chat {chat_id} cannot be replied to"
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(api_id: i32, api_hash: String) -> Result<Self> {
         // Set TDLib log verbosity to fatal errors only (0) before any TDLib operations
         // Level 0 = fatal errors, 1 = errors, 2 = warnings
@@ -938,6 +997,39 @@ fn unwrap_user(user: tdlib_rs::enums::User) -> tdlib_rs::types::User {
 fn unwrap_message(msg: tdlib_rs::enums::Message) -> tdlib_rs::types::Message {
     match msg {
         tdlib_rs::enums::Message::Message(m) => m,
+    }
+}
+
+/// The native reply a send carries, or none. Always the same-chat form: a reply
+/// target is proved to be in the destination chat before the send, and TDLib's
+/// cross-chat form would quote a message the recipient may not be able to see.
+fn reply_target(reply_to: Option<i64>) -> Option<tdlib_rs::enums::InputMessageReplyTo> {
+    reply_to.map(|message_id| {
+        tdlib_rs::enums::InputMessageReplyTo::Message(tdlib_rs::types::InputMessageReplyToMessage {
+            message_id,
+            quote: None,
+            checklist_task_id: 0,
+        })
+    })
+}
+
+/// The reply target TDLib actually attached to a message it accepted, when it is
+/// the one asked for. Read back rather than assumed, because TDLib answers a reply
+/// it cannot honour by sending the message unthreaded — and a caller told
+/// "replied" about that message would be told something false.
+fn confirmed_reply(message: &tdlib_rs::types::Message, asked: Option<i64>) -> Option<i64> {
+    confirmed_reply_to(message.reply_to.as_ref(), asked)
+}
+
+fn confirmed_reply_to(
+    attached: Option<&tdlib_rs::enums::MessageReplyTo>,
+    asked: Option<i64>,
+) -> Option<i64> {
+    match (attached, asked) {
+        (Some(tdlib_rs::enums::MessageReplyTo::Message(r)), Some(id)) if r.message_id == id => {
+            Some(id)
+        }
+        _ => None,
     }
 }
 
@@ -2729,6 +2821,7 @@ impl TelegramClient for TdLibClient {
         chat_id: i64,
         text: &str,
         parse_mode: Option<ParseMode>,
+        reply_to: Option<i64>,
     ) -> Result<SendResult> {
         use tdlib_rs::enums::Update;
 
@@ -2745,13 +2838,22 @@ impl TelegramClient for TdLibClient {
         // Subscribe to updates before sending
         let mut receiver = self.update_sender.subscribe();
 
-        let message_enum =
-            tdlib_rs::functions::send_message(chat_id, None, None, None, content, client_id)
-                .await
-                .map_err(|e| TgError::TdLib(e.message))?;
+        let message_enum = tdlib_rs::functions::send_message(
+            chat_id,
+            None,
+            reply_target(reply_to),
+            None,
+            content,
+            client_id,
+        )
+        .await
+        .map_err(|e| TgError::TdLib(e.message))?;
 
         let message = unwrap_message(message_enum);
         let local_message_id = message.id;
+        // Only the timeout fallbacks below report from the pending copy — they already
+        // return a temporary id, and say no more about the reply than TDLib queued.
+        let replied = confirmed_reply(&message, reply_to);
 
         // Wait for send confirmation (success or failure)
         let timeout = tokio::time::Duration::from_secs(10);
@@ -2761,17 +2863,21 @@ impl TelegramClient for TdLibClient {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
                 // Timeout - message might still be sending, return local ID
-                return Ok(SendResult::single(local_message_id, message.chat_id));
+                return Ok(SendResult::single(local_message_id, message.chat_id).replying(replied));
             }
 
             match tokio::time::timeout(remaining, receiver.recv()).await {
                 Ok(Ok(update)) => match update {
                     Update::MessageSendSucceeded(msg_update) => {
                         if msg_update.old_message_id == local_message_id {
+                            // Confirmed from the message the SERVER accepted, not the
+                            // pending copy: a reply dropped between the target check
+                            // and delivery shows up here and nowhere else.
                             return Ok(SendResult::single(
                                 msg_update.message.id,
                                 msg_update.message.chat_id,
-                            ));
+                            )
+                            .replying(confirmed_reply(&msg_update.message, reply_to)));
                         }
                     }
                     Update::MessageSendFailed(msg_update) => {
@@ -2793,7 +2899,26 @@ impl TelegramClient for TdLibClient {
         }
 
         // Fallback - return local message ID
-        Ok(SendResult::single(local_message_id, message.chat_id))
+        Ok(SendResult::single(local_message_id, message.chat_id).replying(replied))
+    }
+
+    async fn check_reply_target(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        // Bounded, because getMessage on a target TDLib has not cached waits for the
+        // network, and a caller whose own deadline fires first reports a failure while
+        // this goes on to SEND — so its retry would deliver the message twice. Running
+        // out of time here refuses with nothing sent.
+        let timeout = tokio::time::Duration::from_secs(REPLY_CHECK_TIMEOUT_SECS);
+        match tokio::time::timeout(
+            timeout,
+            self.check_reply_target_unbounded(chat_id, message_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(TgError::Other(format!(
+                "send: could not confirm reply_to message {message_id} in chat {chat_id} within {REPLY_CHECK_TIMEOUT_SECS}s; nothing was sent"
+            ))),
+        }
     }
 
     /// Send local files as one message and report only what Telegram confirmed
@@ -2824,6 +2949,7 @@ impl TelegramClient for TdLibClient {
         caption: &str,
         parse_mode: Option<ParseMode>,
         files: &[MediaFile],
+        reply_to: Option<i64>,
     ) -> Result<SendResult> {
         // Belt and braces: `media::validate_files` is the gate, but this trait
         // is public and TDLib's album limits are not recoverable mid-send.
@@ -2853,14 +2979,27 @@ impl TelegramClient for TdLibClient {
 
         let names: Vec<String> = files.iter().map(MediaFile::display_name).collect();
 
+        // Read off the FIRST element, the one carrying the caption: that is the
+        // message a reader sees as the reply, whether it is one file or an album.
+        let replied;
         let pending: Vec<i64> = if is_album(contents.len()) {
             let messages = unwrap_messages(
                 tdlib_rs::functions::send_message_album(
-                    chat_id, None, None, None, contents, client_id,
+                    chat_id,
+                    None,
+                    reply_target(reply_to),
+                    None,
+                    contents,
+                    client_id,
                 )
                 .await
                 .map_err(|e| TgError::TdLib(e.message))?,
             );
+            replied = messages
+                .messages
+                .first()
+                .and_then(Option::as_ref)
+                .and_then(|m| confirmed_reply(m, reply_to));
             let mut ids = Vec::with_capacity(files.len());
             for (i, message) in messages.messages.iter().enumerate() {
                 let Some(message) = message else {
@@ -2914,10 +3053,18 @@ impl TelegramClient for TdLibClient {
                 .next()
                 .expect("send_media_message refuses an empty file set above");
             let message = unwrap_message(
-                tdlib_rs::functions::send_message(chat_id, None, None, None, content, client_id)
-                    .await
-                    .map_err(|e| TgError::TdLib(e.message))?,
+                tdlib_rs::functions::send_message(
+                    chat_id,
+                    None,
+                    reply_target(reply_to),
+                    None,
+                    content,
+                    client_id,
+                )
+                .await
+                .map_err(|e| TgError::TdLib(e.message))?,
             );
+            replied = confirmed_reply(&message, reply_to);
             vec![message.id]
         };
 
@@ -2930,6 +3077,7 @@ impl TelegramClient for TdLibClient {
             tokio::time::Duration::from_secs(MEDIA_SEND_TIMEOUT_SECS),
         )
         .await
+        .map(|result| result.replying(replied))
     }
 
     async fn get_messages(
@@ -3413,6 +3561,10 @@ pub mod mock {
         /// Separate from `sent` on purpose: a test that asserts a text send
         /// happened must not pass because a media send did.
         pub media_sent: std::sync::Mutex<Vec<MediaSendRecord>>,
+        /// The `reply_to` of every send, text and media alike, in order.
+        pub replies_sent: std::sync::Mutex<Vec<Option<i64>>>,
+        /// Every `check_reply_target` call as `(chat_id, message_id)`.
+        pub reply_checks: std::sync::Mutex<Vec<(i64, i64)>>,
     }
 
     /// One recorded media send: `(chat_id, caption, parse_mode, files)`.
@@ -3485,6 +3637,8 @@ pub mod mock {
                 )),
                 sent: std::sync::Mutex::new(Vec::new()),
                 media_sent: std::sync::Mutex::new(Vec::new()),
+                replies_sent: std::sync::Mutex::new(Vec::new()),
+                reply_checks: std::sync::Mutex::new(Vec::new()),
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -3609,12 +3763,34 @@ pub mod mock {
             chat_id: i64,
             text: &str,
             parse_mode: Option<ParseMode>,
+            reply_to: Option<i64>,
         ) -> Result<SendResult> {
             self.sent
                 .lock()
                 .unwrap()
                 .push((chat_id, text.to_string(), parse_mode));
-            Ok(SendResult::single(12345, chat_id))
+            self.replies_sent.lock().unwrap().push(reply_to);
+            Ok(SendResult::single(12345, chat_id).replying(reply_to))
+        }
+
+        /// A target is replyable exactly when `messages` holds it in that chat —
+        /// so the same id in another chat is refused, as TDLib refuses it.
+        async fn check_reply_target(&self, chat_id: i64, message_id: i64) -> Result<()> {
+            self.reply_checks
+                .lock()
+                .unwrap()
+                .push((chat_id, message_id));
+            if self
+                .messages
+                .iter()
+                .any(|m| m.chat_id == chat_id && m.id == message_id)
+            {
+                Ok(())
+            } else {
+                Err(TgError::Other(format!(
+                    "send: reply_to message {message_id} is not accessible in chat {chat_id}: Message not found"
+                )))
+            }
         }
 
         async fn send_media_message(
@@ -3623,7 +3799,9 @@ pub mod mock {
             caption: &str,
             parse_mode: Option<ParseMode>,
             files: &[MediaFile],
+            reply_to: Option<i64>,
         ) -> Result<SendResult> {
+            self.replies_sent.lock().unwrap().push(reply_to);
             self.media_sent.lock().unwrap().push((
                 chat_id,
                 caption.to_string(),
@@ -3636,6 +3814,7 @@ pub mod mock {
             Ok(SendResult {
                 message_id: 54321,
                 chat_id,
+                reply_to_message_id: reply_to,
                 elements: Some(MediaElements {
                     delivered: (0..files.len())
                         .map(|index| DeliveredElement {
@@ -3720,6 +3899,49 @@ pub mod mock {
         async fn mark_chat_as_unread(&self, _chat_id: i64) -> Result<()> {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+
+    fn replying_to(message_id: i64) -> tdlib_rs::enums::MessageReplyTo {
+        tdlib_rs::enums::MessageReplyTo::Message(tdlib_rs::types::MessageReplyToMessage {
+            message_id,
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn reply_target_is_the_same_chat_form_or_nothing() {
+        assert!(reply_target(None).is_none());
+        match reply_target(Some(37 << 20)) {
+            Some(tdlib_rs::enums::InputMessageReplyTo::Message(m)) => {
+                assert_eq!(m.message_id, 37 << 20);
+                assert!(m.quote.is_none());
+                assert_eq!(m.checklist_task_id, 0);
+            }
+            other => panic!("expected a same-chat message reply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reply_is_confirmed_only_when_tdlib_attached_the_one_asked_for() {
+        let asked = Some(37 << 20);
+        assert_eq!(
+            confirmed_reply_to(Some(&replying_to(37 << 20)), asked),
+            Some(37 << 20)
+        );
+        // TDLib's answer to a target it cannot honour is an UNTHREADED message:
+        // that must read as "not confirmed", never as the reply that was asked for.
+        assert_eq!(confirmed_reply_to(None, asked), None);
+        assert_eq!(
+            confirmed_reply_to(Some(&replying_to(38 << 20)), asked),
+            None
+        );
+        // An ordinary send confirms nothing, whatever the message carries.
+        assert_eq!(confirmed_reply_to(Some(&replying_to(37 << 20)), None), None);
     }
 }
 

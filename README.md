@@ -241,7 +241,7 @@ which elements arrived instead of assuming none did. Every other failure has no
 `send` rejects unknown `args` keys rather than ignoring them:
 
 ```json
-{"id": "1", "ok": false, "error": "invalid args: unknown field `x`, expected one of `message`, `name`, `id`, `to`, `group`, `parse_mode`, `files`"}
+{"id": "1", "ok": false, "error": "invalid args: unknown field `x`, expected one of `message`, `name`, `id`, `to`, `group`, `parse_mode`, `files`, `reply_to`"}
 ```
 
 The other commands still ignore unknown keys. For a recipient or identity field, a silent drop
@@ -373,6 +373,39 @@ caller "this was a media send".
 
 A daemon that predates attachments refuses the key loudly — "unknown field \`files\`" — and
 delivers nothing, so no capability probe is needed.
+
+#### `send` as a reply (since 0.7.0)
+
+`args.reply_to` sends the message — text, one file or an album — as a **native Telegram reply** to
+a message already in the destination chat:
+
+```json
+{"id": "1", "cmd": "send", "args": {"message": "Thanks, fixed.", "id": -1009876543210, "reply_to": 962592768}}
+-> {"id": "1", "ok": true, "result": {"message_id": 963641344, "chat_id": -1009876543210, "reply_to_message_id": 962592768}}
+```
+
+- `reply_to` is a **TDLib message id**: `server_id << 20`, exactly what `tg messages` and `tg sync`
+  print as `id`. It is never the bare server id a `t.me/c/…/918` link shows; a value that is not
+  a positive multiple of 2^20 is refused before the recipient is resolved (`invalid reply_to …`).
+- The target must be in **the chat being sent to**. A TDLib message id only means something within
+  its chat, and the same number can name an unrelated message elsewhere, so `send` proves the
+  target first — `getMessage` in that chat, then `messageProperties.can_be_replied` — and refuses
+  with `reply_to message … is not accessible in chat …` (or `cannot be replied to`) having sent
+  nothing. The check exists because TDLib does not refuse a reply it cannot honour: it sends the
+  message anyway, unthreaded. It is bounded at 10s (a target TDLib has not cached is fetched
+  over the network) and refuses on expiry, again having sent nothing.
+- `result.reply_to_message_id` is present only when TDLib **confirmed** it attached that reply —
+  read from the message the server accepted on a text send, from the first queued element on a
+  media send. A send that asked for a reply and came back without the key may have been delivered
+  as an ordinary message.
+- A client can prove a daemon carries `reply_to` without sending anything: a recipient-less
+  request with `"reply_to": 1` is answered `invalid reply_to 1: …` by 0.7.0 and later, but
+  `unknown field` (0.4.6-0.6.x) or the missing-recipient error (older, which drop the field).
+- Absent `reply_to` is an ordinary send, byte-identical to before. The CLI has no flag for it;
+  like `files`, it is a socket-protocol feature.
+
+A daemon that predates replies refuses the key loudly — "unknown field \`reply_to\`" — and
+delivers nothing.
 
 ### One-shot bulk sync
 
