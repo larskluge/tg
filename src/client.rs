@@ -331,6 +331,10 @@ enum SendOutcome {
         old_message_id: i64,
         message_id: i64,
         chat_id: i64,
+        /// The message the SERVER-accepted copy replies to, if any. Read from the
+        /// confirmation, not the pending copy, because a reply TDLib queued can be
+        /// dropped by the time the upload lands.
+        reply_to: Option<i64>,
     },
     Failed {
         old_message_id: i64,
@@ -347,6 +351,7 @@ fn send_outcome(update: tdlib_rs::enums::Update) -> Option<SendOutcome> {
             old_message_id: u.old_message_id,
             message_id: u.message.id,
             chat_id: u.message.chat_id,
+            reply_to: replied_message_id(u.message.reply_to.as_ref()),
         }),
         Update::MessageSendFailed(u) => Some(SendOutcome::Failed {
             old_message_id: u.old_message_id,
@@ -394,6 +399,9 @@ async fn await_send_confirmations<T: Clone>(
     // elements share a chat, but the lowest index wins so that a partial whose
     // first element failed still reports the chat Telegram named.
     let mut chat_id_from: Option<usize> = None;
+    // What the first element — the one carrying the caption, the one a reader sees
+    // as the reply — replies to, as the server accepted it.
+    let mut first_reply_to: Option<i64> = None;
 
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -445,6 +453,7 @@ async fn await_send_confirmations<T: Clone>(
                 old_message_id,
                 message_id,
                 chat_id,
+                reply_to,
             } => {
                 let Some(i) = pending.iter().position(|id| *id == old_message_id) else {
                     continue;
@@ -452,6 +461,9 @@ async fn await_send_confirmations<T: Clone>(
                 if chat_id_from.is_none_or(|seen| i < seen) {
                     result_chat_id = chat_id;
                     chat_id_from = Some(i);
+                }
+                if i == 0 && states[0] == ElementState::Pending {
+                    first_reply_to = reply_to;
                 }
                 (i, ElementState::Delivered(message_id))
             }
@@ -499,7 +511,9 @@ async fn await_send_confirmations<T: Clone>(
     Ok(SendResult {
         message_id,
         chat_id: result_chat_id,
-        reply_to_message_id: None,
+        // Raw: what the accepted first element replies to. The caller, which knows
+        // what was ASKED, turns this into a confirmation (`confirmed_reply_to`).
+        reply_to_message_id: first_reply_to,
         elements: Some(summarise(&states)),
     })
 }
@@ -1019,6 +1033,15 @@ fn reply_target(reply_to: Option<i64>) -> Option<tdlib_rs::enums::InputMessageRe
 /// "replied" about that message would be told something false.
 fn confirmed_reply(message: &tdlib_rs::types::Message, asked: Option<i64>) -> Option<i64> {
     confirmed_reply_to(message.reply_to.as_ref(), asked)
+}
+
+/// The id of the message a message replies to, when it is a same-kind message
+/// reply (a story reply is not one this crate sends).
+fn replied_message_id(attached: Option<&tdlib_rs::enums::MessageReplyTo>) -> Option<i64> {
+    match attached {
+        Some(tdlib_rs::enums::MessageReplyTo::Message(r)) => Some(r.message_id),
+        _ => None,
+    }
 }
 
 fn confirmed_reply_to(
@@ -2979,9 +3002,6 @@ impl TelegramClient for TdLibClient {
 
         let names: Vec<String> = files.iter().map(MediaFile::display_name).collect();
 
-        // Read off the FIRST element, the one carrying the caption: that is the
-        // message a reader sees as the reply, whether it is one file or an album.
-        let replied;
         let pending: Vec<i64> = if is_album(contents.len()) {
             let messages = unwrap_messages(
                 tdlib_rs::functions::send_message_album(
@@ -2995,11 +3015,6 @@ impl TelegramClient for TdLibClient {
                 .await
                 .map_err(|e| TgError::TdLib(e.message))?,
             );
-            replied = messages
-                .messages
-                .first()
-                .and_then(Option::as_ref)
-                .and_then(|m| confirmed_reply(m, reply_to));
             let mut ids = Vec::with_capacity(files.len());
             for (i, message) in messages.messages.iter().enumerate() {
                 let Some(message) = message else {
@@ -3064,7 +3079,6 @@ impl TelegramClient for TdLibClient {
                 .await
                 .map_err(|e| TgError::TdLib(e.message))?,
             );
-            replied = confirmed_reply(&message, reply_to);
             vec![message.id]
         };
 
@@ -3077,7 +3091,13 @@ impl TelegramClient for TdLibClient {
             tokio::time::Duration::from_secs(MEDIA_SEND_TIMEOUT_SECS),
         )
         .await
-        .map(|result| result.replying(replied))
+        // Confirmed from the server-accepted first element (see
+        // `await_send_confirmations`), never the queued copy: the upload can take
+        // minutes, and a reply dropped in that window must read as unconfirmed.
+        .map(|result| {
+            let accepted = result.reply_to_message_id;
+            result.replying(reply_to.filter(|asked| accepted == Some(*asked)))
+        })
     }
 
     async fn get_messages(
@@ -4985,6 +5005,16 @@ mod tests {
             old_message_id: old,
             message_id: new,
             chat_id: chat,
+            reply_to: None,
+        }
+    }
+
+    fn succeeded_replying(old: i64, new: i64, chat: i64, reply_to: Option<i64>) -> SendOutcome {
+        SendOutcome::Succeeded {
+            old_message_id: old,
+            message_id: new,
+            chat_id: chat,
+            reply_to,
         }
     }
 
@@ -5046,6 +5076,64 @@ mod tests {
             Duration::from_millis(timeout_ms),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn media_wait_reports_the_reply_the_server_accepted_on_the_first_element() {
+        // The reply is read off the ACCEPTED first element — the caption carrier —
+        // whatever the other elements say, and in whatever order they confirm.
+        let res = await_outcomes(
+            vec![
+                succeeded_replying(-2, 901, 42, None),
+                succeeded_replying(-1, 900, 42, Some(962_592_768)),
+            ],
+            16,
+            &[-1, -2],
+            500,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.reply_to_message_id, Some(962_592_768));
+
+        // A first element the server accepted UNTHREADED reports no reply, even
+        // though a later element kept one: the reader sees the first as the reply.
+        let res = await_outcomes(
+            vec![
+                succeeded_replying(-1, 900, 42, None),
+                succeeded_replying(-2, 901, 42, Some(962_592_768)),
+            ],
+            16,
+            &[-1, -2],
+            500,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.reply_to_message_id, None);
+
+        // A re-announced confirmation does not overwrite the first one.
+        let res = await_outcomes(
+            vec![
+                succeeded_replying(-1, 900, 42, None),
+                succeeded_replying(-1, 900, 42, Some(962_592_768)),
+            ],
+            16,
+            &[-1],
+            500,
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.reply_to_message_id, None);
+    }
+
+    #[test]
+    fn replied_message_id_reads_only_message_replies() {
+        let reply =
+            tdlib_rs::enums::MessageReplyTo::Message(tdlib_rs::types::MessageReplyToMessage {
+                message_id: 962_592_768,
+                ..Default::default()
+            });
+        assert_eq!(replied_message_id(Some(&reply)), Some(962_592_768));
+        assert_eq!(replied_message_id(None), None);
     }
 
     #[tokio::test]

@@ -395,9 +395,9 @@ a message already in the destination chat:
   message anyway, unthreaded. It is bounded at 10s (a target TDLib has not cached is fetched
   over the network) and refuses on expiry, again having sent nothing.
 - `result.reply_to_message_id` is present only when TDLib **confirmed** it attached that reply —
-  read from the message the server accepted on a text send, from the first queued element on a
-  media send. A send that asked for a reply and came back without the key may have been delivered
-  as an ordinary message.
+  read from the message the server accepted: on a media send, from the first element's
+  confirmation once its upload lands, never from the queued copy. A send that asked for a reply
+  and came back without the key may have been delivered as an ordinary message.
 - A client can prove a daemon carries `reply_to` without sending anything: a recipient-less
   request with `"reply_to": 1` is answered `invalid reply_to 1: …` by 0.7.0 and later, but
   `unknown field` (0.4.6-0.6.x) or the missing-recipient error (older, which drop the field).
