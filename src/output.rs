@@ -746,6 +746,13 @@ pub struct MessageInfo {
     pub download_files: Vec<MessageFileRef>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<MessageContentDetails>,
+    /// The id of the message this one replies to, in THIS message's chat. Absent
+    /// for a non-reply, and also for a reply this chat cannot resolve: a reply to
+    /// a message in another chat, into an unknown chat, or to a story. A consumer
+    /// keys a Telegram message on (chat_id, id), so a bare id pointing into another
+    /// chat would thread the reply onto an unrelated message (`reply_in_chat`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<i64>,
 }
 
 impl PlainText for MessageInfo {
@@ -1120,6 +1127,7 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         };
         let text = msg.to_plain_text();
         assert!(text.contains("2024-01-01 12:00"));
@@ -1145,6 +1153,7 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         };
         let text = msg.to_plain_text();
         assert!(text.contains("You"));
@@ -1168,6 +1177,7 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"sender_is_bot\":true"));
@@ -1191,6 +1201,7 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"sender_is_bot\":null"));
@@ -1252,6 +1263,7 @@ mod tests {
             is_downloadable: true,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         }];
 
         print_messages_table(&msgs);
@@ -1274,6 +1286,7 @@ mod tests {
             is_downloadable: true,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         }];
 
         let table = messages_table_string(&msgs);
@@ -1324,6 +1337,7 @@ mod tests {
                 file_name: Some("song.mp3".to_string()),
                 mime_type: Some("audio/mpeg".to_string()),
             }),
+            reply_to_message_id: None,
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -1352,6 +1366,7 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"sender_id\":null"));
@@ -1375,6 +1390,7 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         };
         let text = msg.to_plain_text();
         assert!(text.contains("Tech Channel"));
@@ -1438,6 +1454,7 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("edit_date"));
@@ -1460,9 +1477,71 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"edit_date\":\"2024-01-01T00:05:00Z\""));
+    }
+
+    fn replying(reply_to_message_id: Option<i64>) -> MessageInfo {
+        MessageInfo {
+            id: 89_508_544_512,
+            chat_id: -1_001_666_847_309,
+            sender_id: Some(300),
+            sender: "Alice".to_string(),
+            sender_is_bot: Some(false),
+            text: "Agreed".to_string(),
+            date: "2024-01-01T00:00:00Z".to_string(),
+            timestamp: 0,
+            is_outgoing: false,
+            edit_date: None,
+            content_type: Some("text".to_string()),
+            is_downloadable: false,
+            download_files: vec![],
+            content: None,
+            reply_to_message_id,
+        }
+    }
+
+    #[test]
+    fn message_info_json_carries_the_reply_target() {
+        // Mycelium threads Telegram messages by reading exactly this key.
+        let json = serde_json::to_value(replying(Some(89_495_961_500))).unwrap();
+        assert_eq!(json["reply_to_message_id"], 89_495_961_500_i64);
+    }
+
+    #[test]
+    fn message_info_json_omits_the_reply_target_of_a_non_reply() {
+        let json = serde_json::to_value(replying(None)).unwrap();
+        assert!(json.get("reply_to_message_id").is_none());
+    }
+
+    #[test]
+    fn message_info_reply_target_survives_the_serve_proxy() {
+        // `tg messages` / `tg sync` inside the container answer through the serve
+        // daemon, so the CLI DESERIALISES the daemon's messages and prints them
+        // again: a field the struct does not read is silently dropped there.
+        let daemon = serde_json::to_string(&replying(Some(89_495_961_500))).unwrap();
+        let proxied: MessageInfo = serde_json::from_str(&daemon).unwrap();
+        assert_eq!(proxied.reply_to_message_id, Some(89_495_961_500));
+    }
+
+    #[test]
+    fn message_info_from_a_daemon_without_reply_targets_reads_as_no_reply() {
+        // Payload from a `tg serve` older than 0.8.0: the key is absent.
+        let json = r#"{
+            "id": 1,
+            "chat_id": 123,
+            "sender_id": 400,
+            "sender": "John",
+            "sender_is_bot": false,
+            "text": "Hello!",
+            "date": "2024-01-01 12:00",
+            "is_outgoing": false,
+            "is_downloadable": false
+        }"#;
+        let msg: MessageInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(msg.reply_to_message_id, None);
     }
 
     #[test]

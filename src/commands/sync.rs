@@ -199,6 +199,7 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         }
     }
 

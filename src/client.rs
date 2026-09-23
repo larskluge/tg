@@ -351,7 +351,7 @@ fn send_outcome(update: tdlib_rs::enums::Update) -> Option<SendOutcome> {
             old_message_id: u.old_message_id,
             message_id: u.message.id,
             chat_id: u.message.chat_id,
-            reply_to: replied_message_id(u.message.reply_to.as_ref()),
+            reply_to: reply_in_chat(u.message.chat_id, u.message.reply_to.as_ref()),
         }),
         Update::MessageSendFailed(u) => Some(SendOutcome::Failed {
             old_message_id: u.old_message_id,
@@ -1032,28 +1032,29 @@ fn reply_target(reply_to: Option<i64>) -> Option<tdlib_rs::enums::InputMessageRe
 /// it cannot honour by sending the message unthreaded — and a caller told
 /// "replied" about that message would be told something false.
 fn confirmed_reply(message: &tdlib_rs::types::Message, asked: Option<i64>) -> Option<i64> {
-    confirmed_reply_to(message.reply_to.as_ref(), asked)
+    confirmed_reply_to(message.chat_id, message.reply_to.as_ref(), asked)
 }
 
-/// The id of the message a message replies to, when it is a same-kind message
-/// reply (a story reply is not one this crate sends).
-fn replied_message_id(attached: Option<&tdlib_rs::enums::MessageReplyTo>) -> Option<i64> {
+/// The id of the message a message in `chat_id` replies to, when that message is
+/// in the same chat. A cross-chat reply (TDLib's `chat_id` names another chat),
+/// one into an unknown chat (both ids 0) and a story reply have no target here:
+/// a message is keyed on (chat_id, message_id), so another chat's id reported
+/// bare would name an unrelated message of this one.
+fn reply_in_chat(chat_id: i64, attached: Option<&tdlib_rs::enums::MessageReplyTo>) -> Option<i64> {
     match attached {
-        Some(tdlib_rs::enums::MessageReplyTo::Message(r)) => Some(r.message_id),
+        Some(tdlib_rs::enums::MessageReplyTo::Message(r)) if r.chat_id == chat_id => {
+            Some(r.message_id)
+        }
         _ => None,
     }
 }
 
 fn confirmed_reply_to(
+    chat_id: i64,
     attached: Option<&tdlib_rs::enums::MessageReplyTo>,
     asked: Option<i64>,
 ) -> Option<i64> {
-    match (attached, asked) {
-        (Some(tdlib_rs::enums::MessageReplyTo::Message(r)), Some(id)) if r.message_id == id => {
-            Some(id)
-        }
-        _ => None,
-    }
+    asked.filter(|&id| reply_in_chat(chat_id, attached) == Some(id))
 }
 
 // Helper to extract Chats fields from the enum
@@ -2555,6 +2556,7 @@ impl MessageHistorySource for TdLibClient {
                 is_downloadable: extracted.is_downloadable,
                 download_files: extracted.download_files,
                 content: extracted.content,
+                reply_to_message_id: reply_in_chat(msg.chat_id, msg.reply_to.as_ref()),
             });
         }
         Ok(result)
@@ -3675,6 +3677,7 @@ pub mod mock {
                         is_downloadable: false,
                         download_files: vec![],
                         content: None,
+                        reply_to_message_id: None,
                     },
                     MessageInfo {
                         id: 2,
@@ -3691,6 +3694,7 @@ pub mod mock {
                         is_downloadable: false,
                         download_files: vec![],
                         content: None,
+                        reply_to_message_id: None,
                     },
                 ],
             }
@@ -3926,11 +3930,54 @@ pub mod mock {
 mod reply_tests {
     use super::*;
 
-    fn replying_to(message_id: i64) -> tdlib_rs::enums::MessageReplyTo {
+    const CHAT: i64 = -1_001_666_847_309;
+
+    fn reply_in(chat_id: i64, message_id: i64) -> tdlib_rs::enums::MessageReplyTo {
         tdlib_rs::enums::MessageReplyTo::Message(tdlib_rs::types::MessageReplyToMessage {
+            chat_id,
             message_id,
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn a_same_chat_reply_names_the_replied_message() {
+        assert_eq!(
+            reply_in_chat(CHAT, Some(&reply_in(CHAT, 89_495_961_500))),
+            Some(89_495_961_500)
+        );
+    }
+
+    #[test]
+    fn a_message_that_replies_to_nothing_has_no_reply_target() {
+        assert_eq!(reply_in_chat(CHAT, None), None);
+    }
+
+    #[test]
+    fn a_cross_chat_reply_has_no_reply_target_in_this_chat() {
+        // A reply to a message in ANOTHER chat (the Replies chat, a quote from
+        // elsewhere): its id means nothing in this chat, and a consumer keying
+        // messages on (chat_id, message_id) would thread it onto whatever message
+        // of this chat happens to share the number.
+        assert_eq!(
+            reply_in_chat(CHAT, Some(&reply_in(-1_001_000_000_001, 42))),
+            None
+        );
+    }
+
+    #[test]
+    fn a_reply_into_an_unknown_chat_has_no_reply_target() {
+        // TDLib reports both ids as 0 when the replied message's chat is unknown.
+        assert_eq!(reply_in_chat(CHAT, Some(&reply_in(0, 0))), None);
+    }
+
+    #[test]
+    fn a_story_reply_has_no_reply_target() {
+        let story = tdlib_rs::enums::MessageReplyTo::Story(tdlib_rs::types::MessageReplyToStory {
+            story_poster_chat_id: CHAT,
+            story_id: 7,
+        });
+        assert_eq!(reply_in_chat(CHAT, Some(&story)), None);
     }
 
     #[test]
@@ -3950,18 +3997,27 @@ mod reply_tests {
     fn a_reply_is_confirmed_only_when_tdlib_attached_the_one_asked_for() {
         let asked = Some(37 << 20);
         assert_eq!(
-            confirmed_reply_to(Some(&replying_to(37 << 20)), asked),
+            confirmed_reply_to(CHAT, Some(&reply_in(CHAT, 37 << 20)), asked),
             Some(37 << 20)
         );
         // TDLib's answer to a target it cannot honour is an UNTHREADED message:
         // that must read as "not confirmed", never as the reply that was asked for.
-        assert_eq!(confirmed_reply_to(None, asked), None);
+        assert_eq!(confirmed_reply_to(CHAT, None, asked), None);
         assert_eq!(
-            confirmed_reply_to(Some(&replying_to(38 << 20)), asked),
+            confirmed_reply_to(CHAT, Some(&reply_in(CHAT, 38 << 20)), asked),
+            None
+        );
+        // The asked id is one in the destination chat; the same number in another
+        // chat is another message (`reply_in_chat`).
+        assert_eq!(
+            confirmed_reply_to(CHAT, Some(&reply_in(-1_001_000_000_001, 37 << 20)), asked),
             None
         );
         // An ordinary send confirms nothing, whatever the message carries.
-        assert_eq!(confirmed_reply_to(Some(&replying_to(37 << 20)), None), None);
+        assert_eq!(
+            confirmed_reply_to(CHAT, Some(&reply_in(CHAT, 37 << 20)), None),
+            None
+        );
     }
 }
 
@@ -4579,6 +4635,7 @@ mod tests {
             is_downloadable: false,
             download_files: vec![],
             content: None,
+            reply_to_message_id: None,
         }
     }
 
@@ -5123,17 +5180,6 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(res.reply_to_message_id, None);
-    }
-
-    #[test]
-    fn replied_message_id_reads_only_message_replies() {
-        let reply =
-            tdlib_rs::enums::MessageReplyTo::Message(tdlib_rs::types::MessageReplyToMessage {
-                message_id: 962_592_768,
-                ..Default::default()
-            });
-        assert_eq!(replied_message_id(Some(&reply)), Some(962_592_768));
-        assert_eq!(replied_message_id(None), None);
     }
 
     #[tokio::test]

@@ -444,6 +444,27 @@ Every JSON surface carries Telegram's own bot flag, so consumers never have to g
 
 The value is `true` or `false` when `tg` could determine it, and `null` when it could not. `null` means unknown, never "not a bot": the sender's user object was unreadable (the same case that leaves `sender` as `"Unknown"`), the chat has no single user counterpart (groups and channels), or the payload came from a `tg` older than 0.4.4. A message sent by a channel or group rather than by a user account is `false` — a chat sender carries no bot marker either way. Deleted and inaccessible accounts also report `false`: Telegram reports them as `userTypeDeleted`/`userTypeUnknown` and no longer says whether they were bots.
 
+### Reply targets (since 0.8.0)
+
+Each message from `tg messages --json`, `tg sync` and the server's `messages`/`sync` carries
+`reply_to_message_id` when it is a native reply to another message **in the same chat**:
+
+```json
+{"id": 963641344, "chat_id": -1009876543210, "reply_to_message_id": 962592768, ...}
+```
+
+The id is a TDLib message id in the message's own `chat_id`, so `(chat_id, reply_to_message_id)`
+names the replied message. The key is **absent** for a message that is not a reply, and also for a
+reply that cannot be named that way:
+
+- a reply to a message in **another chat** (TDLib's `messageReplyToMessage.chat_id` differs — the
+  Replies chat, a quote from elsewhere). The bare id would name an unrelated message of this chat
+  to any consumer that keys messages on `(chat_id, id)`, so it is dropped rather than reported.
+- a reply into an **unknown chat** (TDLib reports both ids as `0`).
+- a reply to a **story** (`messageReplyToStory`): a story is not a message.
+
+A payload from a `tg` older than 0.8.0 never carries the key, reply or not.
+
 ## Testing
 
 ```bash

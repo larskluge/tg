@@ -134,6 +134,18 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 
 **TDLib `getChatMessageByDate` direction:** It returns the last message sent **no later than** the given date — the returned message's date is always `<= date` — and a **404** when the chat has no such message. It does not find the first message *after* a date. To turn a `--since-utc` cutoff into a fetch boundary, probe at `cutoff - 1` and use the returned message's `id + 1` as an exclusive lower bound (`boundary_probe_date` / `boundary_from_probe` in `client.rs`). Reading it as "at or after the date" makes the lookup silently never match.
 
+**TDLib `message.reply_to` names a chat, not just a message (since 0.8.0):**
+`messageReplyToMessage { chat_id, message_id, … }` — `chat_id` is the chat of the *replied*
+message. For an ordinary reply it equals the message's own `chat_id` (measured against 1.8.61:
+33 replies across 3 groups, zero mismatches); it differs for a cross-chat reply (the Replies chat,
+a quote from elsewhere), and both ids are `0` when that chat is unknown. A message id is only
+meaningful with its chat, and Mycelium keys Telegram messages on `(chat_id, message_id)`, so
+`reply_in_chat` is the ONE reader of `reply_to`: it yields the id only for a same-chat message
+reply and `None` for cross-chat, unknown-chat and story replies. Listing (`reply_to_message_id`
+on every `MessageInfo`) and send confirmation both go through it; never read
+`r.message_id` bare. A cross-chat reply is dropped rather than exported with its chat, because
+the one consumer reads the bare id.
+
 **TDLib HTML parse mode is not HTML:** `textParseModeHTML` accepts only Telegram's tag
 whitelist — `b`/`strong`, `i`/`em`, `u`/`ins`, `s`/`strike`/`del`, `a href`, `code`, `pre`
 (+ `code class="language-x"`), `blockquote` (optionally `expandable`), `tg-spoiler`,
