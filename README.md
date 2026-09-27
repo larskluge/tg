@@ -421,6 +421,9 @@ echo '{"123": 0, "-1001666847309": 0}' | tg sync --reconcile-days 7
 
 # Limit messages per chat (default: 1000)
 echo '{"123": 0}' | tg sync --limit 500
+
+# Oldest-first: the OLDEST 100 messages above each HWM, ascending
+echo '{"123": 42, "-1001666847309": 0}' | tg sync --oldest-first --limit 100
 ```
 
 Output is always JSON, keyed by chat ID. Each value is an array of messages or an error object:
@@ -434,6 +437,35 @@ Output is always JSON, keyed by chat ID. Each value is an array of messages or a
 ```
 
 The HWM boundary message itself is excluded from results (it was already consumed). Exit code is 0 if all chats succeeded, 1 if any chat had an error (successful results are still in the output).
+
+#### Which messages: `--oldest-first`
+
+By default each chat's array holds the **newest** `--limit` messages above the HWM, newest
+first. With more than `--limit` messages above the HWM, the older ones are not returned at
+all — so a caller that advances its HWM to the highest id it received skips them for good
+(a 2-hour outage with 250 new messages loses 150; a chat synced from HWM `0` only ever gets
+its newest `--limit`).
+
+`--oldest-first` (socket: `"oldest_first": true`) returns the **oldest** `--limit` messages
+with id > HWM instead, in **ascending** id order. HWM `0` starts at the chat's first message.
+Advancing the HWM to the last id returned and asking again pages through any gap without
+losing a message; an empty array means the chat is caught up. Memory is bounded by `--limit`
+per chat — it steps forward through TDLib's history rather than loading the gap, unlike
+`tg messages --oldest-first`, which reads the whole window.
+
+```bash
+echo '{"-1001666847309": 89508544512}' | tg sync --oldest-first --limit 100
+# → {"-1001666847309": [{"id": 89509593088, ...}, {"id": 89510641664, ...}, ...]}  ascending
+```
+
+```json
+{"id": "1", "cmd": "sync", "args": {"hwm": {"-1001666847309": 89508544512}, "limit": 100, "oldest_first": true}}
+```
+
+`--oldest-first` cannot be combined with `--reconcile-days` (a reconcile sweep is
+newest-first by design): the CLI rejects the pair, and the socket answers `ok: false`.
+`sync` does not reject unknown `args` keys, so a daemon older than 0.9.0 ignores
+`oldest_first` and answers newest-first — check `tg --version` before relying on it.
 
 ### Bot markers
 

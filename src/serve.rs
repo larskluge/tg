@@ -507,6 +507,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_sync_oldest_first_returns_ascending_messages() {
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "12",
+                "sync",
+                json!({"hwm": {"1": 0}, "limit": 1, "oldest_first": true}),
+            ),
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        let chat = res.result.unwrap()["1"].clone();
+        let ids: Vec<i64> = chat
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_i64().unwrap())
+            .collect();
+        let oldest = client.messages.iter().map(|m| m.id).min().unwrap();
+        assert_eq!(ids, vec![oldest]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_sync_refuses_oldest_first_with_reconcile_days() {
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "13",
+                "sync",
+                json!({"hwm": {"1": 0}, "oldest_first": true, "reconcile_days": 7}),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        assert!(res.error.unwrap().contains("oldest_first"));
+    }
+
+    #[tokio::test]
     async fn dispatch_other_commands_still_ignore_unknown_args() {
         // Only `send` is strict. `whoami` in particular backs the container's
         // health check, so tightening the rest has to be a conscious act.

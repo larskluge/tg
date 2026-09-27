@@ -228,6 +228,7 @@ async fn route_via_serve(command: Command, stream: UnixStream, format: OutputFor
                 hwm,
                 limit: args.limit,
                 reconcile_days: args.reconcile_days,
+                oldest_first: args.oldest_first,
             };
             let results: HashMap<String, sync::SyncResult> =
                 serve_client::send_request(stream, "sync", req).await?;
@@ -553,6 +554,7 @@ async fn run_command(
         }
 
         Command::Sync(args) => {
+            let mode = sync::SyncMode::new(args.reconcile_days, args.oldest_first)?;
             client.start().await?;
             client.wait_for_sync().await;
 
@@ -566,7 +568,7 @@ async fn run_command(
             };
 
             let hwm_map = sync::parse_hwm_input(&input).map_err(TgError::Other)?;
-            let results = sync::sync_chats(client, hwm_map, args.limit, args.reconcile_days).await;
+            let results = sync::sync_chats(client, hwm_map, args.limit, mode).await;
 
             let has_errors = results
                 .values()

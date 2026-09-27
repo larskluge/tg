@@ -212,6 +212,12 @@ pub struct SyncArgs {
     /// Maximum messages per chat
     #[arg(long, default_value = "1000")]
     pub limit: i32,
+
+    /// Return the OLDEST `--limit` messages above each HWM, oldest first,
+    /// instead of the newest ones; HWM 0 starts at the chat's first message.
+    /// Page a gap by re-running with the last id returned as the new HWM.
+    #[arg(long, conflicts_with = "reconcile_days")]
+    pub oldest_first: bool,
 }
 
 #[cfg(test)]
@@ -838,6 +844,34 @@ mod tests {
             }
             _ => panic!("Expected Sync command"),
         }
+    }
+
+    #[test]
+    fn parse_sync_oldest_first() {
+        let cli = Cli::parse_from(["tg", "sync", "--oldest-first", "--limit", "100"]);
+        match cli.command {
+            Command::Sync(args) => {
+                assert!(args.oldest_first);
+                assert_eq!(args.limit, 100);
+            }
+            _ => panic!("Expected Sync command"),
+        }
+    }
+
+    #[test]
+    fn parse_sync_defaults_to_newest_first() {
+        let cli = Cli::parse_from(["tg", "sync"]);
+        match cli.command {
+            Command::Sync(args) => assert!(!args.oldest_first),
+            _ => panic!("Expected Sync command"),
+        }
+    }
+
+    #[test]
+    fn parse_sync_oldest_first_conflicts_with_reconcile_days() {
+        let err = Cli::try_parse_from(["tg", "sync", "--oldest-first", "--reconcile-days", "7"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

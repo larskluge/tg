@@ -129,6 +129,19 @@ pub trait TelegramClient: Send + Sync {
         until_message_id: Option<i64>,
     ) -> Result<Vec<MessageInfo>>;
 
+    /// Up to `limit` messages with id > `after_message_id` — the OLDEST ones —
+    /// in ascending id order, holding at most `limit` in memory.
+    /// `after_message_id <= 0` starts at the chat's first message.
+    ///
+    /// The forward counterpart of [`TelegramClient::get_messages`], which walks
+    /// newest-first and so returns the NEWEST `limit` above its boundary.
+    async fn get_messages_after(
+        &self,
+        chat_id: i64,
+        after_message_id: i64,
+        limit: i32,
+    ) -> Result<Vec<MessageInfo>>;
+
     /// Find the fetch boundary for `--since-utc` filtering: the lowest message id
     /// that can belong to a message sent at or after `timestamp`.
     async fn get_boundary_message_id(&self, chat_id: i64, timestamp: i32)
@@ -2383,15 +2396,28 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
 
 #[async_trait]
 trait MessageHistorySource: Send + Sync {
-    /// Fetch a batch of messages for `chat_id` older than or at `from_message_id` (0 = latest).
+    /// One TDLib `getChatHistory` call: the window of `chat_id`'s history
+    /// anchored at `from_message_id` (0 = latest). `offset` is 0 for "at or
+    /// older than the anchor", or `-k` (1..=99) to additionally include the `k`
+    /// messages just newer than it; `limit` must then be at least `k`.
     /// Returns messages newest-first. May return fewer than `limit`.
     async fn fetch_batch(
         &self,
         chat_id: i64,
         from_message_id: i64,
+        offset: i32,
         limit: i32,
     ) -> Result<Vec<MessageInfo>>;
 }
+
+/// How many empty `getChatHistory` answers a walker tolerates before deciding
+/// there is nothing to fetch. TDLib answers empty while it is still loading a
+/// window from its database or the server, so one empty answer is not "no
+/// messages".
+const MAX_EMPTY_HISTORY_ATTEMPTS: u32 = 5;
+
+/// Pause between retries of an empty `getChatHistory` answer.
+const EMPTY_HISTORY_RETRY_MS: u64 = 300;
 
 async fn collect_messages_paginated<S: MessageHistorySource>(
     source: &S,
@@ -2403,13 +2429,12 @@ async fn collect_messages_paginated<S: MessageHistorySource>(
     let mut from_message_id: i64 = 0;
     let mut seen_ids = std::collections::HashSet::new();
     let mut empty_attempts = 0;
-    const MAX_EMPTY_ATTEMPTS: u32 = 5;
 
     while result.len() < limit as usize {
         let remaining = (limit - result.len() as i32).min(100);
 
         let msgs: Vec<_> = source
-            .fetch_batch(chat_id, from_message_id, remaining)
+            .fetch_batch(chat_id, from_message_id, 0, remaining)
             .await?
             .into_iter()
             .filter(|m| seen_ids.insert(m.id))
@@ -2417,10 +2442,10 @@ async fn collect_messages_paginated<S: MessageHistorySource>(
 
         if msgs.is_empty() {
             empty_attempts += 1;
-            if empty_attempts >= MAX_EMPTY_ATTEMPTS {
+            if empty_attempts >= MAX_EMPTY_HISTORY_ATTEMPTS {
                 break;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(EMPTY_HISTORY_RETRY_MS)).await;
             continue;
         }
 
@@ -2458,6 +2483,96 @@ async fn collect_messages_paginated<S: MessageHistorySource>(
     Ok(result)
 }
 
+/// The most messages newer than its anchor one `getChatHistory` call can be
+/// asked for: TDLib requires `offset` in `-99..=0` and `limit <= 100`.
+const MAX_FORWARD_OFFSET: i32 = 99;
+
+/// Where a forward walk from the very beginning of a chat anchors: the
+/// smallest server message id (`ServerMessageId(1) << 20`). No message in a
+/// chat's server history is older, so every message is "newer" than it, and it
+/// is a valid server id, which TDLib turns into `messages.getHistory` with
+/// `offset_id = 1` — Telegram's own idiom for reading history from the start.
+/// `0` cannot be used: to `getChatHistory` it means "from the last message".
+const FIRST_SERVER_MESSAGE_ID: i64 = 1 << 20;
+
+/// Collect up to `limit` messages of `chat_id` with id > `after_message_id`,
+/// the OLDEST ones, in ascending id order. `after_message_id <= 0` starts at
+/// the chat's first message.
+///
+/// Memory is bounded by `limit` plus one TDLib window: the walk steps forward
+/// from its cursor and never loads the rest of the gap, unlike
+/// `tg messages --oldest-first`, which reads the whole window and then reverses
+/// it (and OOM-killed a 512M sidecar at ~140k messages).
+///
+/// Each call is `getChatHistory(from = cursor, offset = -99, limit = 100)`:
+/// "the messages just newer than the cursor", newest-first. TDLib builds that
+/// window from its contiguous local history (its iterator stops at a gap and
+/// loads the missing part instead), so the newer messages in an answer are the
+/// ones immediately after the cursor, and advancing the cursor to the newest
+/// of them never skips a message. How many come back is TDLib's choice: an
+/// answer anchored on an existing message spends one step on it, and any
+/// answer may be shorter than asked. Neither matters, because the walk keeps
+/// going until it has `limit` messages or runs out.
+///
+/// Two ways to run out, deliberately told apart:
+/// - an EMPTY answer means TDLib is still loading (or the chat has no
+///   messages): retry, as the newest-first walker does;
+/// - a non-empty answer with nothing newer than the cursor means TDLib
+///   answered from the cursor itself and found nothing after it — the chat's
+///   newest message is reached. Stop at once, with no retry: that is every
+///   idle chat on every sync tick.
+///
+/// Stopping early is never lossy here: the caller's cursor only advances past
+/// messages it was given, so anything not returned now is returned next time.
+async fn collect_messages_forward<S: MessageHistorySource>(
+    source: &S,
+    chat_id: i64,
+    after_message_id: i64,
+    limit: i32,
+) -> Result<Vec<MessageInfo>> {
+    let limit = limit.max(0) as usize;
+    let mut result: Vec<MessageInfo> = Vec::with_capacity(limit);
+    let mut cursor = after_message_id.max(0);
+    let mut empty_attempts = 0;
+
+    while result.len() < limit {
+        let from_message_id = if cursor > 0 {
+            cursor
+        } else {
+            FIRST_SERVER_MESSAGE_ID
+        };
+        let batch = source
+            .fetch_batch(
+                chat_id,
+                from_message_id,
+                -MAX_FORWARD_OFFSET,
+                MAX_FORWARD_OFFSET + 1,
+            )
+            .await?;
+
+        if batch.is_empty() {
+            empty_attempts += 1;
+            if empty_attempts >= MAX_EMPTY_HISTORY_ATTEMPTS {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(EMPTY_HISTORY_RETRY_MS)).await;
+            continue;
+        }
+        empty_attempts = 0;
+
+        let mut newer: Vec<MessageInfo> = batch.into_iter().filter(|m| m.id > cursor).collect();
+        if newer.is_empty() {
+            break;
+        }
+        newer.sort_unstable_by_key(|m| m.id);
+        newer.truncate(limit - result.len());
+        cursor = newer.last().map_or(cursor, |m| m.id);
+        result.extend(newer);
+    }
+
+    Ok(result)
+}
+
 fn get_user_full_name(user: &tdlib_rs::types::User) -> String {
     if user.last_name.is_empty() {
         user.first_name.clone()
@@ -2480,6 +2595,7 @@ impl MessageHistorySource for TdLibClient {
         &self,
         chat_id: i64,
         from_message_id: i64,
+        offset: i32,
         limit: i32,
     ) -> Result<Vec<MessageInfo>> {
         let client_id = self.get_client_id().await?;
@@ -2487,7 +2603,7 @@ impl MessageHistorySource for TdLibClient {
         let msgs_enum = tdlib_rs::functions::get_chat_history(
             chat_id,
             from_message_id,
-            0,
+            offset,
             limit,
             false,
             client_id,
@@ -3111,6 +3227,15 @@ impl TelegramClient for TdLibClient {
         collect_messages_paginated(self, chat_id, limit, until_message_id).await
     }
 
+    async fn get_messages_after(
+        &self,
+        chat_id: i64,
+        after_message_id: i64,
+        limit: i32,
+    ) -> Result<Vec<MessageInfo>> {
+        collect_messages_forward(self, chat_id, after_message_id, limit).await
+    }
+
     async fn get_boundary_message_id(
         &self,
         chat_id: i64,
@@ -3575,6 +3700,8 @@ pub mod mock {
         pub boundary_result: BoundaryResult,
         /// Tracks how many times `get_messages` has been called
         pub get_messages_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Tracks how many times `get_messages_after` has been called
+        pub get_messages_after_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         /// Tracks how many times `get_boundary_message_id` has been called
         pub get_boundary_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         /// Records every send as `(chat_id, text, parse_mode)`
@@ -3654,6 +3781,9 @@ pub mod mock {
                 get_messages_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                     0,
                 )),
+                get_messages_after_call_count: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
                 get_boundary_call_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
                     0,
                 )),
@@ -3875,6 +4005,28 @@ pub mod mock {
                 .take(limit as usize)
                 .cloned()
                 .collect();
+            Ok(msgs)
+        }
+
+        async fn get_messages_after(
+            &self,
+            chat_id: i64,
+            after_message_id: i64,
+            limit: i32,
+        ) -> Result<Vec<MessageInfo>> {
+            self.get_messages_after_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.inaccessible_chat_ids.contains(&chat_id) {
+                return Err(TgError::ChatInaccessible(chat_id));
+            }
+            let mut msgs: Vec<_> = self
+                .messages
+                .iter()
+                .filter(|m| m.id > after_message_id)
+                .cloned()
+                .collect();
+            msgs.sort_unstable_by_key(|m| m.id);
+            msgs.truncate(limit.max(0) as usize);
             Ok(msgs)
         }
 
@@ -4658,6 +4810,7 @@ mod tests {
             &self,
             _chat_id: i64,
             _from_message_id: i64,
+            _offset: i32,
             _limit: i32,
         ) -> Result<Vec<MessageInfo>> {
             let mut batches = self.batches.lock().unwrap();
@@ -4825,6 +4978,356 @@ mod tests {
             vec![10, 9],
             "probe message (id=8) is before the cutoff and must be excluded"
         );
+    }
+
+    // --- collect_messages_forward tests ---
+    //
+    // `WindowedHistory` answers `fetch_batch` the way TDLib's `getChatHistory`
+    // does (td/telegram/OrderedMessage.cpp, `OrderedMessages::get_history`),
+    // rather than replaying scripted batches, so the walker is tested against
+    // the window arithmetic it has to survive:
+    //
+    // - the anchor is the newest message with id <= `from_message_id`;
+    // - an anchor that IS `from_message_id` uses up one of the `-offset` newer
+    //   steps, so only `-offset - 1` strictly newer messages come back;
+    // - `from_message_id` below every message anchors "before the first";
+    // - walking off the newest message shrinks the answer rather than failing;
+    // - TDLib may return fewer than asked (`cap`), dropping the far end of the
+    //   window, and may answer empty while it loads (`empty_answers`).
+    //
+    // It also refuses any call outside TDLib's documented argument contract, so
+    // a walker that asks for `offset <= -100` or `limit < -offset` fails here
+    // rather than against the server.
+
+    /// A TDLib message id for server message `n` (`n << 20`).
+    fn mid(n: i64) -> i64 {
+        n << 20
+    }
+
+    /// More calls than any walk in these tests needs by an order of magnitude.
+    const RUNAWAY_WALK_CALLS: usize = 200;
+
+    struct WindowedHistory {
+        /// The chat's message ids, ascending.
+        ids: Vec<i64>,
+        /// Largest answer TDLib gives; the newest end of the window is dropped.
+        cap: Option<usize>,
+        /// How many calls answer empty before the history "arrives".
+        empty_answers: std::sync::Mutex<usize>,
+        /// Every call as `(from_message_id, offset, limit)`.
+        calls: std::sync::Mutex<Vec<(i64, i32, i32)>>,
+    }
+
+    impl WindowedHistory {
+        fn new(ids: Vec<i64>) -> Self {
+            let mut ids = ids;
+            ids.sort_unstable();
+            Self {
+                ids,
+                cap: None,
+                empty_answers: std::sync::Mutex::new(0),
+                calls: std::sync::Mutex::new(vec![]),
+            }
+        }
+
+        fn capped(mut self, cap: usize) -> Self {
+            self.cap = Some(cap);
+            self
+        }
+
+        fn empty_first(self, n: usize) -> Self {
+            *self.empty_answers.lock().unwrap() = n;
+            self
+        }
+
+        fn calls(&self) -> Vec<(i64, i32, i32)> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        /// The window TDLib returns, newest-first.
+        fn window(&self, from_message_id: i64, offset: i32, limit: i32) -> Vec<i64> {
+            let n = self.ids.len();
+            if n == 0 {
+                return vec![];
+            }
+            let mut steps = (-offset) as usize;
+            let mut limit = limit as usize;
+            // Index of the newest message with id <= from_message_id.
+            let anchor = self.ids.iter().rposition(|&id| id <= from_message_id);
+            let top = match anchor {
+                Some(a) => {
+                    if self.ids[a] == from_message_id {
+                        if steps > 0 {
+                            steps -= 1;
+                        } else {
+                            // offset 0 on an existing message starts strictly older.
+                            if a == 0 {
+                                return vec![];
+                            }
+                            return self.ids[..a].iter().rev().take(limit).copied().collect();
+                        }
+                    }
+                    let top = (a + steps).min(n - 1);
+                    limit -= steps - (top - a);
+                    top
+                }
+                None => {
+                    // Before the first message: walk forward from "nothing".
+                    if steps == 0 {
+                        return vec![];
+                    }
+                    let top = (steps - 1).min(n - 1);
+                    limit -= steps - (top + 1);
+                    top
+                }
+            };
+            let mut out: Vec<i64> = self.ids[..=top].iter().rev().take(limit).copied().collect();
+            if let Some(cap) = self.cap
+                && out.len() > cap
+            {
+                out.drain(..out.len() - cap);
+            }
+            out
+        }
+    }
+
+    #[async_trait]
+    impl MessageHistorySource for WindowedHistory {
+        async fn fetch_batch(
+            &self,
+            _chat_id: i64,
+            from_message_id: i64,
+            offset: i32,
+            limit: i32,
+        ) -> Result<Vec<MessageInfo>> {
+            {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push((from_message_id, offset, limit));
+                // A walk that stops advancing would otherwise hang the test
+                // binary instead of failing the test.
+                if calls.len() > RUNAWAY_WALK_CALLS {
+                    return Err(TgError::TdLib(format!(
+                        "runaway walk: {} calls, last from {from_message_id}",
+                        calls.len()
+                    )));
+                }
+            }
+            // TDLib's argument contract (td_api.tl, getChatHistory).
+            if !(1..=100).contains(&limit) {
+                return Err(TgError::TdLib(format!("limit {limit} out of 1..=100")));
+            }
+            if !(-99..=0).contains(&offset) {
+                return Err(TgError::TdLib(format!("offset {offset} out of -99..=0")));
+            }
+            if limit < -offset {
+                return Err(TgError::TdLib(format!("limit {limit} < -offset {offset}")));
+            }
+            // 0 means "from the last message": a forward walk must never anchor there.
+            if from_message_id <= 0 {
+                return Err(TgError::TdLib(format!(
+                    "forward walk anchored at from_message_id {from_message_id}"
+                )));
+            }
+            {
+                let mut empty = self.empty_answers.lock().unwrap();
+                if *empty > 0 {
+                    *empty -= 1;
+                    return Ok(vec![]);
+                }
+            }
+            Ok(self
+                .window(from_message_id, offset, limit)
+                .into_iter()
+                .map(msg)
+                .collect())
+        }
+    }
+
+    fn ids_of(messages: &[MessageInfo]) -> Vec<i64> {
+        messages.iter().map(|m| m.id).collect()
+    }
+
+    fn mids(range: std::ops::RangeInclusive<i64>) -> Vec<i64> {
+        range.map(mid).collect()
+    }
+
+    #[test]
+    fn windowed_history_models_tdlib_offsets() {
+        // Pin the fake itself, so the walker tests below test against TDLib's
+        // arithmetic and not against a fake that agrees with the walker.
+        let h = WindowedHistory::new(mids(1..=10));
+        // Existing anchor: it uses up one step, so -3 yields 2 strictly newer.
+        assert_eq!(
+            h.window(mid(5), -3, 4),
+            vec![mid(7), mid(6), mid(5), mid(4)]
+        );
+        // Missing anchor (message 5 deleted): -3 yields 3 strictly newer.
+        let h = WindowedHistory::new(vec![mid(1), mid(2), mid(3), mid(4), mid(6), mid(7), mid(8)]);
+        assert_eq!(
+            h.window(mid(5), -3, 4),
+            vec![mid(8), mid(7), mid(6), mid(4)]
+        );
+        // Offset 0 on an existing message is strictly older.
+        let h = WindowedHistory::new(mids(1..=10));
+        assert_eq!(h.window(mid(5), 0, 2), vec![mid(4), mid(3)]);
+        // Walking off the newest message shrinks the answer.
+        assert_eq!(h.window(mid(9), -5, 6), vec![mid(10), mid(9), mid(8)]);
+        // Anchored before the first message.
+        assert_eq!(h.window(1, -3, 4), vec![mid(3), mid(2), mid(1)]);
+    }
+
+    #[tokio::test]
+    async fn forward_returns_the_oldest_limit_messages_when_the_gap_is_wider() {
+        // 150 messages arrived after the HWM; the caller asks for 100. It must
+        // get the OLDEST 100, so its MAX(id) cursor lands on 200 and the next
+        // call picks up 201..=250. Newest-first would return 151..=250 and the
+        // cursor would skip 101..=150 for good.
+        let source = WindowedHistory::new(mids(1..=250));
+        let result = collect_messages_forward(&source, 7, mid(100), 100)
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&result), mids(101..=200));
+    }
+
+    #[tokio::test]
+    async fn forward_pages_the_whole_gap_across_calls() {
+        // What the caller's catch-up loop does: advance the cursor to the last
+        // id returned and ask again, until an answer comes back empty.
+        let source = WindowedHistory::new(mids(1..=250));
+        let mut cursor = mid(100);
+        let mut seen = vec![];
+        for _ in 0..10 {
+            let page = collect_messages_forward(&source, 7, cursor, 60)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            cursor = page.last().unwrap().id;
+            seen.extend(ids_of(&page));
+        }
+        assert_eq!(
+            seen,
+            mids(101..=250),
+            "every message exactly once, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_from_zero_starts_at_the_chats_oldest_message() {
+        // A newly enabled chat (cursor 0) must start at the beginning, not at
+        // the newest `limit` messages.
+        let source = WindowedHistory::new(mids(5..=300));
+        let result = collect_messages_forward(&source, 7, 0, 100).await.unwrap();
+        assert_eq!(ids_of(&result), mids(5..=104));
+        assert_eq!(
+            source.calls()[0].0,
+            mid(1),
+            "anchor below every message: the smallest server message id"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_from_zero_includes_server_message_one() {
+        // A channel's first message is server id 1 — the anchor itself.
+        let source = WindowedHistory::new(mids(1..=10));
+        let result = collect_messages_forward(&source, 7, 0, 3).await.unwrap();
+        assert_eq!(ids_of(&result), mids(1..=3));
+    }
+
+    #[tokio::test]
+    async fn forward_excludes_the_boundary_message() {
+        let source = WindowedHistory::new(mids(1..=20));
+        let result = collect_messages_forward(&source, 7, mid(10), 100)
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&result), mids(11..=20));
+    }
+
+    #[tokio::test]
+    async fn forward_resumes_after_a_deleted_boundary_message() {
+        // The HWM message was deleted since it was ingested: resume right after it.
+        let ids: Vec<i64> = mids(1..=20)
+            .into_iter()
+            .filter(|&id| id != mid(10))
+            .collect();
+        let source = WindowedHistory::new(ids);
+        let result = collect_messages_forward(&source, 7, mid(10), 100)
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&result), mids(11..=20));
+    }
+
+    #[tokio::test]
+    async fn forward_survives_answers_smaller_than_requested() {
+        // TDLib chooses how many messages to return. Short answers must neither
+        // stop the walk early nor leave a hole.
+        let source = WindowedHistory::new(mids(1..=250)).capped(7);
+        let result = collect_messages_forward(&source, 7, mid(100), 100)
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&result), mids(101..=200));
+    }
+
+    #[tokio::test]
+    async fn forward_with_nothing_newer_returns_empty_without_retrying() {
+        // The common steady state: most chats have nothing new on a tick. TDLib
+        // answers from the anchor with nothing after it — that is "caught up",
+        // not "still loading", so it must cost one call and no retry sleeps.
+        let source = WindowedHistory::new(mids(1..=20));
+        let result = collect_messages_forward(&source, 7, mid(20), 100)
+            .await
+            .unwrap();
+        assert!(result.is_empty());
+        assert_eq!(source.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forward_stops_once_it_reaches_the_newest_message() {
+        let source = WindowedHistory::new(mids(1..=20));
+        let result = collect_messages_forward(&source, 7, mid(15), 100)
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&result), mids(16..=20));
+        assert_eq!(
+            source.calls().len(),
+            2,
+            "one call for the messages, one that proves there are no more"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_retries_while_tdlib_is_still_loading() {
+        let source = WindowedHistory::new(mids(1..=20)).empty_first(2);
+        let result = collect_messages_forward(&source, 7, mid(10), 100)
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&result), mids(11..=20));
+    }
+
+    #[tokio::test]
+    async fn forward_gives_up_on_a_chat_that_stays_empty() {
+        let source = WindowedHistory::new(vec![]);
+        let result = collect_messages_forward(&source, 7, 0, 100).await.unwrap();
+        assert!(result.is_empty());
+        assert_eq!(source.calls().len(), MAX_EMPTY_HISTORY_ATTEMPTS as usize);
+    }
+
+    #[tokio::test]
+    async fn forward_limit_smaller_than_a_window_returns_exactly_limit() {
+        let source = WindowedHistory::new(mids(1..=250));
+        let result = collect_messages_forward(&source, 7, mid(100), 3)
+            .await
+            .unwrap();
+        assert_eq!(ids_of(&result), mids(101..=103));
+    }
+
+    #[tokio::test]
+    async fn forward_limit_zero_fetches_nothing() {
+        let source = WindowedHistory::new(mids(1..=10));
+        let result = collect_messages_forward(&source, 7, 0, 0).await.unwrap();
+        assert!(result.is_empty());
+        assert!(source.calls().is_empty());
     }
 
     #[test]

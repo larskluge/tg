@@ -100,6 +100,7 @@ tg mark-read "John Doe"
 tg mark-unread --id 123456789
 echo '{"123": 42, "-1001666847309": 89508544512}' | tg sync [--limit 1000]
 echo '{"123": 0, "-1001666847309": 0}' | tg sync --reconcile-days 7
+echo '{"123": 42, "-1001666847309": 0}' | tg sync --oldest-first --limit 100
 ```
 
 ## Architecture
@@ -131,6 +132,37 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 **TDLib types:** Functions return enums wrapping types (e.g., `tdlib_rs::enums::Chat::Chat(c)` → `tdlib_rs::types::Chat`). Use helper functions like `unwrap_chat()` in client.rs.
 
 **TDLib `getChatHistory` quirk:** May return fewer messages than `limit` on the first call while syncing from the server. Always use a retry+pagination loop: retry on empty responses (up to 5×), and page using the oldest returned message ID as the next `from_message_id`.
+
+**TDLib `getChatHistory` offsets, and walking forward (`tg sync --oldest-first`, since 0.9.0):**
+Read from TDLib's source (`OrderedMessages::get_history` in `td/telegram/OrderedMessage.cpp`,
+`MessagesManager::get_dialog_history`/`get_history_impl`), because the `td_api.tl` one-liner
+("a negative number … to get additionally -offset newer messages") is looser than the code:
+
+- The anchor is the newest message with id `<= from_message_id`. `offset = 0` on an anchor
+  that IS `from_message_id` starts strictly OLDER than it — which is why the newest-first
+  walker can page with the last id it saw and still dedups defensively.
+- `offset = -k` on an existing `from_message_id` spends one of the `k` steps on the anchor
+  itself: `k - 1` strictly newer messages come back, then the anchor, then older ones. With a
+  deleted `from_message_id` all `k` are strictly newer. So `offset = -1` on an existing message
+  returns nothing newer at all — never use it to probe for newer messages.
+- Walking off the chat's newest message shrinks the answer (`limit += offset`) instead of
+  failing; a local gap makes TDLib load from its database or the server and ask again, and the
+  iterator stops at gaps, so the newer messages in an answer are always the run immediately
+  after the anchor. That contiguity is what makes "advance the cursor to the newest id
+  returned" skip nothing.
+- `from_message_id = 0` means "from the last message". To start at a chat's FIRST message,
+  anchor at `1 << 20` (server message id 1): TDLib turns it into `messages.getHistory` with
+  `offset_id = 1`, Telegram's idiom for reading from the start.
+
+`collect_messages_forward` therefore asks `(from = cursor, offset = -99, limit = 100)` every
+time, keeps ids `> cursor`, sorts ascending and stops at `limit`. An EMPTY answer means TDLib is
+still loading (retry, like the newest-first walker); a non-empty answer with nothing newer than
+the cursor means it answered from the anchor and found nothing after it — caught up, stop at
+once. Conflating the two costs every idle chat 1.5 s of retry sleeps per sync, and resetting
+the retry count on such an answer loops forever. Stopping early is never lossy: the caller's
+cursor only moves past messages it was given. Tested against `WindowedHistory`, a fake that
+answers with this window arithmetic (pinned by `windowed_history_models_tdlib_offsets`) rather
+than scripted batches.
 
 **TDLib `getChatMessageByDate` direction:** It returns the last message sent **no later than** the given date — the returned message's date is always `<= date` — and a **404** when the chat has no such message. It does not find the first message *after* a date. To turn a `--since-utc` cutoff into a fetch boundary, probe at `cutoff - 1` and use the returned message's `id + 1` as an exclusive lower bound (`boundary_probe_date` / `boundary_from_probe` in `client.rs`). Reading it as "at or after the date" makes the lookup silently never match.
 

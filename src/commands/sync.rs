@@ -20,6 +20,10 @@ pub struct SyncRequest {
     pub limit: i32,
     #[serde(default)]
     pub reconcile_days: Option<u32>,
+    /// Return the OLDEST `limit` messages above each HWM, ascending, instead
+    /// of the newest `limit`, descending. See [`SyncMode::OldestFirst`].
+    #[serde(default)]
+    pub oldest_first: bool,
 }
 
 impl Default for SyncRequest {
@@ -28,6 +32,42 @@ impl Default for SyncRequest {
             hwm: HashMap::new(),
             limit: default_sync_limit(),
             reconcile_days: None,
+            oldest_first: false,
+        }
+    }
+}
+
+/// Which messages a sync returns for each chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    /// The NEWEST `limit` messages above each HWM, newest-first. The original
+    /// contract, unchanged. With more than `limit` messages above the HWM the
+    /// older ones are not returned at all, so a caller that advances its HWM
+    /// to the highest id it received skips them.
+    NewestFirst,
+    /// The OLDEST `limit` messages above each HWM, oldest-first (ascending
+    /// id), with memory bounded by `limit`. A caller that advances its HWM to
+    /// the last id returned and asks again pages through any gap without
+    /// losing a message. HWM `0` starts at the chat's first message.
+    OldestFirst,
+    /// Every chat from now minus `days`, newest-first; the HWMs are ignored.
+    Reconcile { days: u32 },
+}
+
+impl SyncMode {
+    /// The mode a request's two flags ask for. `oldest_first` with
+    /// `reconcile_days` is refused rather than resolved: a reconcile sweep reads
+    /// newest-first by design, and dropping either flag would answer with a
+    /// window the caller did not ask for.
+    pub fn new(reconcile_days: Option<u32>, oldest_first: bool) -> Result<Self> {
+        match (reconcile_days, oldest_first) {
+            (Some(_), true) => Err(TgError::Other(
+                "oldest_first cannot be combined with reconcile_days (a reconcile sweep is newest-first)"
+                    .to_string(),
+            )),
+            (Some(days), false) => Ok(Self::Reconcile { days }),
+            (None, true) => Ok(Self::OldestFirst),
+            (None, false) => Ok(Self::NewestFirst),
         }
     }
 }
@@ -36,6 +76,7 @@ pub async fn handle<C: TelegramClient>(
     client: &C,
     req: SyncRequest,
 ) -> Result<HashMap<i64, SyncResult>> {
+    let mode = SyncMode::new(req.reconcile_days, req.oldest_first)?;
     let mut hwm_map = HashMap::with_capacity(req.hwm.len());
     for (k, v) in req.hwm {
         let id: i64 = k
@@ -43,7 +84,7 @@ pub async fn handle<C: TelegramClient>(
             .map_err(|_| TgError::Other(format!("Invalid chat ID: {k}")))?;
         hwm_map.insert(id, v);
     }
-    Ok(sync_chats(client, hwm_map, req.limit, req.reconcile_days).await)
+    Ok(sync_chats(client, hwm_map, req.limit, mode).await)
 }
 
 /// Per-chat sync outcome: either messages or an error description.
@@ -52,6 +93,17 @@ pub async fn handle<C: TelegramClient>(
 pub enum SyncResult {
     Messages(Vec<MessageInfo>),
     Error { error: String },
+}
+
+impl From<Result<Vec<MessageInfo>>> for SyncResult {
+    fn from(result: Result<Vec<MessageInfo>>) -> Self {
+        match result {
+            Ok(messages) => Self::Messages(messages),
+            Err(e) => Self::Error {
+                error: e.to_string(),
+            },
+        }
+    }
 }
 
 /// Parse stdin JSON into a map of chat_id -> last seen message ID.
@@ -73,29 +125,40 @@ pub fn parse_hwm_input(input: &str) -> std::result::Result<HashMap<i64, i64>, St
 
 /// Bulk-sync messages for multiple chats within a single TDLib session.
 ///
-/// For each chat in `hwm_map`, fetches messages newer than the last seen message ID.
-/// If `reconcile_days` is set, all HWMs are overridden with a message-ID boundary
-/// computed from `now - N days`.
+/// For each chat in `hwm_map`, fetches messages newer than the last seen message
+/// ID, in the order `mode` asks for. [`SyncMode::Reconcile`] overrides all HWMs
+/// with a message-ID boundary computed from `now - N days`.
 pub async fn sync_chats<C: TelegramClient>(
     client: &C,
     hwm_map: HashMap<i64, i64>,
     limit: i32,
-    reconcile_days: Option<u32>,
+    mode: SyncMode,
 ) -> HashMap<i64, SyncResult> {
     let mut results = HashMap::new();
 
-    if let Some(days) = reconcile_days {
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
-        let timestamp = cutoff.timestamp() as i32;
+    match mode {
+        SyncMode::Reconcile { days } => {
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+            let timestamp = cutoff.timestamp() as i32;
 
-        for &chat_id in hwm_map.keys() {
-            let result = sync_single_chat_by_timestamp(client, chat_id, timestamp, limit).await;
-            results.insert(chat_id, result);
+            for &chat_id in hwm_map.keys() {
+                let result = sync_single_chat_by_timestamp(client, chat_id, timestamp, limit).await;
+                results.insert(chat_id, result);
+            }
         }
-    } else {
-        for (chat_id, hwm_message_id) in hwm_map {
-            let result = sync_single_chat(client, chat_id, hwm_message_id, limit).await;
-            results.insert(chat_id, result);
+        SyncMode::NewestFirst => {
+            for (chat_id, hwm_message_id) in hwm_map {
+                let result = sync_single_chat(client, chat_id, hwm_message_id, limit).await;
+                results.insert(chat_id, result);
+            }
+        }
+        SyncMode::OldestFirst => {
+            for (chat_id, hwm_message_id) in hwm_map {
+                let result = client
+                    .get_messages_after(chat_id, hwm_message_id, limit)
+                    .await;
+                results.insert(chat_id, SyncResult::from(result));
+            }
         }
     }
 
@@ -119,18 +182,14 @@ async fn sync_single_chat<C: TelegramClient>(
         None
     };
 
-    match client.get_messages(chat_id, limit, until).await {
-        Ok(mut messages) => {
-            // Drop the boundary message itself — it was already ingested
-            if hwm_message_id > 0 {
-                messages.retain(|m| m.id != hwm_message_id);
-            }
-            SyncResult::Messages(messages)
+    let result = client.get_messages(chat_id, limit, until).await;
+    SyncResult::from(result.map(|mut messages| {
+        // Drop the boundary message itself — it was already ingested
+        if hwm_message_id > 0 {
+            messages.retain(|m| m.id != hwm_message_id);
         }
-        Err(e) => SyncResult::Error {
-            error: e.to_string(),
-        },
-    }
+        messages
+    }))
 }
 
 /// Fetch messages newer than a timestamp for a single chat (used by --reconcile-days).
@@ -163,19 +222,15 @@ async fn sync_single_chat_by_timestamp<C: TelegramClient>(
         BoundaryResult::None => None,
     };
 
-    match client.get_messages(chat_id, limit, until_message_id).await {
-        // The boundary orders by message id; the cutoff is a date. Filter to make
-        // the requested window the one that is actually returned.
-        Ok(messages) => SyncResult::Messages(
-            messages
-                .into_iter()
-                .filter(|m| m.timestamp >= timestamp)
-                .collect(),
-        ),
-        Err(e) => SyncResult::Error {
-            error: e.to_string(),
-        },
-    }
+    let result = client.get_messages(chat_id, limit, until_message_id).await;
+    // The boundary orders by message id; the cutoff is a date. Filter to make
+    // the requested window the one that is actually returned.
+    SyncResult::from(result.map(|messages| {
+        messages
+            .into_iter()
+            .filter(|m| m.timestamp >= timestamp)
+            .collect()
+    }))
 }
 
 #[cfg(test)]
@@ -259,10 +314,10 @@ mod tests {
         hwm_map.insert(1i64, 5i64); // HWM at msg 5, should get msgs 10 and 20
         hwm_map.insert(2i64, 5i64);
 
-        let results = sync_chats(&client, hwm_map, 20, None).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
         assert_eq!(results.len(), 2);
 
-        for (_chat_id, result) in &results {
+        for result in results.values() {
             match result {
                 SyncResult::Messages(msgs) => assert!(!msgs.is_empty()),
                 SyncResult::Error { error } => panic!("unexpected error: {error}"),
@@ -281,7 +336,7 @@ mod tests {
         let mut hwm_map = HashMap::new();
         hwm_map.insert(1i64, 10i64); // HWM is msg 10 itself
 
-        let results = sync_chats(&client, hwm_map, 20, None).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => {
                 assert!(
@@ -307,7 +362,7 @@ mod tests {
         let mut hwm_map = HashMap::new();
         hwm_map.insert(1i64, 0i64); // No prior HWM
 
-        let results = sync_chats(&client, hwm_map, 20, None).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => assert_eq!(msgs.len(), 2),
             SyncResult::Error { error } => panic!("unexpected error: {error}"),
@@ -317,7 +372,7 @@ mod tests {
     #[tokio::test]
     async fn sync_empty_hwm_map() {
         let client = MockClient::default();
-        let results = sync_chats(&client, HashMap::new(), 20, None).await;
+        let results = sync_chats(&client, HashMap::new(), 20, SyncMode::NewestFirst).await;
         assert!(results.is_empty());
     }
 
@@ -333,7 +388,7 @@ mod tests {
         hwm_map.insert(1i64, 0i64);
         hwm_map.insert(999i64, 0i64);
 
-        let results = sync_chats(&client, hwm_map, 20, None).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
         assert_eq!(results.len(), 2);
 
         match &results[&1] {
@@ -360,7 +415,7 @@ mod tests {
         let mut hwm_map = HashMap::new();
         hwm_map.insert(1i64, 99999i64); // message ID ignored when reconcile_days is set
 
-        let results = sync_chats(&client, hwm_map, 20, Some(7)).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::Reconcile { days: 7 }).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => assert!(!msgs.is_empty()),
             SyncResult::Error { error } => panic!("unexpected error: {error}"),
@@ -381,7 +436,7 @@ mod tests {
         let mut hwm_map = HashMap::new();
         hwm_map.insert(1i64, 0i64);
 
-        let results = sync_chats(&client, hwm_map, 20, Some(7)).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::Reconcile { days: 7 }).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => assert!(
                 msgs.is_empty(),
@@ -389,6 +444,139 @@ mod tests {
             ),
             SyncResult::Error { error } => panic!("unexpected error: {error}"),
         }
+    }
+
+    // --- oldest-first tests ---
+
+    fn messages_result(result: &SyncResult) -> Vec<i64> {
+        match result {
+            SyncResult::Messages(msgs) => msgs.iter().map(|m| m.id).collect(),
+            SyncResult::Error { error } => panic!("unexpected error: {error}"),
+        }
+    }
+
+    fn call_count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn sync_oldest_first_returns_the_oldest_messages_above_the_hwm_ascending() {
+        let client = MockClient {
+            messages: [40, 10, 30, 20, 50]
+                .into_iter()
+                .map(|id| make_message(id, 1, 1000))
+                .collect(),
+            ..MockClient::default()
+        };
+        let hwm_map = HashMap::from([(1i64, 10i64)]);
+
+        let results = sync_chats(&client, hwm_map, 2, SyncMode::OldestFirst).await;
+        assert_eq!(messages_result(&results[&1]), vec![20, 30]);
+        assert_eq!(call_count(&client.get_messages_after_call_count), 1);
+        assert_eq!(
+            call_count(&client.get_messages_call_count),
+            0,
+            "oldest-first must not go through the newest-first walker"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_oldest_first_hwm_zero_starts_at_the_oldest_message() {
+        let client = MockClient {
+            messages: [3, 1, 2]
+                .into_iter()
+                .map(|id| make_message(id, 1, 1000))
+                .collect(),
+            ..MockClient::default()
+        };
+        let hwm_map = HashMap::from([(1i64, 0i64)]);
+
+        let results = sync_chats(&client, hwm_map, 2, SyncMode::OldestFirst).await;
+        assert_eq!(messages_result(&results[&1]), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn sync_oldest_first_reports_a_failing_chat_in_band() {
+        let client = MockClient {
+            inaccessible_chat_ids: vec![999],
+            messages: vec![make_message(1, 1, 1000)],
+            ..MockClient::default()
+        };
+        let hwm_map = HashMap::from([(1i64, 0i64), (999i64, 0i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst).await;
+        assert_eq!(messages_result(&results[&1]), vec![1]);
+        assert!(matches!(results[&999], SyncResult::Error { .. }));
+    }
+
+    #[tokio::test]
+    async fn sync_default_mode_stays_newest_first() {
+        let client = MockClient {
+            messages: vec![make_message(20, 1, 1000), make_message(10, 1, 1000)],
+            ..MockClient::default()
+        };
+        let hwm_map = HashMap::from([(1i64, 0i64)]);
+
+        sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
+        assert_eq!(call_count(&client.get_messages_call_count), 1);
+        assert_eq!(call_count(&client.get_messages_after_call_count), 0);
+    }
+
+    #[test]
+    fn sync_mode_from_request_fields() {
+        assert_eq!(SyncMode::new(None, false).unwrap(), SyncMode::NewestFirst);
+        assert_eq!(SyncMode::new(None, true).unwrap(), SyncMode::OldestFirst);
+        assert_eq!(
+            SyncMode::new(Some(7), false).unwrap(),
+            SyncMode::Reconcile { days: 7 }
+        );
+    }
+
+    #[test]
+    fn sync_mode_refuses_oldest_first_with_reconcile_days() {
+        // A reconcile sweep reads newest-first by design; silently dropping
+        // either flag would hand the caller a window it did not ask for.
+        let err = SyncMode::new(Some(7), true).unwrap_err().to_string();
+        assert!(err.contains("oldest_first"), "{err}");
+        assert!(err.contains("reconcile_days"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn handle_refuses_oldest_first_with_reconcile_days() {
+        let client = MockClient::default();
+        let req = SyncRequest {
+            hwm: HashMap::from([("1".to_string(), 0i64)]),
+            limit: 20,
+            reconcile_days: Some(7),
+            oldest_first: true,
+        };
+        assert!(handle(&client, req).await.is_err());
+        assert_eq!(call_count(&client.get_messages_call_count), 0);
+        assert_eq!(call_count(&client.get_messages_after_call_count), 0);
+    }
+
+    #[test]
+    fn sync_request_without_oldest_first_is_newest_first() {
+        // Wire compatibility: every existing caller omits the key.
+        let req: SyncRequest = serde_json::from_value(serde_json::json!({
+            "hwm": {"1": 0}, "limit": 100
+        }))
+        .unwrap();
+        assert!(!req.oldest_first);
+    }
+
+    #[test]
+    fn sync_request_carries_oldest_first() {
+        let req: SyncRequest = serde_json::from_value(serde_json::json!({
+            "hwm": {"1": 0}, "limit": 100, "oldest_first": true
+        }))
+        .unwrap();
+        assert!(req.oldest_first);
+        assert!(
+            serde_json::to_value(&req).unwrap()["oldest_first"]
+                .as_bool()
+                .unwrap()
+        );
     }
 
     // --- serialization tests ---
