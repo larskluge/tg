@@ -426,7 +426,7 @@ echo '{"123": 0}' | tg sync --limit 500
 echo '{"123": 42, "-1001666847309": 0}' | tg sync --oldest-first --limit 100
 ```
 
-Output is always JSON, keyed by chat ID. Each value is an array of messages or an error object:
+Output is always JSON, keyed by chat ID. Each value is an array of messages or an error object (or, with `--report-deleted`, the deleted-chat object below):
 
 ```json
 {
@@ -466,6 +466,31 @@ echo '{"-1001666847309": 89508544512}' | tg sync --oldest-first --limit 100
 newest-first by design): the CLI rejects the pair, and the socket answers `ok: false`.
 `sync` does not reject unknown `args` keys, so a daemon older than 0.9.0 ignores
 `oldest_first` and answers newest-first — check `tg --version` before relying on it.
+
+#### Deleted chats: `--report-deleted`
+
+An empty array cannot tell a quiet chat from one the account has deleted: both have nothing
+new to return. With `--report-deleted` (socket: `"report_deleted": true`, since 0.10.0) a
+**private** chat whose fetch came back empty is also checked, and a deleted one answers an
+object instead of `[]`:
+
+```bash
+echo '{"123": 42, "456": 42}' | tg sync --oldest-first --report-deleted
+# → {"123": {"chat_deleted": true}, "456": []}
+```
+
+`{"chat_deleted": true}` means the chat now holds no messages at all, so every message a
+caller stored from it is deleted too, however old. It is reported only when all of these hold
+— the state Telegram leaves a private chat in once you delete it:
+
+- the chat is a private chat (a group you left is never reported);
+- it belongs to no chat list (Main, Archive or any folder);
+- it has no last message, and reading its history from the end comes back empty;
+- the first two still hold after that read.
+
+An error anywhere is reported as `{"error": ...}`, never as a deletion. A chat that receives
+a new message after being deleted is back in a list, and reads as an ordinary chat again.
+Without the flag the output is exactly as before. It goes with every mode.
 
 ### Bot markers
 

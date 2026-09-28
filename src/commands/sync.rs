@@ -24,6 +24,11 @@ pub struct SyncRequest {
     /// of the newest `limit`, descending. See [`SyncMode::OldestFirst`].
     #[serde(default)]
     pub oldest_first: bool,
+    /// Report a private chat the account has deleted as
+    /// [`SyncResult::ChatDeleted`] instead of an empty message list. Opt-in, so
+    /// a caller that does not ask never sees the new shape.
+    #[serde(default)]
+    pub report_deleted: bool,
 }
 
 impl Default for SyncRequest {
@@ -33,6 +38,7 @@ impl Default for SyncRequest {
             limit: default_sync_limit(),
             reconcile_days: None,
             oldest_first: false,
+            report_deleted: false,
         }
     }
 }
@@ -84,15 +90,26 @@ pub async fn handle<C: TelegramClient>(
             .map_err(|_| TgError::Other(format!("Invalid chat ID: {k}")))?;
         hwm_map.insert(id, v);
     }
-    Ok(sync_chats(client, hwm_map, req.limit, mode).await)
+    Ok(sync_chats(client, hwm_map, req.limit, mode, req.report_deleted).await)
 }
 
-/// Per-chat sync outcome: either messages or an error description.
+/// Per-chat sync outcome: messages, an error description, or — only when the
+/// request asked for it (`report_deleted`) — the report that the account has
+/// deleted this private chat.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SyncResult {
     Messages(Vec<MessageInfo>),
-    Error { error: String },
+    Error {
+        error: String,
+    },
+    /// Serialises as `{"chat_deleted": true}`; `chat_deleted` is always `true`.
+    /// It means the chat holds no messages any more, so every message a caller
+    /// stored from it is deleted too, at any age. Never inferred from an error
+    /// or from an empty fetch alone: see `chat_is_deleted`.
+    ChatDeleted {
+        chat_deleted: bool,
+    },
 }
 
 impl From<Result<Vec<MessageInfo>>> for SyncResult {
@@ -128,41 +145,72 @@ pub fn parse_hwm_input(input: &str) -> std::result::Result<HashMap<i64, i64>, St
 /// For each chat in `hwm_map`, fetches messages newer than the last seen message
 /// ID, in the order `mode` asks for. [`SyncMode::Reconcile`] overrides all HWMs
 /// with a message-ID boundary computed from `now - N days`.
+///
+/// With `report_deleted`, a chat whose fetch came back empty is also asked
+/// whether the account deleted it ([`chat_is_deleted`]), and answers
+/// [`SyncResult::ChatDeleted`] when it did.
 pub async fn sync_chats<C: TelegramClient>(
     client: &C,
     hwm_map: HashMap<i64, i64>,
     limit: i32,
     mode: SyncMode,
+    report_deleted: bool,
 ) -> HashMap<i64, SyncResult> {
-    let mut results = HashMap::new();
+    // One clock reading for the whole sweep, so every chat is reconciled over
+    // the same window.
+    let now = chrono::Utc::now();
 
-    match mode {
-        SyncMode::Reconcile { days } => {
-            let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
-            let timestamp = cutoff.timestamp() as i32;
-
-            for &chat_id in hwm_map.keys() {
-                let result = sync_single_chat_by_timestamp(client, chat_id, timestamp, limit).await;
-                results.insert(chat_id, result);
-            }
-        }
-        SyncMode::NewestFirst => {
-            for (chat_id, hwm_message_id) in hwm_map {
-                let result = sync_single_chat(client, chat_id, hwm_message_id, limit).await;
-                results.insert(chat_id, result);
-            }
-        }
-        SyncMode::OldestFirst => {
-            for (chat_id, hwm_message_id) in hwm_map {
-                let result = client
+    let mut results = HashMap::with_capacity(hwm_map.len());
+    for (chat_id, hwm_message_id) in hwm_map {
+        let fetched = match mode {
+            SyncMode::NewestFirst => sync_single_chat(client, chat_id, hwm_message_id, limit).await,
+            SyncMode::OldestFirst => {
+                client
                     .get_messages_after(chat_id, hwm_message_id, limit)
-                    .await;
-                results.insert(chat_id, SyncResult::from(result));
+                    .await
             }
-        }
+            SyncMode::Reconcile { days } => {
+                let timestamp = (now - chrono::Duration::days(days as i64)).timestamp() as i32;
+                sync_single_chat_by_timestamp(client, chat_id, timestamp, limit).await
+            }
+        };
+
+        let result = match fetched {
+            Ok(messages) if messages.is_empty() && report_deleted => {
+                match chat_is_deleted(client, chat_id).await {
+                    Ok(true) => SyncResult::ChatDeleted { chat_deleted: true },
+                    Ok(false) => SyncResult::Messages(messages),
+                    Err(e) => SyncResult::Error {
+                        error: format!("deleted-chat check failed: {e}"),
+                    },
+                }
+            }
+            other => SyncResult::from(other),
+        };
+        results.insert(chat_id, result);
     }
 
     results
+}
+
+/// Has the account deleted this private chat?
+///
+/// Deleting a chat leaves it in no chat list with no last message
+/// ([`crate::client::ChatPresence::looks_deleted`]). TDLib also shows that
+/// state, briefly, for a chat it has just loaded from its database and whose
+/// last message it has yet to load, so the state alone is not trusted: the
+/// chat's history is read from its end — TDLib goes to its database and then
+/// the server before it answers empty, and marks a chat empty only on a server
+/// answer — and the state must still hold afterwards. An error anywhere is an
+/// error, never a deletion.
+async fn chat_is_deleted<C: TelegramClient>(client: &C, chat_id: i64) -> Result<bool> {
+    if !client.get_chat_presence(chat_id).await?.looks_deleted() {
+        return Ok(false);
+    }
+    if !client.get_messages(chat_id, 1, None).await?.is_empty() {
+        return Ok(false);
+    }
+    Ok(client.get_chat_presence(chat_id).await?.looks_deleted())
 }
 
 /// Fetch messages newer than `hwm_message_id` for a single chat.
@@ -175,21 +223,19 @@ async fn sync_single_chat<C: TelegramClient>(
     chat_id: i64,
     hwm_message_id: i64,
     limit: i32,
-) -> SyncResult {
+) -> Result<Vec<MessageInfo>> {
     let until = if hwm_message_id > 0 {
         Some(hwm_message_id)
     } else {
         None
     };
 
-    let result = client.get_messages(chat_id, limit, until).await;
-    SyncResult::from(result.map(|mut messages| {
-        // Drop the boundary message itself — it was already ingested
-        if hwm_message_id > 0 {
-            messages.retain(|m| m.id != hwm_message_id);
-        }
-        messages
-    }))
+    let mut messages = client.get_messages(chat_id, limit, until).await?;
+    // Drop the boundary message itself — it was already ingested
+    if hwm_message_id > 0 {
+        messages.retain(|m| m.id != hwm_message_id);
+    }
+    Ok(messages)
 }
 
 /// Fetch messages newer than a timestamp for a single chat (used by --reconcile-days).
@@ -200,42 +246,30 @@ async fn sync_single_chat_by_timestamp<C: TelegramClient>(
     chat_id: i64,
     timestamp: i32,
     limit: i32,
-) -> SyncResult {
+) -> Result<Vec<MessageInfo>> {
     // Warmup fetch to trigger TDLib server sync
-    if let Err(e) = client.get_messages(chat_id, 1, None).await {
-        return SyncResult::Error {
-            error: e.to_string(),
-        };
-    }
+    client.get_messages(chat_id, 1, None).await?;
 
-    let boundary = match client.get_boundary_message_id(chat_id, timestamp).await {
-        Ok(b) => b,
-        Err(e) => {
-            return SyncResult::Error {
-                error: e.to_string(),
-            };
-        }
-    };
-
-    let until_message_id = match boundary {
+    let until_message_id = match client.get_boundary_message_id(chat_id, timestamp).await? {
         BoundaryResult::BoundAt(id) => Some(id),
         BoundaryResult::None => None,
     };
 
-    let result = client.get_messages(chat_id, limit, until_message_id).await;
+    let messages = client
+        .get_messages(chat_id, limit, until_message_id)
+        .await?;
     // The boundary orders by message id; the cutoff is a date. Filter to make
     // the requested window the one that is actually returned.
-    SyncResult::from(result.map(|messages| {
-        messages
-            .into_iter()
-            .filter(|m| m.timestamp >= timestamp)
-            .collect()
-    }))
+    Ok(messages
+        .into_iter()
+        .filter(|m| m.timestamp >= timestamp)
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ChatPresence;
     use crate::client::mock::MockClient;
 
     fn make_message(id: i64, chat_id: i64, timestamp: i32) -> MessageInfo {
@@ -314,13 +348,14 @@ mod tests {
         hwm_map.insert(1i64, 5i64); // HWM at msg 5, should get msgs 10 and 20
         hwm_map.insert(2i64, 5i64);
 
-        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst, false).await;
         assert_eq!(results.len(), 2);
 
         for result in results.values() {
             match result {
                 SyncResult::Messages(msgs) => assert!(!msgs.is_empty()),
                 SyncResult::Error { error } => panic!("unexpected error: {error}"),
+                SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
             }
         }
     }
@@ -336,7 +371,7 @@ mod tests {
         let mut hwm_map = HashMap::new();
         hwm_map.insert(1i64, 10i64); // HWM is msg 10 itself
 
-        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst, false).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => {
                 assert!(
@@ -349,6 +384,7 @@ mod tests {
                 );
             }
             SyncResult::Error { error } => panic!("unexpected error: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 
@@ -362,17 +398,18 @@ mod tests {
         let mut hwm_map = HashMap::new();
         hwm_map.insert(1i64, 0i64); // No prior HWM
 
-        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst, false).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => assert_eq!(msgs.len(), 2),
             SyncResult::Error { error } => panic!("unexpected error: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 
     #[tokio::test]
     async fn sync_empty_hwm_map() {
         let client = MockClient::default();
-        let results = sync_chats(&client, HashMap::new(), 20, SyncMode::NewestFirst).await;
+        let results = sync_chats(&client, HashMap::new(), 20, SyncMode::NewestFirst, false).await;
         assert!(results.is_empty());
     }
 
@@ -388,17 +425,19 @@ mod tests {
         hwm_map.insert(1i64, 0i64);
         hwm_map.insert(999i64, 0i64);
 
-        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst, false).await;
         assert_eq!(results.len(), 2);
 
         match &results[&1] {
             SyncResult::Messages(msgs) => assert!(!msgs.is_empty()),
             SyncResult::Error { error } => panic!("chat 1 should succeed, got: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
 
         match &results[&999] {
             SyncResult::Error { .. } => {} // expected
             SyncResult::Messages(_) => panic!("chat 999 should fail"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 
@@ -415,10 +454,12 @@ mod tests {
         let mut hwm_map = HashMap::new();
         hwm_map.insert(1i64, 99999i64); // message ID ignored when reconcile_days is set
 
-        let results = sync_chats(&client, hwm_map, 20, SyncMode::Reconcile { days: 7 }).await;
+        let results =
+            sync_chats(&client, hwm_map, 20, SyncMode::Reconcile { days: 7 }, false).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => assert!(!msgs.is_empty()),
             SyncResult::Error { error } => panic!("unexpected error: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 
@@ -436,13 +477,15 @@ mod tests {
         let mut hwm_map = HashMap::new();
         hwm_map.insert(1i64, 0i64);
 
-        let results = sync_chats(&client, hwm_map, 20, SyncMode::Reconcile { days: 7 }).await;
+        let results =
+            sync_chats(&client, hwm_map, 20, SyncMode::Reconcile { days: 7 }, false).await;
         match &results[&1] {
             SyncResult::Messages(msgs) => assert!(
                 msgs.is_empty(),
                 "message older than the reconcile window must be dropped"
             ),
             SyncResult::Error { error } => panic!("unexpected error: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 
@@ -452,6 +495,7 @@ mod tests {
         match result {
             SyncResult::Messages(msgs) => msgs.iter().map(|m| m.id).collect(),
             SyncResult::Error { error } => panic!("unexpected error: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 
@@ -470,7 +514,7 @@ mod tests {
         };
         let hwm_map = HashMap::from([(1i64, 10i64)]);
 
-        let results = sync_chats(&client, hwm_map, 2, SyncMode::OldestFirst).await;
+        let results = sync_chats(&client, hwm_map, 2, SyncMode::OldestFirst, false).await;
         assert_eq!(messages_result(&results[&1]), vec![20, 30]);
         assert_eq!(call_count(&client.get_messages_after_call_count), 1);
         assert_eq!(
@@ -491,7 +535,7 @@ mod tests {
         };
         let hwm_map = HashMap::from([(1i64, 0i64)]);
 
-        let results = sync_chats(&client, hwm_map, 2, SyncMode::OldestFirst).await;
+        let results = sync_chats(&client, hwm_map, 2, SyncMode::OldestFirst, false).await;
         assert_eq!(messages_result(&results[&1]), vec![1, 2]);
     }
 
@@ -504,7 +548,7 @@ mod tests {
         };
         let hwm_map = HashMap::from([(1i64, 0i64), (999i64, 0i64)]);
 
-        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst).await;
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, false).await;
         assert_eq!(messages_result(&results[&1]), vec![1]);
         assert!(matches!(results[&999], SyncResult::Error { .. }));
     }
@@ -517,7 +561,7 @@ mod tests {
         };
         let hwm_map = HashMap::from([(1i64, 0i64)]);
 
-        sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst).await;
+        sync_chats(&client, hwm_map, 20, SyncMode::NewestFirst, false).await;
         assert_eq!(call_count(&client.get_messages_call_count), 1);
         assert_eq!(call_count(&client.get_messages_after_call_count), 0);
     }
@@ -549,6 +593,7 @@ mod tests {
             limit: 20,
             reconcile_days: Some(7),
             oldest_first: true,
+            report_deleted: false,
         };
         assert!(handle(&client, req).await.is_err());
         assert_eq!(call_count(&client.get_messages_call_count), 0);
@@ -577,6 +622,246 @@ mod tests {
                 .as_bool()
                 .unwrap()
         );
+    }
+
+    // --- deleted-chat tests ---
+
+    fn presence(is_private: bool, in_chat_list: bool, has_last_message: bool) -> ChatPresence {
+        ChatPresence {
+            is_private,
+            in_chat_list,
+            has_last_message,
+        }
+    }
+
+    /// The state a private chat is left in once the account deleted it.
+    fn deleted() -> ChatPresence {
+        presence(true, false, false)
+    }
+
+    fn listed() -> ChatPresence {
+        presence(true, true, true)
+    }
+
+    fn client_with_presence(
+        messages: Vec<MessageInfo>,
+        answers: Vec<(i64, Vec<ChatPresence>)>,
+    ) -> MockClient {
+        MockClient {
+            messages,
+            chat_presence: std::sync::Mutex::new(answers.into_iter().collect()),
+            ..MockClient::default()
+        }
+    }
+
+    fn is_chat_deleted(result: &SyncResult) -> bool {
+        matches!(result, SyncResult::ChatDeleted { chat_deleted: true })
+    }
+
+    #[tokio::test]
+    async fn a_deleted_private_chat_is_reported_as_deleted() {
+        let client = client_with_presence(vec![], vec![(1, vec![deleted()])]);
+        let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        assert!(is_chat_deleted(&results[&1]), "{:?}", results[&1]);
+    }
+
+    #[tokio::test]
+    async fn without_report_deleted_a_deleted_chat_stays_an_empty_list() {
+        // Wire compatibility: a caller that did not ask never sees the new shape,
+        // and tg does not spend a TDLib call on the question.
+        let client = client_with_presence(vec![], vec![(1, vec![deleted()])]);
+        let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, false).await;
+        assert_eq!(messages_result(&results[&1]), Vec::<i64>::new());
+        assert_eq!(call_count(&client.get_chat_presence_call_count), 0);
+    }
+
+    #[tokio::test]
+    async fn only_the_deleted_chat_of_several_is_reported() {
+        let client = client_with_presence(vec![], vec![(1, vec![deleted()]), (2, vec![listed()])]);
+        let hwm_map = HashMap::from([(1i64, 42i64), (2i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        assert!(is_chat_deleted(&results[&1]));
+        assert_eq!(messages_result(&results[&2]), Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn an_empty_chat_that_is_still_in_a_chat_list_is_not_deleted() {
+        // A cleared history, or a chat whose only message expired: nothing to
+        // read, but the account still has the chat.
+        let client = client_with_presence(vec![], vec![(1, vec![presence(true, true, false)])]);
+        let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        assert_eq!(messages_result(&results[&1]), Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn a_group_in_no_chat_list_is_never_reported_deleted() {
+        // Leaving a group is not deleting a chat; it is out of scope here.
+        let client =
+            client_with_presence(vec![], vec![(-100, vec![presence(false, false, false)])]);
+        let hwm_map = HashMap::from([(-100i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        assert_eq!(messages_result(&results[&-100]), Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn a_chat_with_a_last_message_is_not_deleted() {
+        let client = client_with_presence(vec![], vec![(1, vec![presence(true, false, true)])]);
+        let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        assert_eq!(messages_result(&results[&1]), Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn a_chat_that_returned_messages_is_never_checked() {
+        let client =
+            client_with_presence(vec![make_message(50, 1, 1000)], vec![(1, vec![deleted()])]);
+        let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        assert_eq!(messages_result(&results[&1]), vec![50]);
+        assert_eq!(call_count(&client.get_chat_presence_call_count), 0);
+    }
+
+    #[tokio::test]
+    async fn the_history_from_the_end_of_the_chat_must_come_back_empty() {
+        // Nothing above the cursor, and a state that looks deleted — but the
+        // chat still holds a message, so it is not deleted.
+        let client =
+            client_with_presence(vec![make_message(42, 1, 1000)], vec![(1, vec![deleted()])]);
+        let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        assert_eq!(messages_result(&results[&1]), Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn the_deleted_state_must_still_hold_after_the_history_read() {
+        // TDLib shows the deleted state for a chat it has only just loaded
+        // from its database; reading the history is what settles it.
+        let client = client_with_presence(vec![], vec![(1, vec![deleted(), listed()])]);
+        let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        assert_eq!(messages_result(&results[&1]), Vec::<i64>::new());
+        assert_eq!(call_count(&client.get_chat_presence_call_count), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_presence_read_is_an_error_never_a_deletion() {
+        let client = MockClient {
+            messages: vec![],
+            presence_error_chat_ids: vec![1],
+            ..MockClient::default()
+        };
+        let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        match &results[&1] {
+            SyncResult::Error { error } => assert!(error.contains("Chat not found"), "{error}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_is_an_error_never_a_deletion() {
+        let client = MockClient {
+            messages: vec![],
+            inaccessible_chat_ids: vec![1],
+            chat_presence: std::sync::Mutex::new(HashMap::from([(1, vec![deleted()])])),
+            ..MockClient::default()
+        };
+        let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::OldestFirst, true).await;
+        assert!(matches!(results[&1], SyncResult::Error { .. }));
+        assert_eq!(call_count(&client.get_chat_presence_call_count), 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_reconcile_window_is_not_a_deletion() {
+        // The reconcile sweep's window is empty for every quiet chat; the chat's
+        // older history is what shows it still exists.
+        let before_window = (chrono::Utc::now() - chrono::Duration::days(30)).timestamp() as i32;
+        let client = client_with_presence(
+            vec![make_message(1, 1, before_window)],
+            vec![(1, vec![deleted()])],
+        );
+        let hwm_map = HashMap::from([(1i64, 0i64)]);
+
+        let results = sync_chats(&client, hwm_map, 20, SyncMode::Reconcile { days: 7 }, true).await;
+        assert_eq!(messages_result(&results[&1]), Vec::<i64>::new());
+    }
+
+    #[tokio::test]
+    async fn every_sync_mode_reports_a_deleted_chat() {
+        for mode in [
+            SyncMode::NewestFirst,
+            SyncMode::OldestFirst,
+            SyncMode::Reconcile { days: 7 },
+        ] {
+            let client = client_with_presence(vec![], vec![(1, vec![deleted()])]);
+            let hwm_map = HashMap::from([(1i64, 42i64)]);
+
+            let results = sync_chats(&client, hwm_map, 20, mode, true).await;
+            assert!(is_chat_deleted(&results[&1]), "{mode:?}: {:?}", results[&1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_carries_report_deleted_through() {
+        let client = client_with_presence(vec![], vec![(1, vec![deleted()])]);
+        let req: SyncRequest = serde_json::from_value(serde_json::json!({
+            "hwm": {"1": 42}, "limit": 20, "oldest_first": true, "report_deleted": true
+        }))
+        .unwrap();
+
+        let results = handle(&client, req).await.unwrap();
+        assert!(is_chat_deleted(&results[&1]));
+    }
+
+    #[test]
+    fn sync_request_without_report_deleted_does_not_report() {
+        let req: SyncRequest = serde_json::from_value(serde_json::json!({
+            "hwm": {"1": 0}, "limit": 100
+        }))
+        .unwrap();
+        assert!(!req.report_deleted);
+    }
+
+    #[test]
+    fn chat_deleted_serializes_as_an_object() {
+        let json = serde_json::to_value(SyncResult::ChatDeleted { chat_deleted: true }).unwrap();
+        assert_eq!(json, serde_json::json!({"chat_deleted": true}));
+    }
+
+    #[test]
+    fn chat_deleted_roundtrips_server_to_client() {
+        let server_side: HashMap<i64, SyncResult> = HashMap::from([
+            (1, SyncResult::ChatDeleted { chat_deleted: true }),
+            (2, SyncResult::Messages(vec![])),
+            (
+                3,
+                SyncResult::Error {
+                    error: "boom".to_string(),
+                },
+            ),
+        ]);
+
+        let json = serde_json::to_value(&server_side).unwrap();
+        let client_side: HashMap<String, SyncResult> = serde_json::from_value(json).unwrap();
+
+        assert!(is_chat_deleted(&client_side["1"]));
+        assert!(matches!(&client_side["2"], SyncResult::Messages(m) if m.is_empty()));
+        assert!(matches!(&client_side["3"], SyncResult::Error { error } if error == "boom"));
     }
 
     // --- serialization tests ---
@@ -649,6 +934,7 @@ mod tests {
         match back {
             SyncResult::Messages(msgs) => assert_eq!(msgs.len(), 1),
             SyncResult::Error { error } => panic!("got Error: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 
@@ -661,6 +947,7 @@ mod tests {
         match back {
             SyncResult::Messages(msgs) => assert!(msgs.is_empty()),
             SyncResult::Error { error } => panic!("got Error: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 
@@ -674,6 +961,7 @@ mod tests {
         match back {
             SyncResult::Error { error } => assert_eq!(error, "boom"),
             SyncResult::Messages(_) => panic!("got Messages, expected Error"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 
@@ -699,14 +987,17 @@ mod tests {
         match &client_side["123"] {
             SyncResult::Messages(msgs) => assert_eq!(msgs.len(), 1),
             SyncResult::Error { error } => panic!("123 should be Messages, got Error: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
         match &client_side["456"] {
             SyncResult::Messages(msgs) => assert!(msgs.is_empty()),
             SyncResult::Error { error } => panic!("456 should be Messages, got Error: {error}"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
         match &client_side["999"] {
             SyncResult::Error { error } => assert_eq!(error, "Not found"),
             SyncResult::Messages(_) => panic!("999 should be Error"),
+            SyncResult::ChatDeleted { .. } => panic!("unexpected chat_deleted"),
         }
     }
 }

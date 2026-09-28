@@ -42,6 +42,35 @@ pub enum BoundaryResult {
     BoundAt(i64),
 }
 
+/// What TDLib's local state says about whether a chat still exists for this
+/// account — the input to deciding that a private chat was deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChatPresence {
+    /// A one-to-one chat with a user or bot. Only such a chat is ever reported
+    /// deleted: leaving a group is a different act with different semantics.
+    pub is_private: bool,
+    /// `chat.chat_lists` is non-empty: the chat belongs to Main, Archive or a
+    /// folder. Deliberately NOT `chat.positions`, which TDLib leaves empty for
+    /// a chat that belongs to a list but lies beyond the part of it loaded so
+    /// far — every quiet chat, until something loads the whole list.
+    pub in_chat_list: bool,
+    /// `chat.last_message` is set.
+    pub has_last_message: bool,
+}
+
+impl ChatPresence {
+    /// The state Telegram leaves a private chat in once the account deleted
+    /// it: in no chat list, with no last message.
+    ///
+    /// Necessary, not sufficient. TDLib also shows it, briefly, for a chat it
+    /// has just loaded from its database and whose last message it has yet to
+    /// load, so `sync` only trusts it after a history read from the end of
+    /// the chat came back empty and the state still holds.
+    pub fn looks_deleted(&self) -> bool {
+        self.is_private && !self.in_chat_list && !self.has_last_message
+    }
+}
+
 /// The date to hand `getChatMessageByDate` when looking for the boundary of `cutoff`.
 ///
 /// TDLib returns "the last message sent no later than the specified date", so probing
@@ -146,6 +175,10 @@ pub trait TelegramClient: Send + Sync {
     /// that can belong to a message sent at or after `timestamp`.
     async fn get_boundary_message_id(&self, chat_id: i64, timestamp: i32)
     -> Result<BoundaryResult>;
+
+    /// Read [`ChatPresence`] from TDLib's local state (`getChat`, an offline
+    /// request). An unknown chat is an error, never a deleted one.
+    async fn get_chat_presence(&self, chat_id: i64) -> Result<ChatPresence>;
 
     async fn download_message_media(
         &self,
@@ -3252,6 +3285,19 @@ impl TelegramClient for TdLibClient {
         }
     }
 
+    async fn get_chat_presence(&self, chat_id: i64) -> Result<ChatPresence> {
+        let client_id = self.get_client_id().await?;
+        let chat = tdlib_rs::functions::get_chat(chat_id, client_id)
+            .await
+            .map(unwrap_chat)
+            .map_err(|e| TgError::TdLib(e.message))?;
+        Ok(ChatPresence {
+            is_private: matches!(chat.r#type, tdlib_rs::enums::ChatType::Private(_)),
+            in_chat_list: !chat.chat_lists.is_empty(),
+            has_last_message: chat.last_message.is_some(),
+        })
+    }
+
     async fn download_message_media(
         &self,
         chat_id: i64,
@@ -3714,6 +3760,14 @@ pub mod mock {
         pub replies_sent: std::sync::Mutex<Vec<Option<i64>>>,
         /// Every `check_reply_target` call as `(chat_id, message_id)`.
         pub reply_checks: std::sync::Mutex<Vec<(i64, i64)>>,
+        /// Successive `get_chat_presence` answers per chat, consumed in order;
+        /// the last one repeats. A chat with none is a listed private chat
+        /// with a last message — never deleted.
+        pub chat_presence: std::sync::Mutex<std::collections::HashMap<i64, Vec<ChatPresence>>>,
+        /// Chats whose `get_chat_presence` fails.
+        pub presence_error_chat_ids: Vec<i64>,
+        /// Tracks how many times `get_chat_presence` has been called
+        pub get_chat_presence_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// One recorded media send: `(chat_id, caption, parse_mode, files)`.
@@ -3791,6 +3845,11 @@ pub mod mock {
                 media_sent: std::sync::Mutex::new(Vec::new()),
                 replies_sent: std::sync::Mutex::new(Vec::new()),
                 reply_checks: std::sync::Mutex::new(Vec::new()),
+                chat_presence: std::sync::Mutex::new(std::collections::HashMap::new()),
+                presence_error_chat_ids: vec![],
+                get_chat_presence_call_count: std::sync::Arc::new(
+                    std::sync::atomic::AtomicUsize::new(0),
+                ),
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -4040,6 +4099,24 @@ pub mod mock {
             Ok(self.boundary_result.clone())
         }
 
+        async fn get_chat_presence(&self, chat_id: i64) -> Result<ChatPresence> {
+            self.get_chat_presence_call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.presence_error_chat_ids.contains(&chat_id) {
+                return Err(TgError::TdLib("Chat not found".to_string()));
+            }
+            let mut answers = self.chat_presence.lock().unwrap();
+            Ok(match answers.get_mut(&chat_id) {
+                Some(queue) if queue.len() > 1 => queue.remove(0),
+                Some(queue) if !queue.is_empty() => queue[0],
+                _ => ChatPresence {
+                    is_private: true,
+                    in_chat_list: true,
+                    has_last_message: true,
+                },
+            })
+        }
+
         async fn download_message_media(
             &self,
             chat_id: i64,
@@ -4208,6 +4285,31 @@ mod tests {
                 uploaded_size: 1234,
             },
         }
+    }
+
+    #[test]
+    fn only_a_private_chat_in_no_list_without_a_last_message_looks_deleted() {
+        let looks_deleted = |is_private, in_chat_list, has_last_message| {
+            ChatPresence {
+                is_private,
+                in_chat_list,
+                has_last_message,
+            }
+            .looks_deleted()
+        };
+        assert!(looks_deleted(true, false, false));
+        assert!(
+            !looks_deleted(false, false, false),
+            "a group is never deleted"
+        );
+        assert!(
+            !looks_deleted(true, true, false),
+            "a listed chat still exists"
+        );
+        assert!(
+            !looks_deleted(true, false, true),
+            "a chat with a message still exists"
+        );
     }
 
     #[test]

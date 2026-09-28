@@ -218,6 +218,11 @@ pub struct SyncArgs {
     /// Page a gap by re-running with the last id returned as the new HWM.
     #[arg(long, conflicts_with = "reconcile_days")]
     pub oldest_first: bool,
+
+    /// Report a private chat the account has deleted — in no chat list, with no
+    /// history left — as `{"chat_deleted": true}` instead of `[]`.
+    #[arg(long)]
+    pub report_deleted: bool,
 }
 
 #[cfg(test)]
@@ -872,6 +877,30 @@ mod tests {
         let err = Cli::try_parse_from(["tg", "sync", "--oldest-first", "--reconcile-days", "7"])
             .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn parse_sync_report_deleted_goes_with_every_mode() {
+        for extra in [
+            &[][..],
+            &["--oldest-first"][..],
+            &["--reconcile-days", "7"][..],
+        ] {
+            let mut argv = vec!["tg", "sync", "--report-deleted"];
+            argv.extend_from_slice(extra);
+            match Cli::parse_from(argv).command {
+                Command::Sync(args) => assert!(args.report_deleted, "{extra:?}"),
+                _ => panic!("Expected Sync command"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_sync_does_not_report_deleted_by_default() {
+        match Cli::parse_from(["tg", "sync"]).command {
+            Command::Sync(args) => assert!(!args.report_deleted),
+            _ => panic!("Expected Sync command"),
+        }
     }
 
     #[test]

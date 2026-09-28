@@ -101,6 +101,7 @@ tg mark-unread --id 123456789
 echo '{"123": 42, "-1001666847309": 89508544512}' | tg sync [--limit 1000]
 echo '{"123": 0, "-1001666847309": 0}' | tg sync --reconcile-days 7
 echo '{"123": 42, "-1001666847309": 0}' | tg sync --oldest-first --limit 100
+echo '{"123": 42}' | tg sync --oldest-first --report-deleted
 ```
 
 ## Architecture
@@ -163,6 +164,33 @@ the retry count on such an answer loops forever. Stopping early is never lossy: 
 cursor only moves past messages it was given. Tested against `WindowedHistory`, a fake that
 answers with this window arithmetic (pinned by `windowed_history_models_tdlib_offsets`) rather
 than scripted batches.
+
+**A deleted private chat (`tg sync --report-deleted`, since 0.10.0):** TDLib has no "chat
+deleted" field and tg subscribes to no updates, so the signal is read off the chat's state.
+Read from TDLib's source (`MessagesManager::update_dialog_pos`, `get_chat_positions_object`,
+`set_dialog_is_empty`, `on_get_history`):
+
+- **`chat.chat_lists`, never `chat.positions`.** `positions` reports a list only while the
+  chat lies inside the part of that list loaded so far (`list_last_dialog_date_`), so every
+  quiet chat has empty `positions` until something loads the whole list. `chat_lists` is
+  membership (`d->dialog_list_ids`), independent of loading: empty exactly when TDLib's
+  order for the chat is `DEFAULT_ORDER`.
+- A chat whose messages are all gone gets that order: deleting its last message makes TDLib
+  re-read the history from the server, and an empty answer from the end marks the chat
+  `is_empty`, which drops it from every list and clears `last_message`. So a deleted private
+  chat reads: in no chat list, no last message, empty history.
+- **The same state appears transiently** for a chat just loaded from the database whose last
+  message is not loaded yet ("no known messages in the chat, just leave it where it is" keeps
+  the in-memory default order until `load_last_dialog_message` answers). That is why
+  `chat_is_deleted` reads `getChat`, then the history from the end (`getChatHistory` loads
+  from the database and then the server before it answers empty), then `getChat` again, and
+  reports a deletion only if the state held throughout. An error at any step is an error.
+- A chat TDLib has never seen answers `getChat` with "Chat not found" — an error, not a
+  deletion. That is what a session created after the deletion sees: verified 2026-09-28, the
+  deleted DMs were unknown to a local session while `tg serve`'s long-lived session knew
+  them.
+- Only private chats are reported: a basic group or supergroup also leaves every list when
+  you leave it, but leaving a group is not deleting a chat.
 
 **TDLib `getChatMessageByDate` direction:** It returns the last message sent **no later than** the given date — the returned message's date is always `<= date` — and a **404** when the chat has no such message. It does not find the first message *after* a date. To turn a `--since-utc` cutoff into a fetch boundary, probe at `cutoff - 1` and use the returned message's `id + 1` as an exclusive lower bound (`boundary_probe_date` / `boundary_from_probe` in `client.rs`). Reading it as "at or after the date" makes the lookup silently never match.
 
