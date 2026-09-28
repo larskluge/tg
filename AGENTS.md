@@ -186,9 +186,11 @@ Read from TDLib's source (`MessagesManager::update_dialog_pos`, `get_chat_positi
   from the database and then the server before it answers empty), then `getChat` again, and
   reports a deletion only if the state held throughout. An error at any step is an error.
 - A chat TDLib has never seen answers `getChat` with "Chat not found" — an error, not a
-  deletion. That is what a session created after the deletion sees: verified 2026-09-28, the
-  deleted DMs were unknown to a local session while `tg serve`'s long-lived session knew
-  them.
+  deletion. That is what a session created after the deletion sees, so the signal only
+  works in a session that synced the chat before it was deleted, like `tg serve`'s.
+- Measured 2026-09-28 against `tg serve` on outpost, every chat Mycelium syncs at its own
+  cursor: 2 of 73 DMs reported `chat_deleted` — the two a local session created later did
+  not know at all — and the other 71 DMs and 6 groups read as ordinary chats.
 - Only private chats are reported: a basic group or supergroup also leaves every list when
   you leave it, but leaving a group is not deleting a chat.
 
