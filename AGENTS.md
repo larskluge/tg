@@ -102,6 +102,7 @@ echo '{"123": 42, "-1001666847309": 89508544512}' | tg sync [--limit 1000]
 echo '{"123": 0, "-1001666847309": 0}' | tg sync --reconcile-days 7
 echo '{"123": 42, "-1001666847309": 0}' | tg sync --oldest-first --limit 100
 echo '{"123": 42}' | tg sync --oldest-first --report-deleted
+tg stream                      # NDJSON events from a running `tg serve`; never starts its own client
 ```
 
 ## Architecture
@@ -115,7 +116,9 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 - `client.rs` - TDLib client wrapper with `TelegramClient` trait for mocking
 - `media.rs` - `send`'s attachments: the `SendFile` wire mirror, the validated `MediaFile`, and the one validator both go through
 - `output.rs` - Dual output formatting (plain text default, JSON with `--json`)
-- `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers)
+- `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers; `serve.rs` holds the socket listener and the subscription loop)
+- `serve.rs` - The serve protocol: envelopes, the dispatcher, and the `StreamEvent` frames a `subscribe` connection carries (`StreamEvent::from_update` is the one TDLib-update → event mapping)
+- `serve_client.rs` - The CLI's side of the socket: one request per connection, plus `stream` for `tg stream`
 
 **Testing pattern:** Mock `TelegramClient` trait for unit tests. CLI parsing tests use `Cli::parse_from()`. Internal algorithms (e.g. `collect_messages_paginated`, `collect_filtered_chats_from_source`) are extracted as free functions taking a source trait so they can be tested without TDLib.
 
@@ -166,7 +169,8 @@ answers with this window arithmetic (pinned by `windowed_history_models_tdlib_of
 than scripted batches.
 
 **A deleted private chat (`tg sync --report-deleted`, since 0.10.0):** TDLib has no "chat
-deleted" field and tg subscribes to no updates, so the signal is read off the chat's state.
+deleted" field, and none of the updates `subscribe` forwards says a chat was deleted, so the
+signal is read off the chat's state.
 Read from TDLib's source (`MessagesManager::update_dialog_pos`, `get_chat_positions_object`,
 `set_dialog_is_empty`, `on_get_history`):
 
@@ -283,6 +287,45 @@ exiting with a live client, and that must fail where it is legible rather than a
 Set log verbosity with the synchronous `set_tdlib_log_verbosity` **before** `create_client()`.
 The async `setLogVerbosityLevel` only takes effect once TDLib is already up, so it cannot
 suppress the startup banner, which otherwise floods CI logs.
+
+**Subscriptions (`subscribe` / `tg stream`, since 0.11.0):** the frames, names and exit codes
+are a contract with Mycelium's Telegram consumer (its spec:
+`docs/specs/2026-09-30-realtime-message-streaming-design.md` in mycelium) and are documented in
+`docs/specs/2026-05-22-serve-design.md` → *Event frames*. What the code relies on:
+
+- **A subscription never takes the client lock.** `serve::run` takes the update channel
+  (`TdLibClient::updates()`) before the client goes behind its mutex and hands each connection
+  a `Subscriptions`. `handle_connection` answers `subscribe` itself, so `serve::dispatch` never
+  sees it (it refuses the command outright if called directly). Pinned by
+  `subscribe_acks_then_streams_events_without_the_client_lock`, which holds the lock throughout.
+- **Attach, then ack.** The broadcast receiver is created before the ack is written, so nothing
+  after the ack can be missed.
+- **Shutdown ends subscriptions first**, through a `watch` switch. A subscription never ends on
+  its own, so without it every live subscriber held the drain for its full 5 s, on top of
+  TDLib's close. Measured locally with one subscriber: `tg serve` stops in 2.1 s.
+- **The peer's close is read, not written.** A subscription reads (and discards) the peer's
+  input to see EOF, so a half-close ends it: `serve_client::stream` keeps its write half alive
+  for exactly that reason. A peer that vanishes without a close is found by the heartbeat write.
+- **The channel is lossy by design.** `UPDATE_CHANNEL_CAPACITY` (1024) bounds how far a
+  subscriber may fall behind; past it tokio drops updates for that receiver alone, the sender
+  never blocks, and the subscriber gets `lagged`. The short-lived receivers (auth, send
+  confirmations) share the same channel and gain from the larger capacity.
+- **Loading chats rings every chat once.** The first `chats`/`groups`/`unread` request of a
+  serve session makes TDLib announce each loaded chat's last message: ~405
+  `chat_last_message` frames from one `tg chats --limit 2` on 2026-09-30, and none from the
+  requests after it.
+- **Supergroups and channels may not ring.** TDLib's `openChat` docs: "all updates are received
+  only for opened chats" in them. `tg` does not call `openChat`; how many synced groups ring
+  anyway is to be measured on outpost.
+- **`tg stream` has no in-process fallback**, unlike every other command: a second TDLib client
+  on serve's database is the one thing it must never open. It exits 1 when serve is
+  unreachable or ends the stream, and 0 when its stdout closes **or its stdin reaches EOF**.
+- **Stdin's EOF is the lifetime signal under `podman exec -i`**, not stdout. Measured with
+  podman 6.1.2: when the exec client goes away (reader closed, SIGTERM, SIGKILL), the process in
+  the container keeps running because conmon keeps accepting its stdout, but its stdin is closed
+  in every case. `serve_client::stdin_closed` reads stdin on a plain, never-joined thread:
+  tokio's `stdin()` cannot be cancelled and would hold the runtime's shutdown — and so the exit
+  after `tg serve closed the stream` — until stdin closed.
 
 **Serve request strictness:** `SendRequest` and its nested `media::SendFile` are the only serve
 request structs carrying `#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs

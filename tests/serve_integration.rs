@@ -268,6 +268,203 @@ async fn parallel_connections_each_get_their_own_response() {
     server.await.unwrap();
 }
 
+/// A `tg serve` stand-in for one subscription: it reads the request, answers
+/// `reply`, writes `frames` verbatim, and then either closes the connection or
+/// holds it open until the subscriber closes its end. Returns the request.
+async fn stub_subscribe_server(
+    path: &Path,
+    reply: ResponseEnvelope,
+    frames: &[&str],
+    hold_open: bool,
+) -> RequestEnvelope {
+    let listener = UnixListener::bind(path).unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    let req: RequestEnvelope =
+        serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+    let mut out = serde_json::to_string(&reply).unwrap();
+    out.push('\n');
+    for frame in frames {
+        out.push_str(frame);
+        out.push('\n');
+    }
+    write.write_all(out.as_bytes()).await.unwrap();
+    write.flush().await.unwrap();
+    if hold_open {
+        // Returns once the subscriber has gone away.
+        while lines.next_line().await.unwrap().is_some() {}
+    }
+    req
+}
+
+const FRAMES: [&str; 2] = [
+    r#"{"event":"new_message","data":{"chat_id":-1001666847309,"message_id":89508544512}}"#,
+    r#"{"event":"heartbeat","data":{}}"#,
+];
+
+fn subscribed() -> ResponseEnvelope {
+    ResponseEnvelope::ok(
+        serde_json::json!("1"),
+        serde_json::json!({"subscribed": true}),
+    )
+}
+
+#[tokio::test]
+async fn stream_writes_each_event_frame_but_not_the_ack() {
+    let dir = TempDir::new().unwrap();
+    let path = sock_path(&dir, "stream.sock");
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        stub_subscribe_server(&server_path, subscribed(), &FRAMES, false).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut out = Vec::new();
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let err = serve_client::stream(stream, &mut out, std::future::pending())
+        .await
+        .unwrap_err();
+
+    // The serve stand-in closed the connection after two frames: that is an
+    // ending the caller must hear about, not a clean exit.
+    assert!(err.to_string().contains("closed the stream"), "{err}");
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        format!("{}\n{}\n", FRAMES[0], FRAMES[1])
+    );
+
+    let req = server.await.unwrap();
+    assert_eq!(req.cmd, "subscribe");
+}
+
+#[tokio::test]
+async fn stream_fails_when_serve_refuses_to_subscribe() {
+    // What a `tg serve` older than `subscribe` answers.
+    let dir = TempDir::new().unwrap();
+    let path = sock_path(&dir, "old.sock");
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        let refusal = ResponseEnvelope::err(serde_json::json!("1"), "unknown command: subscribe");
+        stub_subscribe_server(&server_path, refusal, &[], false).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut out = Vec::new();
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let err = serve_client::stream(stream, &mut out, std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("unknown command: subscribe"),
+        "{err}"
+    );
+    assert!(
+        out.is_empty(),
+        "nothing is written before the subscription holds"
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn stream_refuses_a_frame_that_is_not_an_event() {
+    let dir = TempDir::new().unwrap();
+    let path = sock_path(&dir, "odd.sock");
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        stub_subscribe_server(
+            &server_path,
+            subscribed(),
+            &[FRAMES[0], r#"{"id":"2","ok":true,"result":null}"#],
+            true,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut out = Vec::new();
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let err = serve_client::stream(stream, &mut out, std::future::pending())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not an event frame"), "{err}");
+    // Only the event made it out.
+    assert_eq!(String::from_utf8(out).unwrap(), format!("{}\n", FRAMES[0]));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn stream_ends_quietly_once_its_reader_is_gone() {
+    // stdout closed: the first frame's write fails, and `tg stream` exits
+    // cleanly and hangs up on serve.
+    let dir = TempDir::new().unwrap();
+    let path = sock_path(&dir, "gone.sock");
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        stub_subscribe_server(&server_path, subscribed(), &FRAMES, true).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (mut stdout, reader) = tokio::io::duplex(64);
+    drop(reader);
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let end = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        serve_client::stream(stream, &mut stdout, std::future::pending()),
+    )
+    .await
+    .expect("tg stream exits once its stdout is closed")
+    .unwrap();
+    assert_eq!(end, serve_client::StreamEnd::StdoutClosed);
+
+    // The stand-in only returns once the subscriber closed the connection.
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("tg stream hangs up on serve when it exits")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn stream_ends_once_its_consumer_is_gone_even_while_stdout_still_accepts() {
+    // Under `podman exec -i`, a consumer that dies never closes `tg stream`'s
+    // stdout — conmon keeps accepting the writes — but it does close stdin.
+    // So stdin's EOF must end the stream on its own.
+    let dir = TempDir::new().unwrap();
+    let path = sock_path(&dir, "consumer.sock");
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        stub_subscribe_server(&server_path, subscribed(), &FRAMES[..1], true).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let (mut stdout, reader) = tokio::io::duplex(4096);
+    let (stdin_closed, consumer_gone) = tokio::sync::oneshot::channel::<()>();
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let client = tokio::spawn(async move {
+        serve_client::stream(stream, &mut stdout, async {
+            consumer_gone.await.unwrap();
+        })
+        .await
+    });
+
+    // Streaming, and stdout still open...
+    let mut lines = BufReader::new(reader).lines();
+    assert_eq!(lines.next_line().await.unwrap().unwrap(), FRAMES[0]);
+    // ...when stdin closes.
+    stdin_closed.send(()).unwrap();
+
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), client)
+        .await
+        .expect("tg stream exits once stdin is closed")
+        .unwrap()
+        .unwrap();
+    assert_eq!(end, serve_client::StreamEnd::StdinClosed);
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .expect("tg stream hangs up on serve when it exits")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn try_connect_returns_none_when_path_missing() {
     // We don't manipulate TG_SERVE_SOCKET here (would race with other tests).

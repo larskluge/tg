@@ -53,9 +53,46 @@ Failure:
 - Empty lines are ignored.
 - Stdout/socket writes are flushed after each response.
 
-### Reserved for future use
+### Event frames (`subscribe`, since 0.11.0)
 
-The protocol reserves the shape `{"event": "<name>", "data": <value>}` (no `id`, no `ok`) for unsolicited server-to-client messages — TDLib update notifications, for example. The v1 server never emits these, but clients SHOULD ignore unrecognised top-level shapes rather than treating them as errors, so that future additions are non-breaking.
+The shape `{"event": "<name>", "data": <value>}` (no `id`, no `ok`) carries unsolicited server-to-client messages. The v1 server reserved it; since 0.11.0 a `subscribe` request uses it for TDLib updates. Clients SHOULD still ignore an unrecognised `event` name rather than treating it as an error, so that adding events stays non-breaking.
+
+`subscribe` turns the connection it arrives on into an event stream:
+
+```json
+{"id": "1", "cmd": "subscribe", "args": {}}
+{"id": "1", "ok": true, "result": {"subscribed": true}}
+{"event": "new_message", "data": {"chat_id": -1001666847309, "message_id": 89508544512}}
+{"event": "heartbeat", "data": {}}
+```
+
+After the ack the connection carries only event frames, one JSON object per line, each flushed. `args` is ignored.
+
+| event | data | from TDLib |
+|---|---|---|
+| `new_message` | `{"chat_id": i64, "message_id": i64}` | `updateNewMessage` |
+| `message_edited` | `{"chat_id": i64, "message_id": i64}` | `updateMessageContent`, `updateMessageEdited` |
+| `messages_deleted` | `{"chat_id": i64, "message_ids": [i64]}` | `updateDeleteMessages` with `is_permanent && !from_cache` |
+| `chat_last_message` | `{"chat_id": i64, "message_id": i64 \| null}` | `updateChatLastMessage` |
+| `lagged` | `{"skipped": u64}` | the subscriber fell behind the update channel |
+| `heartbeat` | `{}` | every 30 s |
+
+- **A frame is a doorbell, not a record.** It names a chat and a message and carries no content; a consumer fetches what changed with `sync`. A frame it never saw costs latency, never data, so `lagged` says only how many updates were lost, and the answer to it is a re-sync.
+- **`new_message.message_id`** can be the temporary id of a message this account is still sending. The confirmed id arrives as `chat_last_message`.
+- **One edit usually raises both** `updateMessageContent` and `updateMessageEdited`, so it arrives as two `message_edited` frames.
+- **`messages_deleted`** is sent only for `is_permanent && !from_cache`. A non-permanent deletion means the messages became inaccessible and a cache deletion means TDLib evicted them; both describe messages that still exist.
+- **`chat_last_message` has `message_id: null`** when TDLib no longer knows the chat's last message. While it does not, new messages can arrive without an `updateNewMessage`, which is why this event exists at all.
+- **`chat_last_message` bursts once per server session.** Loading a chat into memory announces its last message, so the first `chats`/`groups`/`unread` request after `tg serve` starts rings one frame per chat it loads. Measured 2026-09-30 against a local account: ~405 frames from one `tg chats --limit 2`, and none from the `chats` and `groups` requests after it.
+- **Supergroups and channels may stay silent.** TDLib documents that in them "all updates are received only for opened chats", and `tg` never calls `openChat`. How many synced groups ring anyway is to be measured on outpost; a group that does not ring loses nothing, it just waits for the consumer's next poll.
+
+Four rules govern a subscription:
+
+- **It never takes the TDLib lock.** `tg serve` takes the update channel from the client before the client goes behind its mutex, and a subscription reads only that channel. A `download` holding the lock does not delay an event.
+- **The update channel holds 1024 updates** per subscriber before it drops some for that subscriber (`lagged`). The sender never waits on a slow subscriber.
+- **It ends when the peer closes** — including a half-close, since reading EOF is how the close is noticed. A subscriber must keep its write side open. Anything it sends after `subscribe` is read and discarded.
+- **A failed write ends it**, which the heartbeat guarantees happens within 30 s of the peer vanishing. The first heartbeat comes one interval after the ack.
+
+The subscriber is attached to the channel before the ack is written, so nothing after the ack is missed. At shutdown every subscription ends at once, before the drain, so a live subscriber does not hold `tg serve`'s stop for the drain timeout.
 
 ## Socket
 
@@ -87,15 +124,16 @@ If `TG_SERVE_SOCKET` is set to the empty string (`TG_SERVE_SOCKET=`), CLI client
 **Per-connection:**
 
 - Read NDJSON requests until EOF. For each request, take the TDLib mutex, dispatch the handler, release the mutex, write the response line, flush.
+- A `subscribe` request is answered by the connection loop itself, never by the dispatcher and without the mutex, and the rest of the connection is an event stream (see [Event frames](#event-frames-subscribe-since-0110)).
 
 **Shutdown:**
 
-- SIGTERM / SIGINT: stop accepting new connections, finish any in-flight requests, call `client.shutdown().await`, unlink the socket, exit `0`.
+- SIGTERM / SIGINT: stop accepting new connections, end every subscription, finish any in-flight requests, call `client.shutdown().await`, unlink the socket, exit `0`.
 - Existing connections may be dropped abruptly if shutdown signals arrive during their requests; clients reading those responses get an EOF on the socket and surface a connection error.
 
 ### Concurrency
 
-The server accepts many connections concurrently but serialises TDLib calls through a single `tokio::sync::Mutex<TdLibClient>`. This matches TDLib's single-writer assumption and the current CLI semantics. A slow `download` blocks other requests until it completes; callers tear down + retry (or wait) — see [Out of Scope](#out-of-scope-v1).
+The server accepts many connections concurrently but serialises TDLib calls through a single `tokio::sync::Mutex<TdLibClient>`. This matches TDLib's single-writer assumption and the current CLI semantics. A slow `download` blocks other requests until it completes; callers tear down + retry (or wait) — see [Out of Scope](#out-of-scope-v1). Subscriptions are the exception: they read the update channel, not the client, so they never wait on the mutex.
 
 ## Client-Side Routing
 
@@ -137,6 +175,20 @@ Reason: TDLib needs exclusive write access to its on-disk database, and `tg auth
 
 Bot sends use the HTTP API, not TDLib, so they don't benefit from the warm client. `tg send --as <bot>` ignores the socket and runs in-process today's way. The non-bot `tg send` does route through the socket.
 
+### `tg stream` (since 0.11.0)
+
+The one command with no in-process fallback. It sends `subscribe` and copies every event frame to stdout, one line each, flushed; the ack is not printed. Updates are `tg serve`'s to hand out, and a fallback would open a second TDLib client on the database serve holds, so:
+
+- serve unreachable (socket missing, connect refused, `TG_SERVE_SOCKET=`) → exits `1` at once;
+- serve refuses `subscribe` or sends a line that is not an event frame → exits `1`;
+- serve closes the stream → exits `1` (`tg stream: tg serve closed the stream`);
+- stdout closed → exits `0`, silently. The next line written finds it out, at the latest serve's 30 s heartbeat;
+- stdin at EOF → exits `0`, with one line on stderr saying so.
+
+The stdin rule is not optional under `podman exec -i`, the way Mycelium runs it. Measured 2026-09-30 with podman 6.1.2 and a stand-in that writes a line a second: when the exec client went away — its reader closed the pipe, or the client was SIGTERMed or SIGKILLed — the process in the container kept running in all three cases, because conmon keeps accepting its writes, so stdout never closes. Podman does close the process's stdin in all three, and a stand-in that exits on stdin's EOF was gone in each. Without the rule, every consumer restart would leave one `tg stream`, and its subscription, behind. The cost is that `tg stream < /dev/null` exits at once: keep stdin open.
+
+stdin is read on a plain thread that is never joined. tokio's own docs warn that its `stdin()` read cannot be cancelled and can hang the runtime's shutdown, which would keep a `tg stream` whose serve went away alive for as long as stdin stayed open. Measured with the thread: stdin held open, `tg serve` SIGTERMed, `tg stream` exited `1` at once.
+
 ## Command Set
 
 The server accepts every subcommand whose handler talks to TDLib:
@@ -154,6 +206,7 @@ The server accepts every subcommand whose handler talks to TDLib:
 | `mark_read`   | `MarkReadRequest`     | `null`                        |
 | `mark_unread` | `MarkUnreadRequest`   | `null`                        |
 | `sync`        | `SyncRequest`         | `HashMap<String, SyncResult>` |
+| `subscribe`   | _none_                | `{"subscribed": true}`, then event frames |
 
 Notably excluded: `auth`, `auth bot`, `auth status`, `send --as <bot>`. These run in-process always.
 
@@ -251,10 +304,10 @@ Unchanged. `output.rs::print_chats_table`, `print_messages_table`, `print_output
 - Authentication commands over the socket.
 - Bot sends (`send --as <bot>`) over the socket.
 - Per-request cancellation or timeouts. A hung `download` blocks the channel; caller decides whether to wait or kill+restart the server.
-- Streaming responses (multiple frames per request id). All responses are single frames.
+- Streaming responses (multiple frames per request id). All responses are single frames. (`subscribe` answers with one ack; the event frames after it carry no `id`.)
 - TLS / authentication on the socket itself. Filesystem permissions (`0600`) are the access boundary.
 - Cross-host or network transports. Unix socket only.
-- Update notifications (TDLib `updateNewMessage` etc.). Protocol reserves `{"event": ...}` for them; v1 server never emits any.
+- ~~Update notifications~~ — in scope since 0.11.0, see [Event frames](#event-frames-subscribe-since-0110). Still out of scope: event content (frames carry ids only), per-subscription filters, and `openChat` to widen what supergroups and channels report.
 - Machine-readable error codes / typed error envelopes. Strings only in v1.
 - Automatic server startup (no systemd unit, no launchd plist). Operator runs `tg serve` themselves (or via the container's entrypoint).
 - Hot reload / re-auth without restart. Re-running `tg auth` requires stopping `tg serve` first.

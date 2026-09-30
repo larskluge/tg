@@ -57,6 +57,12 @@ pub enum Command {
 
     /// Run a long-lived TDLib server on a Unix socket so other `tg` commands skip cold start
     Serve,
+
+    #[command(
+        about = "Print message events from a running `tg serve` as NDJSON, one line each",
+        long_about = "Subscribe to the running `tg serve` and print every event frame it sends to stdout, one JSON object per line, flushed:\n\n  new_message        {\"chat_id\": i64, \"message_id\": i64}\n  message_edited     {\"chat_id\": i64, \"message_id\": i64}\n  messages_deleted   {\"chat_id\": i64, \"message_ids\": [i64]}\n  chat_last_message  {\"chat_id\": i64, \"message_id\": i64 | null}\n  lagged             {\"skipped\": u64}\n  heartbeat          {}   (every 30s)\n\nEach line is {\"event\": <name>, \"data\": {...}}. An event names a chat and a message and carries no content: fetch the message with `tg sync`. After `lagged`, events were lost; re-sync.\n\n`tg stream` never starts its own TDLib client: without a reachable `tg serve` it exits non-zero at once. It also exits non-zero when `tg serve` closes the stream. It exits 0 when its consumer goes away: once stdout is closed (noticed at the next line, at the latest the heartbeat), or once stdin reaches EOF. Keep stdin open for as long as you want events: under `podman exec -i`, stdin's EOF is the only sign that the caller has gone."
+    )]
+    Stream,
 }
 
 #[derive(Parser, Debug)]
@@ -826,6 +832,17 @@ mod tests {
     fn parse_serve() {
         let cli = Cli::parse_from(["tg", "serve"]);
         assert!(matches!(cli.command, Command::Serve));
+    }
+
+    #[test]
+    fn parse_stream() {
+        let cli = Cli::parse_from(["tg", "stream"]);
+        assert!(matches!(cli.command, Command::Stream));
+    }
+
+    #[test]
+    fn stream_takes_no_arguments() {
+        assert!(Cli::try_parse_from(["tg", "stream", "--limit", "5"]).is_err());
     }
 
     #[test]

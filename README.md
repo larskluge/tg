@@ -13,6 +13,7 @@ A modern CLI tool for interacting with Telegram, built in Rust using [TDLib](htt
 - **Download** — download media attachments from messages
 - **Mark read/unread** — manage read state of chats
 - **Long-lived server** — `tg serve` keeps a TDLib client warm so every other `tg <cmd>` skips cold start
+- **Live events** — `tg stream` prints new, edited and deleted messages from `tg serve` as they happen (machine use)
 - **Bulk sync** — fetch new messages for multiple chats in a single session (machine use)
 - **JSON output** — pass `--json` to any command for machine-readable output
 
@@ -110,6 +111,9 @@ tg mark-unread --id 123456789
 
 # Run the long-lived server so other commands skip cold start
 tg serve
+
+# Follow message events from the running server, one JSON line each
+tg stream
 ```
 
 ### Message formatting
@@ -236,7 +240,7 @@ only `ok` is never told a failure succeeded; what it gains is being able to lear
 which elements arrived instead of assuming none did. Every other failure has no
 `result`.
 
-`cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `send`, `download`, `mark_read`, `mark_unread`, `sync`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today.
+`cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `send`, `download`, `mark_read`, `mark_unread`, `sync`, `subscribe`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today. `subscribe` is different: it turns the connection into an event stream — see [Live events](#live-events-subscribe-and-tg-stream-since-0110).
 
 `send` rejects unknown `args` keys rather than ignoring them:
 
@@ -406,6 +410,68 @@ a message already in the destination chat:
 
 A daemon that predates replies refuses the key loudly — "unknown field \`reply_to\`" — and
 delivers nothing.
+
+### Live events: `subscribe` and `tg stream` (since 0.11.0)
+
+A `subscribe` request turns its connection into a stream of TDLib update events. After the usual
+reply, every line is an event frame, `{"event": <name>, "data": {...}}`:
+
+```json
+{"id": "1", "cmd": "subscribe", "args": {}}
+{"id": "1", "ok": true, "result": {"subscribed": true}}
+{"event": "new_message", "data": {"chat_id": -1001666847309, "message_id": 89508544512}}
+{"event": "chat_last_message", "data": {"chat_id": -1001666847309, "message_id": 89508544512}}
+{"event": "heartbeat", "data": {}}
+```
+
+| event | data | when |
+|---|---|---|
+| `new_message` | `{"chat_id": i64, "message_id": i64}` | TDLib `updateNewMessage` |
+| `message_edited` | `{"chat_id": i64, "message_id": i64}` | `updateMessageContent` or `updateMessageEdited` — one edit usually sends both |
+| `messages_deleted` | `{"chat_id": i64, "message_ids": [i64]}` | `updateDeleteMessages`, only when permanent and not merely a cache eviction |
+| `chat_last_message` | `{"chat_id": i64, "message_id": i64 \| null}` | `updateChatLastMessage`; `null` when TDLib no longer knows the last message, and while it does not, new messages can arrive without `new_message` |
+| `lagged` | `{"skipped": u64}` | this subscriber fell more than 1024 updates behind and lost `skipped` of them |
+| `heartbeat` | `{}` | every 30 s |
+
+An event is a **doorbell, not a record**: it names a chat and a message and carries no content.
+Fetch what changed with `sync`. A missed event costs latency, never data — after `lagged`, and
+after connecting, re-sync every chat you follow.
+
+- A subscription never waits on the server's TDLib lock, so a long `download` or `sync` does not
+  delay events.
+- It ends when you close the connection — a half-close too, so keep your write side open.
+  Anything you send after `subscribe` is ignored.
+- The heartbeat's job is to find a subscriber that vanished: its failed write ends the
+  subscription.
+- `tg serve` ends every subscription when it shuts down.
+- The first `chats`, `groups` or `unread` request after `tg serve` starts rings one
+  `chat_last_message` per chat it loads (hundreds, once per server session).
+- Supergroups and channels may not ring at all: TDLib delivers their updates "only for opened
+  chats", and `tg` opens none. Poll them as before.
+
+`tg stream` is the CLI for it: it subscribes and prints each event line to stdout, flushed —
+never the ack. It needs a running `tg serve` and never starts its own TDLib client, because that
+would be a second client on the database serve holds.
+
+```bash
+tg stream
+# {"event":"chat_last_message","data":{"chat_id":123456789,"message_id":45088768}}
+# {"event":"heartbeat","data":{}}
+```
+
+| exit | when |
+|---|---|
+| `1` | `tg serve` is not reachable, refuses `subscribe`, or closes the stream |
+| `0` | stdout was closed — noticed at the next line, at the latest the heartbeat |
+| `0` | stdin reached EOF |
+
+**Keep stdin open for as long as you want events** (`tg stream < /dev/null` exits at once). Under
+`podman exec -i`, stdin's EOF is the only sign that the caller has gone: podman closes the exec'd
+process's stdin when its client disconnects, but conmon keeps accepting its stdout, so without
+the stdin rule an orphaned `tg stream` would run forever.
+
+A `tg serve` older than 0.11.0 answers `unknown command: subscribe`; an older `tg` has no
+`stream` subcommand at all.
 
 ### One-shot bulk sync
 

@@ -221,6 +221,14 @@ pub struct TdLibClient {
 /// Maximum seconds to wait for TDLib to finish syncing updates from the server.
 const SYNC_TIMEOUT_SECS: u64 = 5;
 
+/// How many TDLib updates a subscriber of the update channel may fall behind
+/// before it loses some (`RecvError::Lagged`). A `tg serve` subscription lives
+/// for days and TDLib delivers updates in bursts — a reconnect replays
+/// everything missed — so it is sized for the burst, not the steady state. A
+/// slot only holds an update while some receiver has yet to read it, and the
+/// sender never waits on a slow receiver.
+const UPDATE_CHANNEL_CAPACITY: usize = 1024;
+
 /// Maximum seconds to wait for Telegram to confirm a media send. A file is
 /// uploaded *after* the send call returns, so this bounds an upload over the
 /// caller's link, not a round trip — hence 5 minutes rather than the text
@@ -652,8 +660,7 @@ impl TdLibClient {
 
         std::fs::create_dir_all(&data_dir)?;
 
-        // Create broadcast channel for updates (capacity 100)
-        let (update_sender, _) = broadcast::channel(100);
+        let (update_sender, _) = broadcast::channel(UPDATE_CHANNEL_CAPACITY);
 
         Ok(Self {
             client_id: Arc::new(Mutex::new(None)),
@@ -668,6 +675,15 @@ impl TdLibClient {
             sync_receiver: None,
             connection_ready: false,
         })
+    }
+
+    /// The channel every TDLib update is broadcast on — subscribe to it, never
+    /// send on it. `tg serve` takes it before the client goes behind its lock,
+    /// so a `subscribe` connection reads updates without ever taking the lock.
+    /// It is created with the client and never replaced, so a handle taken at
+    /// any point stays live for the client's lifetime.
+    pub fn updates(&self) -> broadcast::Sender<tdlib_rs::enums::Update> {
+        self.update_sender.clone()
     }
 
     /// Spawn the background receive loop as a native thread.

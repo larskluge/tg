@@ -82,6 +82,27 @@ async fn run(mut command: Command, format: OutputFormat) -> Result<()> {
         return serve::run(client).await;
     }
 
+    // Stream is socket-only, with no in-process fallback: TDLib's updates are
+    // `tg serve`'s to hand out, and a fallback would open a second TDLib client
+    // on the database serve holds.
+    if matches!(command, Command::Stream) {
+        let stream = serve_client::connect()
+            .await
+            .map_err(|e| TgError::Other(format!("tg stream needs a running `tg serve`: {e}")))?;
+        let end = serve_client::stream(
+            stream,
+            &mut tokio::io::stdout(),
+            serve_client::stdin_closed(),
+        )
+        .await?;
+        if end == serve_client::StreamEnd::StdinClosed {
+            // Silent for a consumer that has gone; says why for a human who
+            // ran `tg stream < /dev/null`.
+            eprintln!("tg stream: stdin closed, stopping (keep stdin open to keep streaming)");
+        }
+        return Ok(());
+    }
+
     // Try the warm serve socket first. If unreachable, fall through to the
     // in-process path so existing usage keeps working with no server up.
     let is_auth = matches!(&command, Command::Auth(a) if a.subcommand.is_none());
@@ -243,8 +264,8 @@ async fn route_via_serve(command: Command, stream: UnixStream, format: OutputFor
                 ));
             }
         }
-        Command::Serve | Command::Auth(_) => {
-            unreachable!("Serve and Auth are routed before route_via_serve")
+        Command::Serve | Command::Stream | Command::Auth(_) => {
+            unreachable!("Serve, Stream and Auth are routed before route_via_serve")
         }
     }
     Ok(())
@@ -586,10 +607,11 @@ async fn run_command(
             }
         }
 
-        Command::Serve => {
+        Command::Serve | Command::Stream => {
             // Serve is handled at the top of `run()` because it owns the
-            // TDLib client and its own shutdown lifecycle.
-            unreachable!("Serve is handled at the top of run()");
+            // TDLib client and its own shutdown lifecycle; Stream because it
+            // must never reach an in-process client.
+            unreachable!("Serve and Stream are handled at the top of run()");
         }
     }
 

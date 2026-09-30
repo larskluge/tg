@@ -1,10 +1,13 @@
 //! Shared serve-protocol primitives: socket path resolution, request/response
-//! envelopes, and the command dispatcher. Used by both the server
-//! (`commands/serve.rs`) and the client-side proxy (`serve_client.rs`).
+//! envelopes, the event frames a subscription carries, and the command
+//! dispatcher. Used by both the server (`commands/serve.rs`) and the
+//! client-side proxy (`serve_client.rs`).
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tdlib_rs::enums::Update;
 
 use crate::client::TelegramClient;
 use crate::commands::{
@@ -101,6 +104,95 @@ impl ResponseEnvelope {
     }
 }
 
+/// The `cmd` that turns a connection into a subscription. After its ack the
+/// connection carries only [`StreamEvent`] frames, until the peer closes it.
+pub const SUBSCRIBE_CMD: &str = "subscribe";
+
+/// How often a subscription writes a `heartbeat` frame. The heartbeat is what
+/// finds a peer that went away without closing: its write fails, and the
+/// subscription ends.
+pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The reply to `subscribe`, written once the subscriber is already attached
+/// to the update channel — so no event after the ack can be missed.
+pub fn subscribe_ack(id: serde_json::Value) -> ResponseEnvelope {
+    ResponseEnvelope::ok(id, serde_json::json!({"subscribed": true}))
+}
+
+/// An unsolicited frame on a subscribed connection, in the shape the protocol
+/// reserved for them: `{"event": "<name>", "data": {...}}`, one per line.
+///
+/// A frame is a doorbell, not a record: it names a chat and a message and
+/// carries no content. A consumer that wants the message fetches it (`sync`),
+/// so a frame it missed costs latency, never data — which is why `lagged`
+/// reports only how many were skipped.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
+pub enum StreamEvent {
+    /// `updateNewMessage`. `message_id` can be the temporary id of a message
+    /// this account is still sending; the confirmed id follows as
+    /// `chat_last_message`.
+    NewMessage { chat_id: i64, message_id: i64 },
+    /// `updateMessageContent` or `updateMessageEdited`. One edit usually
+    /// raises both, so a consumer sees two frames for it.
+    MessageEdited { chat_id: i64, message_id: i64 },
+    /// `updateDeleteMessages` with `is_permanent && !from_cache` only: the
+    /// other combinations describe messages that still exist.
+    MessagesDeleted { chat_id: i64, message_ids: Vec<i64> },
+    /// `updateChatLastMessage`. `message_id` is `null` when TDLib no longer
+    /// knows the chat's last message, and while it does not, new messages can
+    /// arrive with no `updateNewMessage` — so this frame rings for them.
+    ChatLastMessage {
+        chat_id: i64,
+        message_id: Option<i64>,
+    },
+    /// The subscriber fell behind the update channel and `skipped` updates
+    /// were dropped for it. Any of them may have been an event.
+    Lagged { skipped: u64 },
+    /// Written every [`HEARTBEAT_INTERVAL`], so a peer that vanished is found
+    /// by the failed write.
+    Heartbeat {},
+}
+
+impl StreamEvent {
+    /// The event a TDLib update rings, or `None` for the updates a subscriber
+    /// is not told about.
+    pub fn from_update(update: &Update) -> Option<Self> {
+        match update {
+            Update::NewMessage(u) => Some(Self::NewMessage {
+                chat_id: u.message.chat_id,
+                message_id: u.message.id,
+            }),
+            Update::MessageContent(u) => Some(Self::MessageEdited {
+                chat_id: u.chat_id,
+                message_id: u.message_id,
+            }),
+            Update::MessageEdited(u) => Some(Self::MessageEdited {
+                chat_id: u.chat_id,
+                message_id: u.message_id,
+            }),
+            Update::DeleteMessages(u) if u.is_permanent && !u.from_cache => {
+                Some(Self::MessagesDeleted {
+                    chat_id: u.chat_id,
+                    message_ids: u.message_ids.clone(),
+                })
+            }
+            Update::ChatLastMessage(u) => Some(Self::ChatLastMessage {
+                chat_id: u.chat_id,
+                message_id: u.last_message.as_ref().map(|m| m.id),
+            }),
+            _ => None,
+        }
+    }
+
+    /// The frame as it goes on the wire: one line of JSON, `\n`-terminated.
+    pub fn to_line(&self) -> Result<String> {
+        let mut line = serde_json::to_string(self)?;
+        line.push('\n');
+        Ok(line)
+    }
+}
+
 /// Turn a handler error into a response, attaching the structured record when
 /// the error carries one.
 fn error_response(id: serde_json::Value, e: TgError) -> ResponseEnvelope {
@@ -138,6 +230,10 @@ pub async fn dispatch<C: TelegramClient>(client: &C, env: RequestEnvelope) -> Re
         "mark_read" => execute(env.args, |r| mark_read::handle(client, r)).await,
         "mark_unread" => execute(env.args, |r| mark_unread::handle(client, r)).await,
         "sync" => execute(env.args, |r| sync::handle(client, r)).await,
+        SUBSCRIBE_CMD => Err(TgError::Other(
+            "subscribe turns the connection into an event stream, so only `tg serve`'s connection loop can answer it"
+                .to_string(),
+        )),
         "auth" | "auth_bot" | "auth_status" => Err(TgError::Other(
             "auth is not available over `tg serve`; stop the serve process and run `tg auth` directly"
                 .to_string(),
@@ -179,6 +275,7 @@ mod tests {
     use super::*;
     use crate::client::mock::MockClient;
     use serde_json::json;
+    use tdlib_rs::enums::Update;
 
     fn req(id: &str, cmd: &str, args: serde_json::Value) -> RequestEnvelope {
         RequestEnvelope {
@@ -553,6 +650,275 @@ mod tests {
         let client = MockClient::default();
         let res = dispatch(&client, req("11", "chats", json!({"limit": 5, "bogus": 1}))).await;
         assert!(res.ok, "{:?}", res.error);
+    }
+
+    /// A TDLib update exactly as it arrives on the wire, so each case below is
+    /// read from the JSON TDLib sends rather than from a hand-built struct.
+    fn update(v: serde_json::Value) -> Update {
+        serde_json::from_value(v).expect("fixture is a valid TDLib update")
+    }
+
+    /// The fields of a TDLib `message` that carry no default, around the two a
+    /// stream event reads.
+    fn tdlib_message(chat_id: i64, id: i64) -> serde_json::Value {
+        json!({
+            "@type": "message",
+            "id": id,
+            "sender_id": {"@type": "messageSenderUser", "user_id": 7},
+            "chat_id": chat_id,
+            "is_outgoing": false,
+            "is_pinned": false,
+            "is_from_offline": false,
+            "can_be_saved": true,
+            "has_timestamped_media": false,
+            "is_channel_post": false,
+            "is_paid_star_suggested_post": false,
+            "is_paid_ton_suggested_post": false,
+            "contains_unread_mention": false,
+            "date": 1_759_190_400,
+            "edit_date": 0,
+            "unread_reactions": [],
+            "self_destruct_in": 0.0,
+            "auto_delete_in": 0.0,
+            "via_bot_user_id": 0,
+            "sender_business_bot_user_id": 0,
+            "sender_boost_count": 0,
+            "paid_message_star_count": 0,
+            "author_signature": "",
+            "media_album_id": "0",
+            "effect_id": "0",
+            "summary_language_code": "",
+            "content": {
+                "@type": "messageText",
+                "text": {"@type": "formattedText", "text": "hi", "entities": []}
+            }
+        })
+    }
+
+    const CHAT: i64 = -1_001_666_847_309;
+
+    #[test]
+    fn a_new_message_rings_new_message() {
+        let u = update(json!({
+            "@type": "updateNewMessage",
+            "message": tdlib_message(CHAT, 89_508_544_512_i64),
+        }));
+        assert_eq!(
+            StreamEvent::from_update(&u),
+            Some(StreamEvent::NewMessage {
+                chat_id: CHAT,
+                message_id: 89_508_544_512,
+            })
+        );
+    }
+
+    #[test]
+    fn a_content_change_rings_message_edited() {
+        let u = update(json!({
+            "@type": "updateMessageContent",
+            "chat_id": CHAT,
+            "message_id": 42_i64 << 20,
+            "new_content": {
+                "@type": "messageText",
+                "text": {"@type": "formattedText", "text": "edited", "entities": []}
+            },
+        }));
+        assert_eq!(
+            StreamEvent::from_update(&u),
+            Some(StreamEvent::MessageEdited {
+                chat_id: CHAT,
+                message_id: 42 << 20,
+            })
+        );
+    }
+
+    #[test]
+    fn an_edit_rings_message_edited() {
+        let u = update(json!({
+            "@type": "updateMessageEdited",
+            "chat_id": CHAT,
+            "message_id": 43_i64 << 20,
+            "edit_date": 1_759_190_500,
+        }));
+        assert_eq!(
+            StreamEvent::from_update(&u),
+            Some(StreamEvent::MessageEdited {
+                chat_id: CHAT,
+                message_id: 43 << 20,
+            })
+        );
+    }
+
+    fn delete(is_permanent: bool, from_cache: bool) -> Update {
+        update(json!({
+            "@type": "updateDeleteMessages",
+            "chat_id": CHAT,
+            "message_ids": [1_i64 << 20, 2_i64 << 20],
+            "is_permanent": is_permanent,
+            "from_cache": from_cache,
+        }))
+    }
+
+    #[test]
+    fn a_permanent_deletion_rings_messages_deleted() {
+        assert_eq!(
+            StreamEvent::from_update(&delete(true, false)),
+            Some(StreamEvent::MessagesDeleted {
+                chat_id: CHAT,
+                message_ids: vec![1 << 20, 2 << 20],
+            })
+        );
+    }
+
+    #[test]
+    fn a_deletion_that_is_not_permanent_or_only_from_the_cache_is_silent() {
+        // A message that merely became inaccessible, or that TDLib only evicted
+        // from its cache, still exists: reporting it would tell a consumer to
+        // mark live messages deleted.
+        assert_eq!(StreamEvent::from_update(&delete(false, false)), None);
+        assert_eq!(StreamEvent::from_update(&delete(true, true)), None);
+        assert_eq!(StreamEvent::from_update(&delete(false, true)), None);
+    }
+
+    #[test]
+    fn a_last_message_change_rings_chat_last_message() {
+        let u = update(json!({
+            "@type": "updateChatLastMessage",
+            "chat_id": CHAT,
+            "last_message": tdlib_message(CHAT, 99_i64 << 20),
+            "positions": [],
+        }));
+        assert_eq!(
+            StreamEvent::from_update(&u),
+            Some(StreamEvent::ChatLastMessage {
+                chat_id: CHAT,
+                message_id: Some(99 << 20),
+            })
+        );
+    }
+
+    #[test]
+    fn an_unknown_last_message_rings_chat_last_message_with_no_id() {
+        // TDLib: while the last message is unknown, new messages can arrive
+        // without an updateNewMessage — so this one must still ring.
+        let u = update(json!({
+            "@type": "updateChatLastMessage",
+            "chat_id": CHAT,
+            "positions": [],
+        }));
+        assert_eq!(
+            StreamEvent::from_update(&u),
+            Some(StreamEvent::ChatLastMessage {
+                chat_id: CHAT,
+                message_id: None,
+            })
+        );
+    }
+
+    #[test]
+    fn unrelated_updates_ring_nothing() {
+        for u in [
+            json!({"@type": "updateConnectionState", "state": {"@type": "connectionStateReady"}}),
+            json!({"@type": "updateChatTitle", "chat_id": CHAT, "title": "x"}),
+            json!({
+                "@type": "updateChatReadInbox",
+                "chat_id": CHAT,
+                "last_read_inbox_message_id": 1_i64 << 20,
+                "unread_count": 0,
+            }),
+        ] {
+            assert_eq!(StreamEvent::from_update(&update(u.clone())), None, "{u}");
+        }
+    }
+
+    /// The exact bytes a subscriber reads, parsed back so key order does not
+    /// matter but every key and value does.
+    fn frame(event: &StreamEvent) -> serde_json::Value {
+        let line = event.to_line().unwrap();
+        assert!(line.ends_with('\n'), "a frame is one line: {line:?}");
+        assert_eq!(
+            line.matches('\n').count(),
+            1,
+            "a frame is one line: {line:?}"
+        );
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn event_frames_have_the_documented_shapes() {
+        assert_eq!(
+            frame(&StreamEvent::NewMessage {
+                chat_id: CHAT,
+                message_id: 5 << 20,
+            }),
+            json!({"event": "new_message", "data": {"chat_id": CHAT, "message_id": 5_i64 << 20}})
+        );
+        assert_eq!(
+            frame(&StreamEvent::MessageEdited {
+                chat_id: CHAT,
+                message_id: 5 << 20,
+            }),
+            json!({"event": "message_edited", "data": {"chat_id": CHAT, "message_id": 5_i64 << 20}})
+        );
+        assert_eq!(
+            frame(&StreamEvent::MessagesDeleted {
+                chat_id: CHAT,
+                message_ids: vec![1 << 20, 2 << 20],
+            }),
+            json!({"event": "messages_deleted", "data": {"chat_id": CHAT, "message_ids": [1_i64 << 20, 2_i64 << 20]}})
+        );
+        assert_eq!(
+            frame(&StreamEvent::ChatLastMessage {
+                chat_id: CHAT,
+                message_id: Some(5 << 20),
+            }),
+            json!({"event": "chat_last_message", "data": {"chat_id": CHAT, "message_id": 5_i64 << 20}})
+        );
+        assert_eq!(
+            frame(&StreamEvent::Lagged { skipped: 17 }),
+            json!({"event": "lagged", "data": {"skipped": 17}})
+        );
+        assert_eq!(
+            frame(&StreamEvent::Heartbeat {}),
+            json!({"event": "heartbeat", "data": {}})
+        );
+    }
+
+    #[test]
+    fn an_unknown_last_message_is_an_explicit_null() {
+        // `message_id: null` is part of the contract, not an absent key: a
+        // consumer reads `data.message_id` on every chat_last_message.
+        let line = StreamEvent::ChatLastMessage {
+            chat_id: 1,
+            message_id: None,
+        }
+        .to_line()
+        .unwrap();
+        assert_eq!(
+            line,
+            "{\"event\":\"chat_last_message\",\"data\":{\"chat_id\":1,\"message_id\":null}}\n"
+        );
+    }
+
+    #[test]
+    fn the_subscribe_ack_has_the_documented_shape() {
+        assert_eq!(
+            serde_json::to_string(&subscribe_ack(json!("1"))).unwrap(),
+            r#"{"id":"1","ok":true,"result":{"subscribed":true}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_subscribe_it_cannot_serve() {
+        // `subscribe` turns a connection into a stream, which only the
+        // connection loop can do. Reaching the dispatcher means a caller
+        // bypassed that loop, and "unknown command" would be a lie.
+        let client = MockClient::default();
+        let res = dispatch(&client, req("s", "subscribe", json!({}))).await;
+        assert!(!res.ok);
+        let err = res.error.unwrap();
+        assert!(!err.contains("unknown command"), "{err}");
+        assert!(err.contains("connection"), "{err}");
     }
 
     // Env-var-mutating tests are gathered into one to avoid cross-test races on
