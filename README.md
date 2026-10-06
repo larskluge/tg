@@ -696,7 +696,7 @@ Telegram's order:
 
 | key | |
 |---|---|
-| `emoji` | the emoji as Telegram holds it: no variation selector, so its heart is the bare `U+2764` |
+| `emoji` | the emoji as Telegram holds it. Its own reactions carry no variation selector (its heart is the bare `U+2764`); a custom emoji is spelled as its sticker spells the emoji it stands for, which may carry one |
 | `count` | everyone who reacted with it, the account included |
 | `chosen` | the account itself reacted with it |
 | `recent_senders` | the **other** people Telegram names, at most three; always present, `[]` when it names none |
@@ -705,6 +705,9 @@ Telegram's order:
 
 - **The key is absent** for a message without reactions, and in a payload from a `tg` older than
   0.12.0.
+- **Compare emoji without `U+FE0F`.** Telegram's "❤" and a keyboard's "❤️" are one emoji, and
+  both spellings occur here: of 280 entries read on 2026-10-06, one, a custom emoji, carried the
+  selector. `tg` already lists two reactions that differ only by it as one entry.
 - **The account is never in `recent_senders`**: `chosen` says it reacted. So
   `count - (chosen ? 1 : 0) - recent_senders.length` is the number of reactions nobody is named
   for. Telegram names at most three people per emoji and none in a large group.

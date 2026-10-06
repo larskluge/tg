@@ -352,7 +352,11 @@ docs, not measured: **no test and no agent ever sends a reaction to a real chat.
   `count == chosen + recent_senders.len()`; never more than three senders; 32 entries with an
   uncredited rest. `getMessageAvailableReactions` offered 73 emoji for a group message and for a
   private one, none with the selector, and `telegram_form` found the bare heart for a keyboard's.
-  `getMessage` for an id the chat does not hold answers `Not Found`.
+  `getMessage` for an id the chat does not hold answers `Not Found`. On outpost's `tg serve` the
+  same day, after the roll to 0.12.0: 1,956 messages of 35 chats, 274 with reactions in 280
+  entries, and ONE emoji with U+FE0F — U+1F441 U+FE0F in a group, which is not a reaction
+  Telegram offers, so a custom emoji listed as its sticker spells it. Telegram's own reactions
+  carry no selector; what `tg` lists can.
 - **`reactions::listed_reactions` is the one reader of `interaction_info.reactions`**, as
   `reply_in_chat` is of `reply_to`. It drops paid reactions, lists a custom emoji under the
   emoji `getCustomEmojiStickers` names for it (one call per batch of messages, cached by TDLib,

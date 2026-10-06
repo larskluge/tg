@@ -735,9 +735,10 @@ pub struct ReactionSender {
 /// and the other people Telegram names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageReactionInfo {
-    /// The emoji in Telegram's own form, which carries no variation selector
-    /// (its heart is the bare U+2764). A custom emoji is listed under the
-    /// standard emoji it stands for.
+    /// The emoji as Telegram holds it. Its own reactions carry no variation
+    /// selector (its heart is the bare U+2764). A custom emoji is listed
+    /// under the standard emoji it stands for, spelled as its sticker spells
+    /// it, which may carry one: compare emoji without U+FE0F.
     pub emoji: String,
     /// Everyone who reacted with it, the account included.
     pub count: i32,
