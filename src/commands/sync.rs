@@ -289,6 +289,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         }
     }
 

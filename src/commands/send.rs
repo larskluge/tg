@@ -283,14 +283,23 @@ pub async fn handle<C: TelegramClient>(client: &C, req: SendRequest) -> Result<S
 /// TDLib would read as a different (usually nonexistent) message. Refused by
 /// name rather than left to a lookup whose "not found" would not say why.
 fn validate_reply_to(reply_to: Option<i64>) -> Result<Option<i64>> {
+    reply_to
+        .map(|id| validate_message_id("reply_to", id))
+        .transpose()
+}
+
+/// The shape check behind [`validate_reply_to`], for any request field that
+/// names a message already on the server — `react`'s `message_id` as well.
+/// `field` is the request's own name for it, so the refusal says which one.
+pub(crate) fn validate_message_id(field: &str, id: i64) -> Result<i64> {
     const SERVER_ID_SHIFT: i64 = 1 << 20;
-    match reply_to {
-        None => Ok(None),
-        Some(id) if id > 0 && id % SERVER_ID_SHIFT == 0 => Ok(Some(id)),
-        Some(id) => Err(TgError::Other(format!(
-            "invalid reply_to {id}: expected a TDLib message id (server_id << 20, as `tg messages` prints it), \
+    if id > 0 && id % SERVER_ID_SHIFT == 0 {
+        Ok(id)
+    } else {
+        Err(TgError::Other(format!(
+            "invalid {field} {id}: expected a TDLib message id (server_id << 20, as `tg messages` prints it), \
              not a bare server id or a local message id"
-        ))),
+        )))
     }
 }
 

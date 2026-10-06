@@ -66,6 +66,8 @@ This document is a full implementation spec for the `tg` CLI, mapping every TDLi
 | `messages <NAME\|--chat ID> [--limit N]` | Read messages | `get_chat_history`, `get_user`, `get_chat` |
 | `send <NAME\|--id ID\|--group GROUP> -m "MSG"` | Send text message | `send_message`, `search_contacts`, `create_private_chat`, `search_public_chats`, `get_chat` |
 | `download --chat ID --message ID` | Download media | `get_message`, `download_file` |
+| `message --chat ID --message ID` | Read one message again, reactions included | `get_message`, `get_user`, `get_chat`, `get_custom_emoji_stickers` |
+| `react --chat ID --message ID <EMOJI> [--remove]` | Add a reaction or take it back | `get_message`, `get_message_available_reactions`, `add_message_reaction`, `remove_message_reaction` |
 | `search <QUERY>` | Search contacts | `search_contacts` |
 | `mark-read <NAME\|--id ID>` | Mark chat as read | `view_messages`, `get_chat` |
 | `mark-unread --id ID` | Mark chat as unread | `toggle_chat_is_marked_as_unread` |
@@ -259,7 +261,7 @@ WaitTdlibParameters, WaitPhoneNumber, WaitCode, WaitPassword, Ready, Closed
 #### Message Queries
 | Feature | TDLib Functions | CLI UX |
 |---------|----------------|--------|
-| Get message | `getMessage(chat_id, message_id)` | `tg message <CHAT_ID> <MSG_ID>` |
+| Get message | `getMessage(chat_id, message_id)` | Implemented (0.12.0): `tg message --chat <CHAT_ID> --message <MSG_ID>` |
 | Get messages | `getMessages(chat_id, message_ids)` | `tg message <CHAT_ID> <MSG_ID1> <MSG_ID2> ...` |
 | Get message link | `getMessageLink(chat_id, message_id, media_timestamp, for_album, in_message_thread)` | `tg message link <CHAT_ID> <MSG_ID>` |
 | Get replied message | `getRepliedMessage(chat_id, message_id)` | Shown in message display |
@@ -476,17 +478,28 @@ Member filters: `supergroupMembersFilterRecent`, `supergroupMembersFilterAdminis
 
 ## 10. Reactions
 
-### Currently Implemented
-- None
+### Currently Implemented (0.12.0)
+
+| Feature | TDLib | Where |
+|---------|-------|-------|
+| List a message's reactions | `message.interaction_info.reactions` | `reactions` on every `MessageInfo` (`tg messages`, `tg message`, `tg sync`): per emoji `count`, `chosen`, `recent_senders` |
+| Ring when they change | `updateMessageInteractionInfo` | the `message_reactions` frame of `subscribe` / `tg stream` |
+| Read one message again | `getMessage(chat_id, message_id)` | `tg message --chat <CHAT_ID> --message <MSG_ID>`, socket `message` |
+| Add reaction | `addMessageReaction(chat_id, message_id, reaction_type, is_big: false, update_recent_reactions: true)` | `tg react --chat <CHAT_ID> --message <MSG_ID> <EMOJI>`, socket `react` |
+| Remove reaction | `removeMessageReaction(chat_id, message_id, reaction_type)` | `tg react --chat <CHAT_ID> --message <MSG_ID> [<EMOJI>] --remove`, socket `react` with `remove` |
+| Get available reactions | `getMessageAvailableReactions(chat_id, message_id, row_size)` | Internal: `react` finds Telegram's spelling of the emoji in it |
+| Name a custom emoji | `getCustomEmojiStickers(custom_emoji_ids)` | Internal: a custom emoji reaction is listed under the standard emoji it stands for |
+
+The shapes are in `README.md` (*Reactions*, *`react`*, *One message*); what TDLib does and does
+not deliver is in `AGENTS.md` (*Reactions*). Custom-emoji and paid reactions cannot be sent, and
+a reaction is never sent big.
 
 ### To Implement
 
 | Feature | TDLib Functions | CLI UX |
 |---------|----------------|--------|
-| Add reaction | `addMessageReaction(chat_id, message_id, reaction_type, is_big, update_recent_reactions)` | `tg react <CHAT_ID> <MSG_ID> <EMOJI>` |
-| Remove reaction | `removeMessageReaction(chat_id, message_id, reaction_type)` | `tg react <CHAT_ID> <MSG_ID> <EMOJI> --remove` |
-| Get message reactions | `getMessageAddedReactions(chat_id, message_id, reaction_type, offset, limit)` | `tg reactions <CHAT_ID> <MSG_ID>` |
-| Get available reactions | `getMessageAvailableReactions(chat_id, message_id, row_size)` | Internal |
+| Reactions between other people in a group | `openChat` + `viewMessages` (a non-history source) + `closeChat`, which makes TDLib poll `messages.getMessagesReactions`; or `getMessageAddedReactions(chat_id, message_id, reaction_type, offset, limit)` per message | None yet. TDLib receives these only by polling; see `AGENTS.md` → *Reactions* before building |
+| Who reacted, beyond the three Telegram names | `getMessageAddedReactions(chat_id, message_id, reaction_type, offset, limit)` | `tg reactions <CHAT_ID> <MSG_ID>` |
 | Set chat reactions | `setChatAvailableReactions(chat_id, available_reactions)` | `tg chat set-reactions <CHAT_ID>` |
 | Set default reaction | `setDefaultReaction(reaction_type)` | `tg settings default-reaction <EMOJI>` |
 | Read all reactions | `readAllChatReactions(chat_id)` | `tg chat read-reactions <CHAT_ID>` |
@@ -1291,10 +1304,11 @@ pub trait TelegramClient {
     async fn mark_chat_as_read(&self, chat_id: i64) -> Result<()>;
     async fn mark_chat_as_unread(&self, chat_id: i64) -> Result<()>;
 
-    // === Reactions ===
-    async fn add_reaction(&self, chat_id: i64, msg_id: i64, emoji: &str) -> Result<()>;
-    async fn remove_reaction(&self, chat_id: i64, msg_id: i64, emoji: &str) -> Result<()>;
-    async fn get_reactions(&self, chat_id: i64, msg_id: i64) -> Result<Vec<ReactionInfo>>;
+    // === Reactions === (implemented in 0.12.0; a message's reactions ride on its MessageInfo)
+    async fn get_message(&self, chat_id: i64, message_id: i64) -> Result<MessageInfo>;
+    async fn get_available_reactions(&self, chat_id: i64, message_id: i64) -> Result<Vec<String>>;
+    async fn add_message_reaction(&self, chat_id: i64, message_id: i64, emoji: &str) -> Result<()>;
+    async fn remove_message_reaction(&self, chat_id: i64, message_id: i64, emoji: &str) -> Result<()>;
 
     // === Search ===
     async fn search_contacts(&self, query: &str) -> Result<Vec<ContactInfo>>;

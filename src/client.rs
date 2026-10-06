@@ -13,9 +13,10 @@ use crate::media::{MediaFile, MediaKind};
 use crate::output::{
     ChatInfo, ContactInfo, DeliveredElement, DownloadReport, DownloadStatus, DownloadedFileResult,
     FailedElement, MediaElements, MessageContentDetails, MessageFileRef, MessageInfo,
-    PartialSendResult, SendResult,
+    MessageReactionInfo, PartialSendResult, ReactionSender, SendResult,
 };
 use crate::parse_mode::ParseMode;
+use crate::reactions::{self, CustomEmoji};
 
 // Direct FFI to TDLib's synchronous log functions (not exposed by tdlib-rs)
 #[link(name = "tdjson")]
@@ -158,6 +159,30 @@ pub trait TelegramClient: Send + Sync {
         until_message_id: Option<i64>,
     ) -> Result<Vec<MessageInfo>>;
 
+    /// One message by its id, as a listing gives it: from TDLib's cache, or
+    /// fetched from Telegram when TDLib does not hold it. Cursors and windows
+    /// do not apply. An id that names nothing in `chat_id` is an error.
+    async fn get_message(&self, chat_id: i64, message_id: i64) -> Result<MessageInfo>;
+
+    /// Every emoji Telegram offers as a reaction to this message, each in
+    /// Telegram's own spelling.
+    async fn get_available_reactions(&self, chat_id: i64, message_id: i64) -> Result<Vec<String>>;
+
+    /// React to a message with exactly this emoji: not big, and counted among
+    /// the account's recent reactions. Returns once Telegram has answered. Its
+    /// refusal is [`TgError::TdLib`] carrying Telegram's own reason.
+    async fn add_message_reaction(&self, chat_id: i64, message_id: i64, emoji: &str) -> Result<()>;
+
+    /// Take back the account's reaction that [`TelegramClient::get_message`]
+    /// lists as `emoji`. Refused as [`TelegramClient::add_message_reaction`]
+    /// is.
+    async fn remove_message_reaction(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: &str,
+    ) -> Result<()>;
+
     /// Up to `limit` messages with id > `after_message_id` — the OLDEST ones —
     /// in ascending id order, holding at most `limit` in memory.
     /// `after_message_id <= 0` starts at the chat's first message.
@@ -239,6 +264,29 @@ const MEDIA_SEND_TIMEOUT_SECS: u64 = 300;
 /// text path's own confirmation wait, so a reply send still answers well inside a
 /// caller's socket deadline. Expiry refuses the send: see `check_reply_target`.
 const REPLY_CHECK_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum seconds to read one message by id. TDLib answers from its cache at
+/// once, and fetches a message it does not hold over the network: that is the
+/// wait this bounds.
+const MESSAGE_READ_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum seconds to wait for Telegram's answer to a reaction. TDLib shows a
+/// reaction on its own copy of the message at once and only then asks
+/// Telegram, so running out of time says nothing about the outcome.
+const REACTION_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum seconds to learn which emoji a custom emoji stands for. TDLib
+/// answers from its cache once it has seen one and asks Telegram the first
+/// time; a listing does not wait longer than this for it.
+const CUSTOM_EMOJI_TIMEOUT_SECS: u64 = 5;
+
+/// `getCustomEmojiStickers` takes at most this many ids per call.
+const CUSTOM_EMOJI_BATCH: usize = 200;
+
+/// `getMessageAvailableReactions` sorts what it answers into rows for a
+/// picker, of 5 to 25 emoji. Every offered emoji is in the answer whatever the
+/// width, so this is only a valid one.
+const REACTION_ROW_SIZE: i32 = 8;
 
 /// Whether `count` elements go out as an album.
 ///
@@ -649,6 +697,206 @@ impl TdLibClient {
             )));
         }
         Ok(())
+    }
+
+    /// `getMessage`, bounded by [`MESSAGE_READ_TIMEOUT_SECS`].
+    async fn tdlib_message(
+        &self,
+        client_id: i32,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<tdlib_rs::types::Message> {
+        let timeout = tokio::time::Duration::from_secs(MESSAGE_READ_TIMEOUT_SECS);
+        let read = tdlib_rs::functions::get_message(chat_id, message_id, client_id);
+        match tokio::time::timeout(timeout, read).await {
+            Ok(Ok(message)) => Ok(unwrap_message(message)),
+            Ok(Err(e)) => Err(TgError::Other(format!(
+                "message {message_id} is not accessible in chat {chat_id}: {}",
+                e.message
+            ))),
+            Err(_) => Err(TgError::Other(format!(
+                "message {message_id} in chat {chat_id} could not be read within {MESSAGE_READ_TIMEOUT_SECS}s"
+            ))),
+        }
+    }
+
+    /// TDLib messages as the `MessageInfo`s every listing gives, in order.
+    async fn message_infos(
+        &self,
+        client_id: i32,
+        messages: Vec<tdlib_rs::types::Message>,
+    ) -> Vec<MessageInfo> {
+        let custom = self
+            .custom_emoji(
+                client_id,
+                messages.iter().map(|m| m.interaction_info.as_ref()),
+            )
+            .await;
+        let mut result = Vec::with_capacity(messages.len());
+        for msg in messages {
+            result.push(self.message_info(client_id, msg, &custom).await);
+        }
+        result
+    }
+
+    /// One TDLib message as a `MessageInfo`. `custom` names the standard emoji
+    /// behind the custom emoji its reactions use ([`Self::custom_emoji`]).
+    async fn message_info(
+        &self,
+        client_id: i32,
+        msg: tdlib_rs::types::Message,
+        custom: &CustomEmoji,
+    ) -> MessageInfo {
+        let extracted = extract_message_data(&msg.content);
+        let (sender_id, sender, sender_is_bot) = match &msg.sender_id {
+            tdlib_rs::enums::MessageSender::User(u) => {
+                match tdlib_rs::functions::get_user(u.user_id, client_id).await {
+                    Ok(ue) => {
+                        let user = unwrap_user(ue);
+                        let is_bot = user_type_is_bot(&user.r#type);
+                        (Some(u.user_id), get_user_full_name(&user), Some(is_bot))
+                    }
+                    // No user object, no answer. The gap travels as
+                    // "Unknown"/`null` rather than as a guessed `false`.
+                    Err(_) => (Some(u.user_id), "Unknown".to_string(), None),
+                }
+            }
+            tdlib_rs::enums::MessageSender::Chat(c) => {
+                let name = if let Ok(ce) = tdlib_rs::functions::get_chat(c.chat_id, client_id).await
+                {
+                    unwrap_chat(ce).title
+                } else {
+                    "Unknown".to_string()
+                };
+                // A chat sender is a channel or group, not a user account,
+                // so it carries no bot marker either way.
+                (None, name, Some(false))
+            }
+        };
+
+        let mut listed = Vec::new();
+        for reaction in reactions::listed_reactions(msg.interaction_info.as_ref(), custom) {
+            let mut recent_senders = Vec::with_capacity(reaction.senders.len());
+            for sender in &reaction.senders {
+                recent_senders.push(self.reaction_sender(client_id, sender).await);
+            }
+            listed.push(MessageReactionInfo {
+                emoji: reaction.emoji,
+                count: reaction.count,
+                chosen: reaction.chosen,
+                recent_senders,
+            });
+        }
+
+        MessageInfo {
+            id: msg.id,
+            chat_id: msg.chat_id,
+            sender_id,
+            sender,
+            sender_is_bot,
+            text: extracted.text,
+            date: format_timestamp(msg.date),
+            timestamp: msg.date,
+            is_outgoing: msg.is_outgoing,
+            edit_date: if msg.edit_date == 0 {
+                None
+            } else {
+                Some(format_timestamp(msg.edit_date))
+            },
+            content_type: extracted.content_type,
+            is_downloadable: extracted.is_downloadable,
+            download_files: extracted.download_files,
+            content: extracted.content,
+            reply_to_message_id: reply_in_chat(msg.chat_id, msg.reply_to.as_ref()),
+            reactions: listed,
+        }
+    }
+
+    /// Who reacted, as a message's sender is given: a user by id and display
+    /// name, a chat by its title alone. `getUser` and `getChat` answer from
+    /// TDLib's memory, and what TDLib does not know there has no name: the
+    /// sender is then listed without one.
+    async fn reaction_sender(
+        &self,
+        client_id: i32,
+        sender: &tdlib_rs::enums::MessageSender,
+    ) -> ReactionSender {
+        match sender {
+            tdlib_rs::enums::MessageSender::User(u) => ReactionSender {
+                id: Some(u.user_id),
+                name: tdlib_rs::functions::get_user(u.user_id, client_id)
+                    .await
+                    .ok()
+                    .map(|user| get_user_full_name(&unwrap_user(user)))
+                    .filter(|name| !name.is_empty()),
+            },
+            tdlib_rs::enums::MessageSender::Chat(c) => ReactionSender {
+                id: None,
+                name: tdlib_rs::functions::get_chat(c.chat_id, client_id)
+                    .await
+                    .ok()
+                    .map(|chat| unwrap_chat(chat).title)
+                    .filter(|title| !title.is_empty()),
+            },
+        }
+    }
+
+    /// The standard emoji behind every custom emoji these messages' reactions
+    /// use: one `getCustomEmojiStickers` call per [`CUSTOM_EMOJI_BATCH`] of
+    /// them, and none when there are none.
+    ///
+    /// A custom emoji this cannot name is not an error for the listing: the
+    /// reaction is left out of it, as the contract says, and the reason goes
+    /// to stderr.
+    async fn custom_emoji<'a>(
+        &self,
+        client_id: i32,
+        infos: impl Iterator<Item = Option<&'a tdlib_rs::types::MessageInteractionInfo>>,
+    ) -> CustomEmoji {
+        let mut ids: Vec<i64> = Vec::new();
+        for info in infos {
+            for id in reactions::custom_emoji_ids(info) {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+
+        let mut names = CustomEmoji::new();
+        let timeout = tokio::time::Duration::from_secs(CUSTOM_EMOJI_TIMEOUT_SECS);
+        for batch in ids.chunks(CUSTOM_EMOJI_BATCH) {
+            let lookup = tdlib_rs::functions::get_custom_emoji_stickers(batch.to_vec(), client_id);
+            match tokio::time::timeout(timeout, lookup).await {
+                Ok(Ok(tdlib_rs::enums::Stickers::Stickers(found))) => {
+                    names.extend(reactions::custom_emoji_names(&found.stickers));
+                }
+                Ok(Err(e)) => eprintln!(
+                    "tg: could not read what {} custom emoji stand for ({}); reactions with them are left out",
+                    batch.len(),
+                    e.message
+                ),
+                Err(_) => eprintln!(
+                    "tg: could not read what {} custom emoji stand for within {CUSTOM_EMOJI_TIMEOUT_SECS}s; reactions with them are left out",
+                    batch.len()
+                ),
+            }
+        }
+        names
+    }
+
+    /// Wait for Telegram's answer to a reaction change, for at most
+    /// [`REACTION_TIMEOUT_SECS`].
+    async fn reaction_answer(
+        call: impl std::future::Future<Output = std::result::Result<(), tdlib_rs::types::Error>>,
+    ) -> Result<()> {
+        let timeout = tokio::time::Duration::from_secs(REACTION_TIMEOUT_SECS);
+        match tokio::time::timeout(timeout, call).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(TgError::TdLib(e.message)),
+            Err(_) => Err(TgError::Other(format!(
+                "Telegram did not answer within {REACTION_TIMEOUT_SECS}s; the change may still take effect"
+            ))),
+        }
     }
 
     pub fn new(api_id: i32, api_hash: String) -> Result<Self> {
@@ -2674,57 +2922,12 @@ impl MessageHistorySource for TdLibClient {
             }
         })?;
 
-        let mut result = Vec::new();
-        for msg in unwrap_messages(msgs_enum).messages.into_iter().flatten() {
-            let extracted = extract_message_data(&msg.content);
-            let (sender_id, sender, sender_is_bot) = match &msg.sender_id {
-                tdlib_rs::enums::MessageSender::User(u) => {
-                    match tdlib_rs::functions::get_user(u.user_id, client_id).await {
-                        Ok(ue) => {
-                            let user = unwrap_user(ue);
-                            let is_bot = user_type_is_bot(&user.r#type);
-                            (Some(u.user_id), get_user_full_name(&user), Some(is_bot))
-                        }
-                        // No user object, no answer. The gap travels as
-                        // "Unknown"/`null` rather than as a guessed `false`.
-                        Err(_) => (Some(u.user_id), "Unknown".to_string(), None),
-                    }
-                }
-                tdlib_rs::enums::MessageSender::Chat(c) => {
-                    let name =
-                        if let Ok(ce) = tdlib_rs::functions::get_chat(c.chat_id, client_id).await {
-                            unwrap_chat(ce).title
-                        } else {
-                            "Unknown".to_string()
-                        };
-                    // A chat sender is a channel or group, not a user account,
-                    // so it carries no bot marker either way.
-                    (None, name, Some(false))
-                }
-            };
-            result.push(MessageInfo {
-                id: msg.id,
-                chat_id: msg.chat_id,
-                sender_id,
-                sender,
-                sender_is_bot,
-                text: extracted.text,
-                date: format_timestamp(msg.date),
-                timestamp: msg.date,
-                is_outgoing: msg.is_outgoing,
-                edit_date: if msg.edit_date == 0 {
-                    None
-                } else {
-                    Some(format_timestamp(msg.edit_date))
-                },
-                content_type: extracted.content_type,
-                is_downloadable: extracted.is_downloadable,
-                download_files: extracted.download_files,
-                content: extracted.content,
-                reply_to_message_id: reply_in_chat(msg.chat_id, msg.reply_to.as_ref()),
-            });
-        }
-        Ok(result)
+        let messages = unwrap_messages(msgs_enum)
+            .messages
+            .into_iter()
+            .flatten()
+            .collect();
+        Ok(self.message_infos(client_id, messages).await)
     }
 }
 
@@ -3285,6 +3488,90 @@ impl TelegramClient for TdLibClient {
         collect_messages_forward(self, chat_id, after_message_id, limit).await
     }
 
+    async fn get_message(&self, chat_id: i64, message_id: i64) -> Result<MessageInfo> {
+        let client_id = self.get_client_id().await?;
+        let message = self.tdlib_message(client_id, chat_id, message_id).await?;
+        let custom = self
+            .custom_emoji(
+                client_id,
+                std::iter::once(message.interaction_info.as_ref()),
+            )
+            .await;
+        Ok(self.message_info(client_id, message, &custom).await)
+    }
+
+    async fn get_available_reactions(&self, chat_id: i64, message_id: i64) -> Result<Vec<String>> {
+        let client_id = self.get_client_id().await?;
+        let tdlib_rs::enums::AvailableReactions::AvailableReactions(offered) =
+            tdlib_rs::functions::get_message_available_reactions(
+                chat_id,
+                message_id,
+                REACTION_ROW_SIZE,
+                client_id,
+            )
+            .await
+            .map_err(|e| {
+                TgError::Other(format!(
+                    "could not read which reactions message {message_id} in chat {chat_id} takes: {}",
+                    e.message
+                ))
+            })?;
+        // TDLib sorts every offered reaction into exactly one of the three
+        // lists, so together they are all of them.
+        Ok(offered
+            .top_reactions
+            .iter()
+            .chain(&offered.recent_reactions)
+            .chain(&offered.popular_reactions)
+            .filter_map(|reaction| match &reaction.r#type {
+                tdlib_rs::enums::ReactionType::Emoji(e) => Some(e.emoji.clone()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    async fn add_message_reaction(&self, chat_id: i64, message_id: i64, emoji: &str) -> Result<()> {
+        let client_id = self.get_client_id().await?;
+        let reaction = tdlib_rs::enums::ReactionType::Emoji(tdlib_rs::types::ReactionTypeEmoji {
+            emoji: emoji.to_string(),
+        });
+        // Not big, and counted among the account's recent reactions, as a
+        // reaction picked in a Telegram app is.
+        Self::reaction_answer(tdlib_rs::functions::add_message_reaction(
+            chat_id, message_id, reaction, false, true, client_id,
+        ))
+        .await
+    }
+
+    async fn remove_message_reaction(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        emoji: &str,
+    ) -> Result<()> {
+        let client_id = self.get_client_id().await?;
+        // What is listed as one emoji can be more than one TDLib reaction (a
+        // custom emoji beside the standard one it stands for), and TDLib takes
+        // back exactly the type it is given: so read which ones are the
+        // account's, as the listing read them.
+        let message = self.tdlib_message(client_id, chat_id, message_id).await?;
+        let info = message.interaction_info.as_ref();
+        let custom = self.custom_emoji(client_id, std::iter::once(info)).await;
+        let own = reactions::chosen_types(info, &custom, emoji);
+        if own.is_empty() {
+            return Err(TgError::Other(format!(
+                "message {message_id} in chat {chat_id} holds no reaction of the account to take back"
+            )));
+        }
+        for reaction in own {
+            Self::reaction_answer(tdlib_rs::functions::remove_message_reaction(
+                chat_id, message_id, reaction, client_id,
+            ))
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn get_boundary_message_id(
         &self,
         chat_id: i64,
@@ -3784,10 +4071,34 @@ pub mod mock {
         pub presence_error_chat_ids: Vec<i64>,
         /// Tracks how many times `get_chat_presence` has been called
         pub get_chat_presence_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// The reactions a message carries, by `(chat_id, message_id)`. What
+        /// `get_message` reports, and what a reaction call changes.
+        pub reactions:
+            std::sync::Mutex<std::collections::HashMap<(i64, i64), Vec<MessageReactionInfo>>>,
+        /// The emoji this Telegram offers, in its own spelling. Like TDLib,
+        /// `add_message_reaction` takes these bytes and no others.
+        pub available_reactions: Vec<String>,
+        /// When set, every reaction call is refused with this as Telegram's
+        /// reason.
+        pub reaction_refusal: Option<String>,
+        /// When set, a reaction call is accepted and changes nothing: the case
+        /// the read-back exists for.
+        pub reactions_take_no_effect: bool,
+        /// Every reaction call the client was asked for, refused ones too.
+        pub reaction_calls: std::sync::Mutex<Vec<ReactionCall>>,
+        /// Tracks how many times `get_message` has been called
+        pub get_message_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     /// One recorded media send: `(chat_id, caption, parse_mode, files)`.
     pub type MediaSendRecord = (i64, String, Option<ParseMode>, Vec<MediaFile>);
+
+    /// One recorded reaction call: `(chat_id, message_id, emoji)`.
+    #[derive(Debug, Clone, PartialEq)]
+    pub enum ReactionCall {
+        Added(i64, i64, String),
+        Removed(i64, i64, String),
+    }
 
     impl MockClient {
         pub fn with_state(state: AuthState) -> Self {
@@ -3866,6 +4177,17 @@ pub mod mock {
                 get_chat_presence_call_count: std::sync::Arc::new(
                     std::sync::atomic::AtomicUsize::new(0),
                 ),
+                reactions: std::sync::Mutex::new(std::collections::HashMap::new()),
+                // Telegram's spellings: its heart carries no variation selector.
+                available_reactions: vec![
+                    "👍".to_string(),
+                    "\u{2764}".to_string(),
+                    "🔥".to_string(),
+                ],
+                reaction_refusal: None,
+                reactions_take_no_effect: false,
+                reaction_calls: std::sync::Mutex::new(Vec::new()),
+                get_message_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 messages: vec![
                     MessageInfo {
                         id: 1,
@@ -3883,6 +4205,7 @@ pub mod mock {
                         download_files: vec![],
                         content: None,
                         reply_to_message_id: None,
+                        reactions: vec![],
                     },
                     MessageInfo {
                         id: 2,
@@ -3900,6 +4223,7 @@ pub mod mock {
                         download_files: vec![],
                         content: None,
                         reply_to_message_id: None,
+                        reactions: vec![],
                     },
                 ],
             }
@@ -4103,6 +4427,119 @@ pub mod mock {
             msgs.sort_unstable_by_key(|m| m.id);
             msgs.truncate(limit.max(0) as usize);
             Ok(msgs)
+        }
+
+        /// A message is readable exactly when `messages` holds it in that
+        /// chat. Its reactions are the ones `reactions` holds for it.
+        async fn get_message(&self, chat_id: i64, message_id: i64) -> Result<MessageInfo> {
+            self.get_message_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut message = self
+                .messages
+                .iter()
+                .find(|m| m.chat_id == chat_id && m.id == message_id)
+                .cloned()
+                .ok_or_else(|| {
+                    TgError::Other(format!(
+                        "message {message_id} is not accessible in chat {chat_id}: Message not found"
+                    ))
+                })?;
+            if let Some(reactions) = self.reactions.lock().unwrap().get(&(chat_id, message_id)) {
+                message.reactions = reactions.clone();
+            }
+            Ok(message)
+        }
+
+        async fn get_available_reactions(
+            &self,
+            _chat_id: i64,
+            _message_id: i64,
+        ) -> Result<Vec<String>> {
+            Ok(self.available_reactions.clone())
+        }
+
+        /// Refuses, as TDLib does, an emoji that is not byte for byte one of
+        /// the offered ones. An account without Premium has one reaction per
+        /// message, so another emoji replaces the one it had.
+        async fn add_message_reaction(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            emoji: &str,
+        ) -> Result<()> {
+            self.reaction_calls
+                .lock()
+                .unwrap()
+                .push(ReactionCall::Added(chat_id, message_id, emoji.to_string()));
+            if let Some(reason) = &self.reaction_refusal {
+                return Err(TgError::TdLib(reason.clone()));
+            }
+            if !self.available_reactions.iter().any(|e| e == emoji) {
+                return Err(TgError::TdLib(
+                    "The reaction isn't available for the message".to_string(),
+                ));
+            }
+            if self.reactions_take_no_effect {
+                return Ok(());
+            }
+
+            let mut all = self.reactions.lock().unwrap();
+            let list = all.entry((chat_id, message_id)).or_default();
+            for other in list.iter_mut().filter(|r| r.chosen && r.emoji != emoji) {
+                other.chosen = false;
+                other.count -= 1;
+            }
+            list.retain(|r| r.count > 0);
+            match list.iter_mut().find(|r| r.emoji == emoji) {
+                Some(same) if same.chosen => {}
+                Some(same) => {
+                    same.chosen = true;
+                    same.count += 1;
+                }
+                None => list.push(MessageReactionInfo {
+                    emoji: emoji.to_string(),
+                    count: 1,
+                    chosen: true,
+                    recent_senders: vec![],
+                }),
+            }
+            Ok(())
+        }
+
+        async fn remove_message_reaction(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            emoji: &str,
+        ) -> Result<()> {
+            self.reaction_calls
+                .lock()
+                .unwrap()
+                .push(ReactionCall::Removed(
+                    chat_id,
+                    message_id,
+                    emoji.to_string(),
+                ));
+            if let Some(reason) = &self.reaction_refusal {
+                return Err(TgError::TdLib(reason.clone()));
+            }
+            if self.reactions_take_no_effect {
+                return Ok(());
+            }
+
+            if let Some(list) = self
+                .reactions
+                .lock()
+                .unwrap()
+                .get_mut(&(chat_id, message_id))
+            {
+                for own in list.iter_mut().filter(|r| r.chosen && r.emoji == emoji) {
+                    own.chosen = false;
+                    own.count -= 1;
+                }
+                list.retain(|r| r.count > 0);
+            }
+            Ok(())
         }
 
         async fn get_boundary_message_id(
@@ -4906,6 +5343,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         }
     }
 

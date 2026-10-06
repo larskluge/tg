@@ -94,6 +94,8 @@ tg send --to @username --parse-mode HTML -m "<b>bold</b> and <code>code</code>"
 tg send --as @mybot --to @someone --parse-mode HTML -m "<b>Hello</b>"
 tg messages "John Doe" [--limit 20] [--since-utc 2026-03-01]
 tg messages --chat -1001666847309 [--limit 20] [--since-utc 2026-03-01]
+tg message --chat -1001666847309 --message 89508544512 [--json]   # one message, reactions included
+tg react --chat -1001666847309 --message 89508544512 👍 [--remove]  # NEVER against a real chat from a test or an agent
 tg download --chat -1001666847309 --message 42 [--output-dir .] [--priority 16]
 tg search "John"
 tg mark-read "John Doe"
@@ -116,7 +118,8 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 - `client.rs` - TDLib client wrapper with `TelegramClient` trait for mocking
 - `media.rs` - `send`'s attachments: the `SendFile` wire mirror, the validated `MediaFile`, and the one validator both go through
 - `output.rs` - Dual output formatting (plain text default, JSON with `--json`)
-- `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers; `serve.rs` holds the socket listener and the subscription loop)
+- `reactions.rs` - Pure functions over TDLib's reaction types: `listed_reactions` (the ONE reader of `interaction_info.reactions`), `telegram_form` (which spelling of an emoji Telegram takes), `chosen_types` (what to take back)
+- `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers; `message.rs` re-reads one message; `react.rs` adds or takes back a reaction; `serve.rs` holds the socket listener and the subscription loop)
 - `serve.rs` - The serve protocol: envelopes, the dispatcher, and the `StreamEvent` frames a `subscribe` connection carries (`StreamEvent::from_update` is the one TDLib-update → event mapping)
 - `serve_client.rs` - The CLI's side of the socket: one request per connection, plus `stream` for `tg stream`
 
@@ -316,7 +319,8 @@ are a contract with Mycelium's Telegram consumer (its spec:
   requests after it.
 - **Supergroups and channels may not ring.** TDLib's `openChat` docs: "all updates are received
   only for opened chats" in them. `tg` does not call `openChat`; how many synced groups ring
-  anyway is to be measured on outpost.
+  anyway is to be measured on outpost. For `message_reactions` the answer is known and is not
+  about `openChat`: see **Reactions** below.
 - **`tg stream` has no in-process fallback**, unlike every other command: a second TDLib client
   on serve's database is the one thing it must never open. It exits 1 when serve is
   unreachable or ends the stream, and 0 when its stdout closes **or its stdin reaches EOF**.
@@ -327,12 +331,97 @@ are a contract with Mycelium's Telegram consumer (its spec:
   tokio's `stdin()` cannot be cancelled and would hold the runtime's shutdown — and so the exit
   after `tg serve closed the stream` — until stdin closed.
 
-**Serve request strictness:** `SendRequest` and its nested `media::SendFile` are the only serve
-request structs carrying `#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs
+**Serve request strictness:** `SendRequest`, its nested `media::SendFile` and `ReactRequest` —
+the requests that put something in a chat — are the only serve request structs carrying
+`#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs
 the container's `HealthCmd` (`tg whoami`, `HealthStartupTimeout=2m`), so tightening it risks
 the health gate for no benefit, and the remaining structs have caller sets that were never
 audited. `dispatch_other_commands_still_ignore_unknown_args` pins the decision so a later
 blanket change has to be deliberate.
+
+**Reactions (since 0.12.0):** a listed message carries `reactions`, `subscribe` rings
+`message_reactions`, `message` re-reads one message, `react` adds or takes back. The shapes are
+a contract with Mycelium (its `message_reactions` projector) and Postmaster (`send_reaction`),
+documented in `README.md` → *Reactions*, *`react`*, *One message*. All of the following was read
+from TDLib's source at the commit tdlib-rs 1.3.0 pins (`11e254af`, 1.8.61) and from Telegram's API
+docs, not measured: **no test and no agent ever sends a reaction to a real chat.**
+
+- **Measured read-only on 2026-10-06** (a local session, listing only, counts only): 2,669
+  messages of 37 chats, 389 with reactions in 438 entries; no emoji with U+FE0F in any of them;
+  the account never among `recent_senders`; in all 232 entries of one-to-one chats
+  `count == chosen + recent_senders.len()`; never more than three senders; 32 entries with an
+  uncredited rest. `getMessageAvailableReactions` offered 73 emoji for a group message and for a
+  private one, none with the selector, and `telegram_form` found the bare heart for a keyboard's.
+  `getMessage` for an id the chat does not hold answers `Not Found`.
+- **`reactions::listed_reactions` is the one reader of `interaction_info.reactions`**, as
+  `reply_in_chat` is of `reply_to`. It drops paid reactions, lists a custom emoji under the
+  emoji `getCustomEmojiStickers` names for it (one call per batch of messages, cached by TDLib,
+  5 s at most; unnamed ones are left out with a line on stderr), merges two TDLib reactions that
+  are one emoji once variation selectors are set aside, and keeps the account out of the senders.
+- **`used_sender_id` is how the account is recognised among `recent_sender_ids`.** TDLib sets it
+  exactly when the reaction is chosen AND the account's own sender is among the recent choosers it
+  returns (`MessageReaction::get_message_reaction_object`): always in a private chat, where it
+  builds the list itself (the account if chosen, then the peer if the count leaves room), and in
+  a group only when Telegram named the account among the recent three. So "drop the sender equal
+  to `used_sender_id`" is exact, and `count - chosen - recent_senders.len()` is the uncredited
+  rest. `recent_senders[].id` is `null` for a chat sender, as `sender_id` is on a message.
+- **TDLib compares a reaction to the offered ones byte for byte.** `ReactionType` keeps the string
+  as given and `addMessageReaction` answers 400 `The reaction isn't available for the message`
+  unless `ChatReactions::is_allowed_reaction_type` finds it. Telegram's forms carry no U+FE0F (its
+  heart is U+2764), a keyboard's do. `react` therefore reads `getMessageAvailableReactions` first
+  and sends the offered emoji that equals the asked one without variation selectors
+  (`telegram_form`); none found, it sends the emoji as given so the refusal is Telegram's own.
+  The three lists of `availableReactions` together hold every offered reaction
+  (`get_sorted_available_reactions` ends in `CHECK(all_available_reaction_types.empty())`), and
+  the request is answered from TDLib's memory. Do not replace this with "strip U+FE0F and retry
+  on that error text": it works today only because Telegram happens to offer no emoji with the
+  selector.
+- **`addMessageReaction` changes TDLib's own copy first.** `set_message_reactions` sends
+  `updateMessageInteractionInfo` and only then `messages.sendReaction`; the request's answer is
+  Telegram's. On an error TDLib queues a reload of the message's reactions. So: a `react` through
+  `tg` rings a `message_reactions` frame by itself; a read-back right after an ERROR may still
+  show the reaction (which is why `react` reads back only after success); and a request that
+  times out says nothing about the outcome. Reactions are not in TDLib's binlog ("TODO … log
+  event"), and a repeated request is harmless: an account without Premium has one reaction per
+  message and adding the same one again is a no-op.
+- **`removeMessageReaction` takes back exactly the type it is given** and answers ok, having done
+  nothing, for one the account has not chosen. What `tg` lists as one emoji can be a custom emoji,
+  so `remove_message_reaction` reads the message and takes back `reactions::chosen_types`.
+- **`message_reactions` rings on every `updateMessageInteractionInfo`**, with or without an
+  `interaction_info`: the last reaction taken back leaves none, and that update is the only sign
+  of it. The same update carries a channel post's view and forward counters and a discussion
+  thread's reply count, and an update holds only the new state, so telling those apart would
+  take a cache of what each message had. The consumer compares instead.
+- **Which reaction changes reach TDLib at all** — the answer to "does a chat `tg` never opened
+  ring?". Telegram pushes `updateMessageReactions` only where it concerns the account, and
+  `openChat` is not what decides it:
+  - *One-to-one chats:* every change. TDLib never polls there
+    (`need_poll_dialog_message_reactions` is `false` for `DialogType::User`).
+  - *Basic groups and supergroups:* a reaction to the account's OWN message (Telegram's API docs:
+    "Message authors will receive an updateMessageReactions update when a user reacts to their
+    message", subject to the account's reaction-notification setting), and the account's own
+    reaction made through `tg`. Whether the account's own reaction made on another device arrives
+    is not established. A reaction between other people does not arrive: Telegram's docs tell apps
+    to "short-poll reactions for visible messages (that weren't sent by the user) once every 15-30
+    seconds", and TDLib does that (`messages.getMessagesReactions`, `process_viewed_message`) only
+    for messages reported with `viewMessages` while the chat's `open_count > 0`. `tg` calls
+    neither `openChat` nor `viewMessages`.
+  - *Reading again does not help.* `getChatHistory` returns what `ordered_messages` holds without
+    asking Telegram (`get_dialog_history`), and `getMessage` asks only for a message TDLib does
+    not have. So `sync --reconcile-days` and `message` answer with the same possibly stale
+    reactions, and a consumer's periodic reconcile catches missed doorbells, not reactions TDLib
+    never received. A message `tg serve` heard arrive has, for other people's reactions, none.
+  - *What would read them*, should it be wanted. Neither is built. (1) `openChat`, `viewMessages`
+    with an explicit non-history source, `closeChat`: queues one `getMessagesReactions` per 100
+    messages, and the changes then arrive as ordinary `message_reactions` frames. The source is
+    the whole risk: `viewMessages` in an open chat with the default source reads as chat history
+    (`MessageSource::Auto` → `DialogHistory`), which MARKS THE MESSAGES READ and increments view
+    counters; `messageSourceOther` does neither (`need_read = force_read || is_dialog_history`).
+    Get Lars's go-ahead and watch an unread chat's count on the first run. (2)
+    `getMessageAddedReactions`: a plain read, one request per message, up to 100 senders with
+    dates and `is_outgoing`, only where `can_get_added_reactions` (not in channels); it makes
+    TDLib reload a message whose cached
+    reactions disagree, but only when it has cached some.
 
 **Attachments (`args.files`, since 0.5.0):** 1-10 local files sent as ONE message, `args.message`
 being the caption. Validated in `send::handle` BEFORE the recipient ladder — same ordering and

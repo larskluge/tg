@@ -7,14 +7,14 @@ use tg::bot_api;
 use tg::cli::{Cli, Command};
 use tg::client::TdLibClient;
 use tg::commands::{
-    auth_status, chats, download, groups, mark_read, mark_unread, messages, search, send, serve,
-    sync, unread, whoami,
+    auth_status, chats, download, groups, mark_read, mark_unread, message, messages, react, search,
+    send, serve, sync, unread, whoami,
 };
 use tg::credentials::{self, ApiCredentials, BotEntry, CredentialsFile};
 use tg::error::{Result, TgError};
 use tg::output::{
-    ChatInfo, ContactInfo, DownloadReport, DownloadStatus, MessageInfo, OutputFormat, SendResult,
-    UserInfo, print_chats_table, print_contacts_table, print_error, print_list,
+    ChatInfo, ContactInfo, DownloadReport, DownloadStatus, MessageInfo, OutputFormat, ReactResult,
+    SendResult, UserInfo, print_chats_table, print_contacts_table, print_error, print_list,
     print_messages_table, print_output, print_success,
 };
 use tg::resolve;
@@ -206,10 +206,20 @@ async fn route_via_serve(command: Command, stream: UnixStream, format: OutputFor
                 OutputFormat::Plain => print_messages_table(&msgs),
             }
         }
+        Command::Message(args) => {
+            let req = message::MessageRequest::from(args);
+            let msg: MessageInfo = serve_client::send_request(stream, "message", req).await?;
+            print_output(format, &msg);
+        }
         Command::Send(args) => {
             // Bot sends are filtered out before route_via_serve.
             let req = send::SendRequest::from(args);
             let result: SendResult = serve_client::send_request(stream, "send", req).await?;
+            print_output(format, &result);
+        }
+        Command::React(args) => {
+            let req = react::ReactRequest::from(args);
+            let result: ReactResult = serve_client::send_request(stream, "react", req).await?;
             print_output(format, &result);
         }
         Command::Download(args) => {
@@ -518,6 +528,20 @@ async fn run_command(
                 OutputFormat::Json => print_list(format, &result.messages),
                 OutputFormat::Plain => print_messages_table(&result.messages),
             }
+        }
+
+        Command::Message(args) => {
+            client.start().await?;
+            let msg = message::get_message(client, args.chat, args.message).await?;
+            print_output(format, &msg);
+        }
+
+        Command::React(args) => {
+            // Shared with the socket path, as `send` is, so the two cannot
+            // diverge.
+            client.start().await?;
+            let result = react::handle(client, react::ReactRequest::from(args)).await?;
+            print_output(format, &result);
         }
 
         Command::Download(args) => {

@@ -37,6 +37,12 @@ pub enum Command {
     /// Read messages from a chat
     Messages(MessagesArgs),
 
+    /// Read one message by its id, reactions included, wherever it lies in the chat
+    Message(MessageArgs),
+
+    /// React to a message with an emoji, or take a reaction back
+    React(ReactArgs),
+
     /// Download media from a single message
     Download(DownloadArgs),
 
@@ -60,7 +66,7 @@ pub enum Command {
 
     #[command(
         about = "Print message events from a running `tg serve` as NDJSON, one line each",
-        long_about = "Subscribe to the running `tg serve` and print every event frame it sends to stdout, one JSON object per line, flushed:\n\n  new_message        {\"chat_id\": i64, \"message_id\": i64}\n  message_edited     {\"chat_id\": i64, \"message_id\": i64}\n  messages_deleted   {\"chat_id\": i64, \"message_ids\": [i64]}\n  chat_last_message  {\"chat_id\": i64, \"message_id\": i64 | null}\n  lagged             {\"skipped\": u64}\n  heartbeat          {}   (every 30s)\n\nEach line is {\"event\": <name>, \"data\": {...}}. An event names a chat and a message and carries no content: fetch the message with `tg sync`. After `lagged`, events were lost; re-sync.\n\n`tg stream` never starts its own TDLib client: without a reachable `tg serve` it exits non-zero at once. It also exits non-zero when `tg serve` closes the stream. It exits 0 when its consumer goes away: once stdout is closed (noticed at the next line, at the latest the heartbeat), or once stdin reaches EOF. Keep stdin open for as long as you want events: under `podman exec -i`, stdin's EOF is the only sign that the caller has gone."
+        long_about = "Subscribe to the running `tg serve` and print every event frame it sends to stdout, one JSON object per line, flushed:\n\n  new_message        {\"chat_id\": i64, \"message_id\": i64}\n  message_edited     {\"chat_id\": i64, \"message_id\": i64}\n  messages_deleted   {\"chat_id\": i64, \"message_ids\": [i64]}\n  chat_last_message  {\"chat_id\": i64, \"message_id\": i64 | null}\n  message_reactions  {\"chat_id\": i64, \"message_id\": i64}\n  lagged             {\"skipped\": u64}\n  heartbeat          {}   (every 30s)\n\nEach line is {\"event\": <name>, \"data\": {...}}. An event names a chat and a message and carries no content: fetch the message with `tg sync`, or with `tg message` when it lies below your cursor, as the message of a `message_reactions` event usually does. After `lagged`, events were lost; re-sync.\n\n`tg stream` never starts its own TDLib client: without a reachable `tg serve` it exits non-zero at once. It also exits non-zero when `tg serve` closes the stream. It exits 0 when its consumer goes away: once stdout is closed (noticed at the next line, at the latest the heartbeat), or once stdin reaches EOF. Keep stdin open for as long as you want events: under `podman exec -i`, stdin's EOF is the only sign that the caller has gone."
     )]
     Stream,
 }
@@ -160,6 +166,37 @@ pub struct MessagesArgs {
     /// Return messages in chronological order (oldest first), fetching full history
     #[arg(long)]
     pub oldest_first: bool,
+}
+
+#[derive(Parser, Debug)]
+pub struct MessageArgs {
+    /// Chat ID (required). Supports negative IDs for supergroups/channels.
+    #[arg(long, allow_hyphen_values = true)]
+    pub chat: i64,
+
+    /// Message ID, as `tg messages --json` prints it
+    #[arg(long, allow_hyphen_values = true)]
+    pub message: i64,
+}
+
+#[derive(Parser, Debug)]
+pub struct ReactArgs {
+    /// The emoji to react with, or with --remove the one to take back
+    /// (omit it there to take back whatever reaction you have on the message)
+    #[arg(required_unless_present = "remove")]
+    pub emoji: Option<String>,
+
+    /// Chat ID (required). Supports negative IDs for supergroups/channels.
+    #[arg(long, allow_hyphen_values = true)]
+    pub chat: i64,
+
+    /// Message ID, as `tg messages --json` prints it
+    #[arg(long, allow_hyphen_values = true)]
+    pub message: i64,
+
+    /// Take the reaction back instead of adding it
+    #[arg(long)]
+    pub remove: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -408,6 +445,101 @@ mod tests {
                 assert_eq!(args.limit, 50);
             }
             _ => panic!("Expected Unread command"),
+        }
+    }
+
+    #[test]
+    fn parse_message_by_chat_and_id() {
+        // A supergroup's id is negative, so both values must take a hyphen.
+        let cli = Cli::parse_from([
+            "tg",
+            "message",
+            "--chat",
+            "-1001666847309",
+            "--message",
+            "89508544512",
+        ]);
+        match cli.command {
+            Command::Message(args) => {
+                assert_eq!(args.chat, -1001666847309);
+                assert_eq!(args.message, 89508544512);
+            }
+            _ => panic!("Expected Message command"),
+        }
+    }
+
+    #[test]
+    fn message_requires_both_ids() {
+        assert!(Cli::try_parse_from(["tg", "message", "--chat", "1"]).is_err());
+        assert!(Cli::try_parse_from(["tg", "message", "--message", "1048576"]).is_err());
+    }
+
+    #[test]
+    fn parse_react_and_take_back() {
+        let cli = Cli::parse_from([
+            "tg",
+            "react",
+            "--chat",
+            "-1001666847309",
+            "--message",
+            "89508544512",
+            "👍",
+        ]);
+        match cli.command {
+            Command::React(args) => {
+                assert_eq!(args.chat, -1001666847309);
+                assert_eq!(args.message, 89508544512);
+                assert_eq!(args.emoji.as_deref(), Some("👍"));
+                assert!(!args.remove);
+            }
+            _ => panic!("Expected React command"),
+        }
+
+        // Taking back needs no emoji: it takes back whatever the account has.
+        let cli = Cli::parse_from([
+            "tg",
+            "react",
+            "--chat",
+            "123",
+            "--message",
+            "89508544512",
+            "--remove",
+        ]);
+        match cli.command {
+            Command::React(args) => {
+                assert_eq!(args.emoji, None);
+                assert!(args.remove);
+            }
+            _ => panic!("Expected React command"),
+        }
+    }
+
+    #[test]
+    fn react_needs_an_emoji_unless_it_takes_back() {
+        assert!(
+            Cli::try_parse_from(["tg", "react", "--chat", "123", "--message", "1048576"]).is_err()
+        );
+    }
+
+    #[test]
+    fn stream_help_names_every_event() {
+        let mut cmd = Cli::command();
+        let mut help = Vec::new();
+        cmd.find_subcommand_mut("stream")
+            .expect("stream subcommand should exist")
+            .write_long_help(&mut help)
+            .expect("writing help should succeed");
+        let help = String::from_utf8(help).unwrap();
+        for event in [
+            "new_message",
+            "message_edited",
+            "messages_deleted",
+            "chat_last_message",
+            "message_reactions",
+            "lagged",
+            "heartbeat",
+        ] {
+            assert!(help.contains(event), "stream help should name {event}");
         }
     }
 

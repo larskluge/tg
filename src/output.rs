@@ -718,6 +718,38 @@ pub struct MessageFileRef {
     pub is_downloaded: bool,
 }
 
+/// Someone other than the account whom Telegram names for a reaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionSender {
+    /// The user's id, as `sender_id` gives it on a message. `null` when the
+    /// reaction was made as a chat (a channel, or a group's anonymous admin),
+    /// as `sender_id` is on a message such a chat sent.
+    pub id: Option<i64>,
+    /// The user's display name, or the chat's title. Absent when TDLib does
+    /// not know it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// One emoji on a message: how many reacted with it, whether the account did,
+/// and the other people Telegram names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageReactionInfo {
+    /// The emoji in Telegram's own form, which carries no variation selector
+    /// (its heart is the bare U+2764). A custom emoji is listed under the
+    /// standard emoji it stands for.
+    pub emoji: String,
+    /// Everyone who reacted with it, the account included.
+    pub count: i32,
+    /// The account itself reacted with it.
+    pub chosen: bool,
+    /// The OTHER people Telegram names: at most three, and none in a large
+    /// group. Never the account itself, which `chosen` already says, so
+    /// `count - chosen - recent_senders.len()` is the number nobody is named
+    /// for.
+    pub recent_senders: Vec<ReactionSender>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageInfo {
     pub id: i64,
@@ -753,6 +785,11 @@ pub struct MessageInfo {
     /// chat would thread the reply onto an unrelated message (`reply_in_chat`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<i64>,
+    /// The message's reactions as TDLib holds them, one entry per emoji. Absent
+    /// when there are none. Paid reactions are left out, and so is a custom
+    /// emoji TDLib cannot name a standard emoji for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reactions: Vec<MessageReactionInfo>,
 }
 
 impl PlainText for MessageInfo {
@@ -766,7 +803,19 @@ impl PlainText for MessageInfo {
                 self.sender.green().to_string()
             }
         };
-        format!("[{}] {}: {}", self.date.dimmed(), sender, self.text)
+        let line = format!("[{}] {}: {}", self.date.dimmed(), sender, self.text);
+        if self.reactions.is_empty() {
+            return line;
+        }
+        let reactions: Vec<String> = self
+            .reactions
+            .iter()
+            .map(|r| {
+                let own = if r.chosen { " (you)" } else { "" };
+                format!("{} {}{own}", r.emoji, r.count)
+            })
+            .collect();
+        format!("{line}  [{}]", reactions.join(", "))
     }
 }
 
@@ -973,6 +1022,35 @@ impl SendResult {
     }
 }
 
+/// What `react` did, read back from the message after Telegram answered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactResult {
+    pub chat_id: i64,
+    pub message_id: i64,
+    /// The emoji in the form Telegram holds it, which may differ from the one
+    /// asked for by a variation selector. Empty when the request took back
+    /// every reaction of the account without naming one.
+    pub emoji: String,
+    /// The account's reaction with that emoji is on the message. Always what
+    /// the request asked for: a read-back that disagrees is an error.
+    pub chosen: bool,
+}
+
+impl PlainText for ReactResult {
+    fn to_plain_text(&self) -> String {
+        if self.chosen {
+            format!("Reacted {} to message {}", self.emoji, self.message_id)
+        } else if self.emoji.is_empty() {
+            format!("No reaction left on message {}", self.message_id)
+        } else {
+            format!(
+                "Reaction {} removed from message {}",
+                self.emoji, self.message_id
+            )
+        }
+    }
+}
+
 impl PlainText for SendResult {
     fn to_plain_text(&self) -> String {
         format!("Message sent (id: {})", self.message_id)
@@ -1128,6 +1206,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         };
         let text = msg.to_plain_text();
         assert!(text.contains("2024-01-01 12:00"));
@@ -1154,6 +1233,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         };
         let text = msg.to_plain_text();
         assert!(text.contains("You"));
@@ -1178,6 +1258,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"sender_is_bot\":true"));
@@ -1202,6 +1283,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"sender_is_bot\":null"));
@@ -1264,6 +1346,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         }];
 
         print_messages_table(&msgs);
@@ -1287,6 +1370,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         }];
 
         let table = messages_table_string(&msgs);
@@ -1338,6 +1422,7 @@ mod tests {
                 mime_type: Some("audio/mpeg".to_string()),
             }),
             reply_to_message_id: None,
+            reactions: vec![],
         };
 
         let json = serde_json::to_string(&msg).unwrap();
@@ -1367,6 +1452,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"sender_id\":null"));
@@ -1391,6 +1477,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         };
         let text = msg.to_plain_text();
         assert!(text.contains("Tech Channel"));
@@ -1455,6 +1542,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("edit_date"));
@@ -1478,6 +1566,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id: None,
+            reactions: vec![],
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"edit_date\":\"2024-01-01T00:05:00Z\""));
@@ -1500,6 +1589,7 @@ mod tests {
             download_files: vec![],
             content: None,
             reply_to_message_id,
+            reactions: vec![],
         }
     }
 
@@ -1524,6 +1614,153 @@ mod tests {
         let daemon = serde_json::to_string(&replying(Some(89_495_961_500))).unwrap();
         let proxied: MessageInfo = serde_json::from_str(&daemon).unwrap();
         assert_eq!(proxied.reply_to_message_id, Some(89_495_961_500));
+    }
+
+    /// A group message with two reactions: a thumbs-up by the account and two
+    /// other people, and a bare heart (Telegram's form: no variation selector)
+    /// by a channel.
+    fn reacted() -> MessageInfo {
+        let mut msg = replying(None);
+        msg.reactions = vec![
+            MessageReactionInfo {
+                emoji: "👍".to_string(),
+                count: 3,
+                chosen: true,
+                recent_senders: vec![
+                    ReactionSender {
+                        id: Some(5_550_101),
+                        name: Some("Giulia Ferraro".to_string()),
+                    },
+                    ReactionSender {
+                        id: Some(5_550_102),
+                        name: None,
+                    },
+                ],
+            },
+            MessageReactionInfo {
+                emoji: "\u{2764}".to_string(),
+                count: 12,
+                chosen: false,
+                recent_senders: vec![ReactionSender {
+                    id: None,
+                    name: Some("Tavola News".to_string()),
+                }],
+            },
+        ];
+        msg
+    }
+
+    #[test]
+    fn message_info_plain_text_names_the_reactions() {
+        // `tg message` without --json is one line for a person: the reactions
+        // follow the text, the account's own marked.
+        let text = reacted().to_plain_text();
+        assert!(
+            text.ends_with("Agreed  [👍 3 (you), \u{2764} 12]"),
+            "{text}"
+        );
+        // And nothing follows a message without any.
+        assert!(replying(None).to_plain_text().ends_with("Agreed"));
+    }
+
+    #[test]
+    fn message_info_json_lists_reactions_per_emoji() {
+        // The shape Mycelium projects into message_reactions: one entry per
+        // emoji with its total, whether one is the account's own, and the other
+        // people Telegram names.
+        let json = serde_json::to_value(reacted()).unwrap();
+        assert_eq!(
+            json["reactions"],
+            serde_json::json!([
+                {
+                    "emoji": "👍",
+                    "count": 3,
+                    "chosen": true,
+                    "recent_senders": [
+                        {"id": 5_550_101, "name": "Giulia Ferraro"},
+                        {"id": 5_550_102},
+                    ],
+                },
+                {
+                    "emoji": "\u{2764}",
+                    "count": 12,
+                    "chosen": false,
+                    "recent_senders": [{"id": null, "name": "Tavola News"}],
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn message_info_json_omits_reactions_when_there_are_none() {
+        let json = serde_json::to_value(replying(None)).unwrap();
+        assert!(json.get("reactions").is_none(), "{json}");
+    }
+
+    #[test]
+    fn a_reaction_nobody_is_named_for_keeps_an_empty_sender_list() {
+        // A large group gives a count alone. `recent_senders` stays in the JSON
+        // so a consumer reads it on every reaction.
+        let mut msg = replying(None);
+        msg.reactions = vec![MessageReactionInfo {
+            emoji: "🔥".to_string(),
+            count: 40,
+            chosen: false,
+            recent_senders: vec![],
+        }];
+        let json = serde_json::to_value(msg).unwrap();
+        assert_eq!(
+            json["reactions"][0],
+            serde_json::json!({"emoji": "🔥", "count": 40, "chosen": false, "recent_senders": []})
+        );
+    }
+
+    #[test]
+    fn message_info_reactions_survive_the_serve_proxy() {
+        // `tg message` and `tg sync` inside the container print what the serve
+        // daemon answered after deserialising it: a field the struct does not
+        // read back is dropped there.
+        let daemon = serde_json::to_string(&reacted()).unwrap();
+        let proxied: MessageInfo = serde_json::from_str(&daemon).unwrap();
+        assert_eq!(proxied.reactions, reacted().reactions);
+        assert_eq!(serde_json::to_string(&proxied).unwrap(), daemon);
+    }
+
+    #[test]
+    fn message_info_from_a_daemon_without_reactions_reads_as_none() {
+        // Payload from a `tg serve` older than 0.12.0: the key is absent.
+        let json = r#"{
+            "id": 1,
+            "chat_id": 123,
+            "sender_id": 400,
+            "sender": "John",
+            "sender_is_bot": false,
+            "text": "Hello!",
+            "date": "2024-01-01 12:00",
+            "is_outgoing": false,
+            "is_downloadable": false
+        }"#;
+        let msg: MessageInfo = serde_json::from_str(json).unwrap();
+        assert!(msg.reactions.is_empty());
+    }
+
+    #[test]
+    fn react_result_has_the_documented_shape() {
+        let result = ReactResult {
+            chat_id: -1_009_876_543_210,
+            message_id: 918 << 20,
+            emoji: "\u{2764}".to_string(),
+            chosen: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({
+                "chat_id": -1_009_876_543_210_i64,
+                "message_id": 918_i64 << 20,
+                "emoji": "\u{2764}",
+                "chosen": true,
+            })
+        );
     }
 
     #[test]

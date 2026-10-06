@@ -8,6 +8,7 @@ pub mod error;
 pub mod media;
 pub mod output;
 pub mod parse_mode;
+pub mod reactions;
 pub mod resolve;
 pub mod serve;
 pub mod serve_client;

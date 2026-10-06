@@ -11,6 +11,7 @@ A modern CLI tool for interacting with Telegram, built in Rust using [TDLib](htt
 - **Send** — send messages to contacts or groups by name, @username, or chat ID
 - **Search** — find contacts by name
 - **Download** — download media attachments from messages
+- **Reactions** — every listed message carries its emoji reactions; `tg react` adds one or takes it back, and `tg message` reads one message again
 - **Mark read/unread** — manage read state of chats
 - **Long-lived server** — `tg serve` keeps a TDLib client warm so every other `tg <cmd>` skips cold start
 - **Live events** — `tg stream` prints new, edited and deleted messages from `tg serve` as they happen (machine use)
@@ -98,6 +99,14 @@ printf '<b>bold</b>\n<i>italic</i>' | tg send --to @username --parse-mode HTML
 tg send --as @mybot --to @someone -m "Hello from bot!"
 tg send --as @mybot --to 123456789 -m "Hello!"
 tg send --as @mybot --to @someone --parse-mode HTML -m "<b>Hello</b>"
+
+# Read one message again, wherever it lies in the chat, reactions included
+tg message --chat -1001666847309 --message 89508544512 [--json]
+
+# React to a message, or take the reaction back
+tg react --chat -1001666847309 --message 89508544512 👍
+tg react --chat -1001666847309 --message 89508544512 👍 --remove
+tg react --chat -1001666847309 --message 89508544512 --remove    # whatever reaction you have there
 
 # Download media
 tg download --chat -1001666847309 --message 42 [--output-dir .] [--priority 16]
@@ -240,7 +249,7 @@ only `ok` is never told a failure succeeded; what it gains is being able to lear
 which elements arrived instead of assuming none did. Every other failure has no
 `result`.
 
-`cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `send`, `download`, `mark_read`, `mark_unread`, `sync`, `subscribe`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today. `subscribe` is different: it turns the connection into an event stream — see [Live events](#live-events-subscribe-and-tg-stream-since-0110).
+`cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `message`, `send`, `react`, `download`, `mark_read`, `mark_unread`, `sync`, `subscribe`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today. `subscribe` is different: it turns the connection into an event stream — see [Live events](#live-events-subscribe-and-tg-stream-since-0110).
 
 `send` rejects unknown `args` keys rather than ignoring them:
 
@@ -248,9 +257,9 @@ which elements arrived instead of assuming none did. Every other failure has no
 {"id": "1", "ok": false, "error": "invalid args: unknown field `x`, expected one of `message`, `name`, `id`, `to`, `group`, `parse_mode`, `files`, `reply_to`"}
 ```
 
-The other commands still ignore unknown keys. For a recipient or identity field, a silent drop
-means a message delivered to the wrong place with `ok: true`, which is worse than a refusal the
-caller can retry.
+So does [`react`](#react-since-0120). The other commands still ignore unknown keys. For a
+recipient or identity field, a silent drop means a message delivered to the wrong place with
+`ok: true`, which is worse than a refusal the caller can retry.
 
 #### `send` with attachments
 
@@ -411,6 +420,55 @@ a message already in the destination chat:
 A daemon that predates replies refuses the key loudly — "unknown field \`reply_to\`" — and
 delivers nothing.
 
+#### `react` (since 0.12.0)
+
+`react` puts the account's emoji reaction on one message, or takes it back:
+
+```json
+{"id": "1", "cmd": "react", "args": {"id": -1009876543210, "message_id": 962592768, "emoji": "👍"}}
+-> {"id": "1", "ok": true, "result": {"chat_id": -1009876543210, "message_id": 962592768, "emoji": "👍", "chosen": true}}
+
+{"id": "2", "cmd": "react", "args": {"id": -1009876543210, "message_id": 962592768, "emoji": "👍", "remove": true}}
+-> {"id": "2", "ok": true, "result": {"chat_id": -1009876543210, "message_id": 962592768, "emoji": "👍", "chosen": false}}
+```
+
+| arg | | |
+|---|---|---|
+| `id` | i64, required | the chat |
+| `message_id` | i64, required | the message's TDLib id in that chat: `server_id << 20`, as `tg messages` and `tg sync` print `id` |
+| `emoji` | string | the emoji. Required to react; with `remove` it may be `""` or absent, which takes back whatever reaction the account has on the message |
+| `remove` | bool, default `false` | take the reaction back instead of adding it |
+
+- **Closed like `send`.** An unknown key is refused (`invalid args: unknown field …`), and nothing
+  goes out.
+- **The target is proved first.** `message_id` must be a positive multiple of 2^20 (`invalid
+  message_id …` otherwise, before TDLib is asked anything), and the message must be in that chat
+  (`react: message … is not accessible in chat …: Not Found`, the last words being TDLib's).
+- **Either spelling of an emoji is taken.** Telegram's reactions carry no variation selector: its
+  heart is the bare `U+2764`, a keyboard's is `U+2764 U+FE0F`, and TDLib refuses a reaction that is
+  not byte for byte one Telegram offers. So `react` reads the emoji Telegram offers for that
+  message (`getMessageAvailableReactions`) and sends the one that equals `emoji` once variation
+  selectors are set aside. `result.emoji` is the spelling Telegram holds. An emoji Telegram offers
+  there in no spelling is sent as given, so the refusal is Telegram's own.
+- **Success is read back.** After Telegram answers, the message is read again: `ok: true` always
+  means it shows what was asked for, `chosen: true` after reacting and `chosen: false` after
+  taking back. A read-back that disagrees is `ok: false`.
+- **One reaction per message** for an account without Telegram Premium: another emoji replaces the
+  one the account had. Taking back a reaction that is not there changes nothing and answers
+  `chosen: false`. Repeating a request is safe either way.
+- **Telegram's reason is passed through**, and no error names the emoji:
+  `react: Telegram refused the reaction to message 962592768 in chat -1009876543210: The reaction isn't available for the message`
+  (the chat does not allow that emoji, or the string is no reaction).
+- It is not sent big, and it counts among the account's recent reactions, as one picked in a
+  Telegram app does. Custom-emoji and paid reactions cannot be sent.
+- Telegram's answer is awaited for 10 s. Past that the request fails and says the change may still
+  take effect: TDLib shows a reaction on its own copy of the message before Telegram has answered.
+- A client can learn whether a daemon knows `react` without reacting to anything: `"args": {}` is
+  answered ``invalid args: missing field `id` `` by 0.12.0 and later, and `unknown command: react`
+  before.
+
+The CLI is `tg react --chat <id> --message <id> <emoji> [--remove]`.
+
 ### Live events: `subscribe` and `tg stream` (since 0.11.0)
 
 A `subscribe` request turns its connection into a stream of TDLib update events. After the usual
@@ -430,12 +488,14 @@ reply, every line is an event frame, `{"event": <name>, "data": {...}}`:
 | `message_edited` | `{"chat_id": i64, "message_id": i64}` | `updateMessageContent` or `updateMessageEdited` — one edit usually sends both |
 | `messages_deleted` | `{"chat_id": i64, "message_ids": [i64]}` | `updateDeleteMessages`, only when permanent and not merely a cache eviction |
 | `chat_last_message` | `{"chat_id": i64, "message_id": i64 \| null}` | `updateChatLastMessage`; `null` when TDLib no longer knows the last message, and while it does not, new messages can arrive without `new_message` |
+| `message_reactions` | `{"chat_id": i64, "message_id": i64}` | `updateMessageInteractionInfo` (since 0.12.0): the message's reactions may have changed |
 | `lagged` | `{"skipped": u64}` | this subscriber fell more than 1024 updates behind and lost `skipped` of them |
 | `heartbeat` | `{}` | every 30 s |
 
 An event is a **doorbell, not a record**: it names a chat and a message and carries no content.
-Fetch what changed with `sync`. A missed event costs latency, never data — after `lagged`, and
-after connecting, re-sync every chat you follow.
+Fetch what changed with `sync`, or with [`message`](#one-message-message-since-0120) when it lies
+below your cursor. A missed event costs latency, never data — after `lagged`, and after
+connecting, re-sync every chat you follow.
 
 - A subscription never waits on the server's TDLib lock, so a long `download` or `sync` does not
   delay events.
@@ -448,6 +508,11 @@ after connecting, re-sync every chat you follow.
   `chat_last_message` per chat it loads (hundreds, once per server session).
 - Supergroups and channels may not ring at all: TDLib delivers their updates "only for opened
   chats", and `tg` opens none. Poll them as before.
+- `message_reactions` is the only sign of a reaction: Telegram does not move a message's edit date
+  for one. It rings for the message's whole interaction info, so also for a channel post's view and
+  forward counters and a discussion thread's reply count: read the message and compare its
+  `reactions` with the ones you hold. Which reactions ring at all is under
+  [Reactions](#reactions-since-0120).
 
 `tg stream` is the CLI for it: it subscribes and prints each event line to stdout, flushed —
 never the ack. It needs a running `tg serve` and never starts its own TDLib client, because that
@@ -472,6 +537,33 @@ the stdin rule an orphaned `tg stream` would run forever.
 
 A `tg serve` older than 0.11.0 answers `unknown command: subscribe`; an older `tg` has no
 `stream` subcommand at all.
+
+### One message: `message` (since 0.12.0)
+
+`message` reads one message by its chat and its id, as the same object `messages` and `sync` list:
+
+```bash
+tg message --chat -1009876543210 --message 962592768 --json
+# {"id": 962592768, "chat_id": -1009876543210, "sender_id": 5550101, "sender": "Giulia Ferraro", "text": "Lunch?", ..., "reactions": [...]}
+```
+
+```json
+{"id": "1", "cmd": "message", "args": {"chat": -1009876543210, "message": 962592768}}
+-> {"id": "1", "ok": true, "result": {"id": 962592768, "chat_id": -1009876543210, ...}}
+```
+
+It is the read a `message_reactions` event asks for. `sync` returns what is above a cursor or
+inside a reconcile window, and a reaction lands on a message far below either. `sync
+--oldest-first --limit 1` with a cursor one server id lower (`id - 2^20`) comes close and is not
+the same: it loads a window of a hundred messages to return one, and when the message is gone it
+answers with the next one instead of saying so.
+
+- The answer is one object, not an array. `--json` prints it; without the flag it is one line of
+  text.
+- A message TDLib does not hold is fetched from Telegram, for at most 10 s.
+- An id that names nothing in that chat is an error (`message … is not accessible in chat …: Not
+  Found`, the last words being TDLib's), exit code 1, never another message.
+- A `tg serve` older than 0.12.0 answers `unknown command: message`.
 
 ### One-shot bulk sync
 
@@ -587,6 +679,60 @@ reply that cannot be named that way:
 - a reply to a **story** (`messageReplyToStory`): a story is not a message.
 
 A payload from a `tg` older than 0.8.0 never carries the key, reply or not.
+
+### Reactions (since 0.12.0)
+
+Each message from `tg messages --json`, `tg message --json`, `tg sync` and the server's
+`messages`/`message`/`sync` carries `reactions` when it has any, one entry per emoji in
+Telegram's order:
+
+```json
+{"id": 962592768, "chat_id": -1009876543210, ..., "reactions": [
+  {"emoji": "👍", "count": 3, "chosen": true,
+   "recent_senders": [{"id": 5550101, "name": "Giulia Ferraro"}, {"id": 5550102, "name": "Paolo Conti"}]},
+  {"emoji": "❤", "count": 12, "chosen": false, "recent_senders": []}
+]}
+```
+
+| key | |
+|---|---|
+| `emoji` | the emoji as Telegram holds it: no variation selector, so its heart is the bare `U+2764` |
+| `count` | everyone who reacted with it, the account included |
+| `chosen` | the account itself reacted with it |
+| `recent_senders` | the **other** people Telegram names, at most three; always present, `[]` when it names none |
+| `recent_senders[].id` | the user's id, as `sender_id` on a message; `null` for a reaction made as a chat (a channel, a group's anonymous admin) |
+| `recent_senders[].name` | the user's display name or the chat's title; absent when TDLib does not know it |
+
+- **The key is absent** for a message without reactions, and in a payload from a `tg` older than
+  0.12.0.
+- **The account is never in `recent_senders`**: `chosen` says it reacted. So
+  `count - (chosen ? 1 : 0) - recent_senders.length` is the number of reactions nobody is named
+  for. Telegram names at most three people per emoji and none in a large group.
+- **A custom emoji is listed under the standard emoji it stands for** (`getCustomEmojiStickers`,
+  which TDLib answers from its cache once it has seen the emoji) and joins that emoji's own entry
+  when the message has one. One that names no emoji, or cannot be looked up within 5 s, is left
+  out, with the reason on stderr.
+- **Paid reactions are left out.**
+- **In Saved Messages** reactions are the account's own tags, and are listed like any reaction.
+
+**These are the reactions TDLib holds, and it does not hold all of them.** Telegram sends a
+reaction change on its own only where it concerns the account:
+
+- **A one-to-one chat:** every change arrives. TDLib itself never polls there; it relies on
+  Telegram sending them.
+- **A group or supergroup:** a reaction **to one of the account's own messages** arrives
+  (Telegram's API: "Message authors will receive an updateMessageReactions update when a user
+  reacts to their message"), and so does the account's own reaction made through `tg`. Whether
+  the account's own reaction made on another device arrives is not established. A reaction
+  between other people does not. A Telegram app shows those because it polls the messages on
+  screen every 15 to 30 seconds; TDLib polls only messages reported with `viewMessages` in a chat
+  opened with `openChat`, and `tg` calls neither.
+
+So for other people's reactions to other people's messages in a group, `reactions` is what TDLib
+last received with the message, which for a message it heard arrive is nothing. No
+`message_reactions` event rings for them, and reading the message again (`message`, `sync
+--reconcile-days`) answers from the same copy. Reading them would take the polling a Telegram app
+does; `tg` does not do it.
 
 ## Testing
 

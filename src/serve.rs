@@ -11,7 +11,8 @@ use tdlib_rs::enums::Update;
 
 use crate::client::TelegramClient;
 use crate::commands::{
-    chats, download, groups, mark_read, mark_unread, messages, search, send, sync, unread, whoami,
+    chats, download, groups, mark_read, mark_unread, message, messages, react, search, send, sync,
+    unread, whoami,
 };
 use crate::credentials::tg_data_dir;
 use crate::error::{Result, TgError};
@@ -123,9 +124,10 @@ pub fn subscribe_ack(id: serde_json::Value) -> ResponseEnvelope {
 /// reserved for them: `{"event": "<name>", "data": {...}}`, one per line.
 ///
 /// A frame is a doorbell, not a record: it names a chat and a message and
-/// carries no content. A consumer that wants the message fetches it (`sync`),
-/// so a frame it missed costs latency, never data — which is why `lagged`
-/// reports only how many were skipped.
+/// carries no content. A consumer that wants the message fetches it (`sync`,
+/// or `message` for one that lies below its cursor), so a frame it missed
+/// costs latency, never data — which is why `lagged` reports only how many
+/// were skipped.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum StreamEvent {
@@ -146,6 +148,13 @@ pub enum StreamEvent {
         chat_id: i64,
         message_id: Option<i64>,
     },
+    /// `updateMessageInteractionInfo`: the message's reactions may have
+    /// changed. Telegram does not move a message's edit date for a reaction,
+    /// so nothing else rings for one. TDLib sends the same update for a
+    /// channel post's view and forward counters and a discussion thread's
+    /// reply count, so a consumer compares the reactions it reads (`message`)
+    /// with the ones it holds.
+    MessageReactions { chat_id: i64, message_id: i64 },
     /// The subscriber fell behind the update channel and `skipped` updates
     /// were dropped for it. Any of them may have been an event.
     Lagged { skipped: u64 },
@@ -180,6 +189,12 @@ impl StreamEvent {
             Update::ChatLastMessage(u) => Some(Self::ChatLastMessage {
                 chat_id: u.chat_id,
                 message_id: u.last_message.as_ref().map(|m| m.id),
+            }),
+            // Whatever the info holds, absent included: the last reaction
+            // taken back leaves none, and that must ring too.
+            Update::MessageInteractionInfo(u) => Some(Self::MessageReactions {
+                chat_id: u.chat_id,
+                message_id: u.message_id,
             }),
             _ => None,
         }
@@ -225,7 +240,9 @@ pub async fn dispatch<C: TelegramClient>(client: &C, env: RequestEnvelope) -> Re
         "unread" => execute(env.args, |r| unread::handle(client, r)).await,
         "search" => execute(env.args, |r| search::handle(client, r)).await,
         "messages" => execute(env.args, |r| messages::handle(client, r)).await,
+        "message" => execute(env.args, |r| message::handle(client, r)).await,
         "send" => execute(env.args, |r| send::handle(client, r)).await,
+        "react" => execute(env.args, |r| react::handle(client, r)).await,
         "download" => execute(env.args, |r| download::handle(client, r)).await,
         "mark_read" => execute(env.args, |r| mark_read::handle(client, r)).await,
         "mark_unread" => execute(env.args, |r| mark_unread::handle(client, r)).await,
@@ -603,6 +620,146 @@ mod tests {
         assert!(err.contains("MarkdownV2"), "{err}");
     }
 
+    /// The mock's chat 1 with one more message in it, numbered as TDLib
+    /// numbers a server message.
+    fn client_with_a_server_message() -> MockClient {
+        let mut client = MockClient::default();
+        let mut m = client.messages[0].clone();
+        m.id = 918 << 20;
+        client.messages.push(m);
+        client
+    }
+
+    #[tokio::test]
+    async fn dispatch_message_returns_the_one_message() {
+        let client = client_with_a_server_message();
+        let res = dispatch(
+            &client,
+            req(
+                "14",
+                "message",
+                json!({"chat": 1, "message": 918_i64 << 20}),
+            ),
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        let r = res.result.unwrap();
+        assert!(r.is_object(), "one message, not a list: {r}");
+        assert_eq!(r["id"], 918_i64 << 20);
+        assert_eq!(r["chat_id"], 1);
+        assert!(r.get("reactions").is_none(), "no reactions, no key: {r}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_message_reports_a_message_that_is_not_there_in_band() {
+        let client = client_with_a_server_message();
+        let res = dispatch(
+            &client,
+            req(
+                "15",
+                "message",
+                json!({"chat": 1, "message": 919_i64 << 20}),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        assert!(res.result.is_none());
+        let err = res.error.unwrap();
+        assert!(err.contains("not accessible in chat 1"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_react_answers_what_the_message_shows() {
+        let client = client_with_a_server_message();
+        let res = dispatch(
+            &client,
+            req(
+                "16",
+                "react",
+                json!({"id": 1, "message_id": 918_i64 << 20, "emoji": "👍"}),
+            ),
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        assert_eq!(
+            res.result.unwrap(),
+            json!({"chat_id": 1, "message_id": 918_i64 << 20, "emoji": "👍", "chosen": true})
+        );
+
+        let res = dispatch(
+            &client,
+            req(
+                "17",
+                "react",
+                json!({"id": 1, "message_id": 918_i64 << 20, "emoji": "👍", "remove": true}),
+            ),
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        assert_eq!(
+            res.result.unwrap(),
+            json!({"chat_id": 1, "message_id": 918_i64 << 20, "emoji": "👍", "chosen": false})
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_react_rejects_an_unknown_arg() {
+        // `react` is as closed as `send`: an arg tg does not know is refused
+        // in-band, and no reaction goes out.
+        let client = client_with_a_server_message();
+        let res = dispatch(
+            &client,
+            req(
+                "18",
+                "react",
+                json!({"id": 1, "message_id": 918_i64 << 20, "emoji": "👍", "is_big": true}),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        let err = res.error.unwrap();
+        assert!(err.contains("invalid args"), "{err}");
+        assert!(err.contains("unknown field `is_big`"), "{err}");
+        assert!(client.reaction_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_react_without_args_names_what_is_missing() {
+        // What a caller sends to learn whether a daemon knows `react` at all,
+        // without reacting to anything: an older tg answers "unknown command".
+        let client = MockClient::default();
+        let res = dispatch(&client, req("19", "react", json!({}))).await;
+        assert!(!res.ok);
+        let err = res.error.unwrap();
+        assert!(err.contains("missing field `id`"), "{err}");
+        assert!(!err.contains("unknown command"), "{err}");
+        assert!(client.reaction_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_react_passes_telegrams_refusal_through() {
+        let client = client_with_a_server_message();
+        let res = dispatch(
+            &client,
+            req(
+                "20",
+                "react",
+                json!({"id": 1, "message_id": 918_i64 << 20, "emoji": "🦄"}),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        assert!(
+            res.result.is_none(),
+            "a refused reaction left nothing behind"
+        );
+        assert!(
+            res.error
+                .unwrap()
+                .ends_with("The reaction isn't available for the message")
+        );
+    }
+
     #[tokio::test]
     async fn dispatch_sync_oldest_first_returns_ascending_messages() {
         let client = MockClient::default();
@@ -645,8 +802,9 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_other_commands_still_ignore_unknown_args() {
-        // Only `send` is strict. `whoami` in particular backs the container's
-        // health check, so tightening the rest has to be a conscious act.
+        // Only `send` and `react`, the two that put something in a chat, are
+        // strict. `whoami` in particular backs the container's health check, so
+        // tightening the rest has to be a conscious act.
         let client = MockClient::default();
         let res = dispatch(&client, req("11", "chats", json!({"limit": 5, "bogus": 1}))).await;
         assert!(res.ok, "{:?}", res.error);
@@ -816,6 +974,61 @@ mod tests {
     }
 
     #[test]
+    fn a_reaction_change_rings_message_reactions() {
+        // updateMessageInteractionInfo as TDLib sends it when someone reacts:
+        // the edit date does not move, so no other frame rings for it.
+        let u = update(json!({
+            "@type": "updateMessageInteractionInfo",
+            "chat_id": CHAT,
+            "message_id": 44_i64 << 20,
+            "interaction_info": {
+                "@type": "messageInteractionInfo",
+                "view_count": 0,
+                "forward_count": 0,
+                "reactions": {
+                    "@type": "messageReactions",
+                    "reactions": [{
+                        "@type": "messageReaction",
+                        "type": {"@type": "reactionTypeEmoji", "emoji": "👍"},
+                        "total_count": 1,
+                        "is_chosen": false,
+                        "recent_sender_ids": [{"@type": "messageSenderUser", "user_id": 7}],
+                    }],
+                    "are_tags": false,
+                    "paid_reactors": [],
+                    "can_get_added_reactions": true,
+                },
+            },
+        }));
+        assert_eq!(
+            StreamEvent::from_update(&u),
+            Some(StreamEvent::MessageReactions {
+                chat_id: CHAT,
+                message_id: 44 << 20,
+            })
+        );
+    }
+
+    #[test]
+    fn the_last_reaction_taken_back_rings_message_reactions() {
+        // With nothing left to report TDLib sends no interaction_info at all.
+        // That is the one sign a consumer gets that the reaction is gone, so
+        // the frame cannot depend on the info being there.
+        let u = update(json!({
+            "@type": "updateMessageInteractionInfo",
+            "chat_id": CHAT,
+            "message_id": 44_i64 << 20,
+        }));
+        assert_eq!(
+            StreamEvent::from_update(&u),
+            Some(StreamEvent::MessageReactions {
+                chat_id: CHAT,
+                message_id: 44 << 20,
+            })
+        );
+    }
+
+    #[test]
     fn unrelated_updates_ring_nothing() {
         for u in [
             json!({"@type": "updateConnectionState", "state": {"@type": "connectionStateReady"}}),
@@ -825,6 +1038,15 @@ mod tests {
                 "chat_id": CHAT,
                 "last_read_inbox_message_id": 1_i64 << 20,
                 "unread_count": 0,
+            }),
+            // Reactions ring through updateMessageInteractionInfo. This one only
+            // says which of them the account has not seen yet.
+            json!({
+                "@type": "updateMessageUnreadReactions",
+                "chat_id": CHAT,
+                "message_id": 44_i64 << 20,
+                "unread_reactions": [],
+                "unread_reaction_count": 0,
             }),
         ] {
             assert_eq!(StreamEvent::from_update(&update(u.clone())), None, "{u}");
@@ -873,6 +1095,13 @@ mod tests {
                 message_id: Some(5 << 20),
             }),
             json!({"event": "chat_last_message", "data": {"chat_id": CHAT, "message_id": 5_i64 << 20}})
+        );
+        assert_eq!(
+            frame(&StreamEvent::MessageReactions {
+                chat_id: CHAT,
+                message_id: 5 << 20,
+            }),
+            json!({"event": "message_reactions", "data": {"chat_id": CHAT, "message_id": 5_i64 << 20}})
         );
         assert_eq!(
             frame(&StreamEvent::Lagged { skipped: 17 }),

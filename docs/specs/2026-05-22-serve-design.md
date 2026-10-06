@@ -74,15 +74,17 @@ After the ack the connection carries only event frames, one JSON object per line
 | `message_edited` | `{"chat_id": i64, "message_id": i64}` | `updateMessageContent`, `updateMessageEdited` |
 | `messages_deleted` | `{"chat_id": i64, "message_ids": [i64]}` | `updateDeleteMessages` with `is_permanent && !from_cache` |
 | `chat_last_message` | `{"chat_id": i64, "message_id": i64 \| null}` | `updateChatLastMessage` |
+| `message_reactions` | `{"chat_id": i64, "message_id": i64}` | `updateMessageInteractionInfo` (since 0.12.0) |
 | `lagged` | `{"skipped": u64}` | the subscriber fell behind the update channel |
 | `heartbeat` | `{}` | every 30 s |
 
-- **A frame is a doorbell, not a record.** It names a chat and a message and carries no content; a consumer fetches what changed with `sync`. A frame it never saw costs latency, never data, so `lagged` says only how many updates were lost, and the answer to it is a re-sync.
+- **A frame is a doorbell, not a record.** It names a chat and a message and carries no content; a consumer fetches what changed with `sync`, or with `message` when the message lies below its cursor. A frame it never saw costs latency, never data, so `lagged` says only how many updates were lost, and the answer to it is a re-sync.
 - **`new_message.message_id`** can be the temporary id of a message this account is still sending. The confirmed id arrives as `chat_last_message`.
 - **One edit usually raises both** `updateMessageContent` and `updateMessageEdited`, so it arrives as two `message_edited` frames.
 - **`messages_deleted`** is sent only for `is_permanent && !from_cache`. A non-permanent deletion means the messages became inaccessible and a cache deletion means TDLib evicted them; both describe messages that still exist.
 - **`chat_last_message` has `message_id: null`** when TDLib no longer knows the chat's last message. While it does not, new messages can arrive without an `updateNewMessage`, which is why this event exists at all.
 - **`chat_last_message` bursts once per server session.** Loading a chat into memory announces its last message, so the first `chats`/`groups`/`unread` request after `tg serve` starts rings one frame per chat it loads. Measured 2026-09-30 against a local account: ~405 frames from one `tg chats --limit 2`, and none from the `chats` and `groups` requests after it.
+- **`message_reactions` is the only sign of a reaction**, since Telegram does not move a message's edit date for one. It is sent for every `updateMessageInteractionInfo`, with or without an `interaction_info` (the last reaction taken back leaves none), so it also rings for a channel post's view and forward counters and a discussion thread's reply count; an update holds only the new state, so the consumer reads the message (`message`) and compares its `reactions`. Telegram sends reaction changes for one-to-one chats and for the account's own messages in groups; reactions between other people in a group reach TDLib only by the polling an app does for messages on screen, which `tg` does not do (`AGENTS.md` → *Reactions*).
 - **Supergroups and channels may stay silent.** TDLib documents that in them "all updates are received only for opened chats", and `tg` never calls `openChat`. How many synced groups ring anyway is to be measured on outpost; a group that does not ring loses nothing, it just waits for the consumer's next poll.
 
 Four rules govern a subscription:
@@ -201,7 +203,9 @@ The server accepts every subcommand whose handler talks to TDLib:
 | `unread`      | `UnreadRequest`       | `Vec<ChatInfo>`               |
 | `search`      | `SearchRequest`       | `Vec<ContactInfo>`            |
 | `messages`    | `MessagesRequest`     | `Vec<MessageInfo>`            |
+| `message`     | `MessageRequest`      | `MessageInfo` (since 0.12.0)  |
 | `send`        | `SendRequest`         | `SendResult`                  |
+| `react`       | `ReactRequest`        | `ReactResult` (since 0.12.0)  |
 | `download`    | `DownloadRequest`     | `DownloadReport`              |
 | `mark_read`   | `MarkReadRequest`     | `null`                        |
 | `mark_unread` | `MarkUnreadRequest`   | `null`                        |
