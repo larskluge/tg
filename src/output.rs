@@ -66,6 +66,11 @@ pub struct ChatInfo {
     /// could not be read — never `false` on a guess.
     #[serde(default)]
     pub is_bot: Option<bool>,
+    /// A channel: TDLib's `chatTypeSupergroup` with `is_channel`. Read off the
+    /// chat's type, so it is always known; a row from a `tg serve` older than
+    /// 0.13.0 has no key and reads `false`.
+    #[serde(default)]
+    pub is_channel: bool,
     pub unread_count: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_message: Option<String>,
@@ -1074,6 +1079,7 @@ mod tests {
             id: 123456789,
             name: "John Doe".to_string(),
             is_bot: Some(false),
+            is_channel: false,
             unread_count: 0,
             last_message: None,
         };
@@ -1088,6 +1094,7 @@ mod tests {
             id: 123456789,
             name: "John Doe".to_string(),
             is_bot: Some(false),
+            is_channel: false,
             unread_count: 5,
             last_message: None,
         };
@@ -1103,14 +1110,32 @@ mod tests {
             id: 123456789,
             name: "John Doe".to_string(),
             is_bot: Some(false),
+            is_channel: false,
             unread_count: 5,
             last_message: Some("Hello".to_string()),
         };
         let json = serde_json::to_string(&chat).unwrap();
         assert!(json.contains("\"id\":123456789"));
         assert!(json.contains("\"name\":\"John Doe\""));
+        assert!(json.contains("\"is_channel\":false"));
         assert!(json.contains("\"unread_count\":5"));
         assert!(json.contains("\"last_message\":\"Hello\""));
+    }
+
+    #[test]
+    fn chat_info_json_marks_a_channel() {
+        let chat = ChatInfo {
+            id: -1001234567890,
+            name: "Town Feed".to_string(),
+            is_bot: None,
+            is_channel: true,
+            unread_count: 3,
+            last_message: Some("Road works on Mill Lane".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_string(&chat).unwrap(),
+            r#"{"id":-1001234567890,"name":"Town Feed","is_bot":null,"is_channel":true,"unread_count":3,"last_message":"Road works on Mill Lane"}"#
+        );
     }
 
     #[test]
@@ -1119,6 +1144,7 @@ mod tests {
             id: 123456789,
             name: "John Doe".to_string(),
             is_bot: Some(false),
+            is_channel: false,
             unread_count: 0,
             last_message: None,
         };
@@ -1313,6 +1339,14 @@ mod tests {
         let json = r#"{"id": 1, "name": "John Doe", "unread_count": 0}"#;
         let chat: ChatInfo = serde_json::from_str(json).unwrap();
         assert_eq!(chat.is_bot, None);
+    }
+
+    #[test]
+    fn chat_info_without_the_channel_marker_deserialises_as_not_a_channel() {
+        // Row from a `tg serve` older than 0.13.0: the key is absent.
+        let json = r#"{"id": 1, "name": "John Doe", "unread_count": 0}"#;
+        let chat: ChatInfo = serde_json::from_str(json).unwrap();
+        assert!(!chat.is_channel);
     }
 
     #[test]

@@ -214,6 +214,17 @@ The server accepts every subcommand whose handler talks to TDLib:
 
 Notably excluded: `auth`, `auth bot`, `auth status`, `send --as <bot>`. These run in-process always.
 
+A `ChatInfo` row, as `chats`, `groups` and `unread` answer it:
+
+```json
+{"id": -1001234567890, "name": "Town Feed", "is_bot": null, "is_channel": true, "unread_count": 3, "last_message": "…"}
+```
+
+- `is_bot` is `true` or `false` for a private chat's counterpart, and `null` when the chat has none (a group, a channel) or the user could not be read.
+- `is_channel` (since 0.13.0) is `true` only for a channel, TDLib's `chatTypeSupergroup` with `is_channel`, and `false` for a private chat, a basic group, a secret chat and every other supergroup. It is always a boolean. A server older than 0.13.0 leaves the key out, and a client reads that as `false`.
+- `last_message` is absent when TDLib knows none for the chat.
+- `groups` lists basic groups, supergroups and channels, so `is_channel` is what tells a channel from a group; `chats` lists private chats only.
+
 For `sync`, the HWM map that today comes from stdin moves into `args.hwm`:
 
 ```json

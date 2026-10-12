@@ -1164,7 +1164,35 @@ enum ChatTypeKind {
     Private,
     BasicGroup,
     Supergroup,
+    Channel,
     Other,
+}
+
+/// TDLib has no chat type for a channel: it is a `chatTypeSupergroup` with
+/// `is_channel`. Every other supergroup (a forum, a broadcast group) carries
+/// the flag as `false` and stays `Supergroup`.
+fn chat_type_kind(chat_type: &tdlib_rs::enums::ChatType) -> ChatTypeKind {
+    match chat_type {
+        tdlib_rs::enums::ChatType::Private(_) => ChatTypeKind::Private,
+        tdlib_rs::enums::ChatType::BasicGroup(_) => ChatTypeKind::BasicGroup,
+        tdlib_rs::enums::ChatType::Supergroup(s) if s.is_channel => ChatTypeKind::Channel,
+        tdlib_rs::enums::ChatType::Supergroup(_) => ChatTypeKind::Supergroup,
+        _ => ChatTypeKind::Other,
+    }
+}
+
+/// What `chats` lists.
+fn is_private_chat(chat: &ChatSnapshot) -> bool {
+    chat.chat_type == ChatTypeKind::Private
+}
+
+/// What `groups` lists. A channel has always been among them, as the
+/// supergroup TDLib says it is; `is_channel` on the row tells it from a group.
+fn is_group_chat(chat: &ChatSnapshot) -> bool {
+    matches!(
+        chat.chat_type,
+        ChatTypeKind::BasicGroup | ChatTypeKind::Supergroup | ChatTypeKind::Channel
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -1185,6 +1213,7 @@ impl ChatSnapshot {
             id: self.id,
             name: self.title.clone(),
             is_bot: self.is_bot,
+            is_channel: self.chat_type == ChatTypeKind::Channel,
             unread_count: self.unread_count,
             last_message: self.last_message.clone(),
         }
@@ -1213,23 +1242,20 @@ impl ChatDataSource for TdLibClient {
             .await
             .map_err(|e| TgError::TdLib(e.message))?;
         let chat = unwrap_chat(chat_enum);
-        let (chat_type, counterpart_user_id) = match chat.r#type {
-            tdlib_rs::enums::ChatType::Private(p) => (ChatTypeKind::Private, Some(p.user_id)),
-            tdlib_rs::enums::ChatType::BasicGroup(_) => (ChatTypeKind::BasicGroup, None),
-            tdlib_rs::enums::ChatType::Supergroup(_) => (ChatTypeKind::Supergroup, None),
-            _ => (ChatTypeKind::Other, None),
-        };
+        let chat_type = chat_type_kind(&chat.r#type);
 
         // Only a private chat has a single user counterpart that can carry the
         // bot marker. TDLib answers `getUser` for a listed chat from its local
         // cache, so this costs no server round trip. A failed lookup stays
         // `None` — unknown, not "not a bot".
-        let is_bot = match counterpart_user_id {
-            Some(user_id) => tdlib_rs::functions::get_user(user_id, client_id)
-                .await
-                .ok()
-                .map(|ue| user_type_is_bot(&unwrap_user(ue).r#type)),
-            None => None,
+        let is_bot = match chat.r#type {
+            tdlib_rs::enums::ChatType::Private(p) => {
+                tdlib_rs::functions::get_user(p.user_id, client_id)
+                    .await
+                    .ok()
+                    .map(|ue| user_type_is_bot(&unwrap_user(ue).r#type))
+            }
+            _ => None,
         };
 
         Ok(ChatSnapshot {
@@ -3119,18 +3145,11 @@ impl TelegramClient for TdLibClient {
     }
 
     async fn get_chats(&self, limit: i32) -> Result<Vec<ChatInfo>> {
-        self.collect_filtered_chats(limit, |chat| chat.chat_type == ChatTypeKind::Private)
-            .await
+        self.collect_filtered_chats(limit, is_private_chat).await
     }
 
     async fn get_groups(&self, limit: i32) -> Result<Vec<ChatInfo>> {
-        self.collect_filtered_chats(limit, |chat| {
-            matches!(
-                chat.chat_type,
-                ChatTypeKind::BasicGroup | ChatTypeKind::Supergroup
-            )
-        })
-        .await
+        self.collect_filtered_chats(limit, is_group_chat).await
     }
 
     async fn get_unread_chats(&self, limit: i32) -> Result<Vec<ChatInfo>> {
@@ -4123,6 +4142,7 @@ pub mod mock {
                         id: 1,
                         name: "John Doe".to_string(),
                         is_bot: Some(false),
+                        is_channel: false,
                         unread_count: 2,
                         last_message: Some("Hello!".to_string()),
                     },
@@ -4130,17 +4150,30 @@ pub mod mock {
                         id: 2,
                         name: "Jane Smith".to_string(),
                         is_bot: Some(false),
+                        is_channel: false,
                         unread_count: 0,
                         last_message: None,
                     },
                 ],
-                groups: vec![ChatInfo {
-                    id: 100,
-                    name: "Family Chat".to_string(),
-                    is_bot: Some(false),
-                    unread_count: 5,
-                    last_message: Some("See you tomorrow".to_string()),
-                }],
+                groups: vec![
+                    ChatInfo {
+                        id: 100,
+                        name: "Family Chat".to_string(),
+                        is_bot: Some(false),
+                        is_channel: false,
+                        unread_count: 5,
+                        last_message: Some("See you tomorrow".to_string()),
+                    },
+                    // Read, so `unread` lists the same chats with or without it.
+                    ChatInfo {
+                        id: -1001234567890,
+                        name: "Town Feed".to_string(),
+                        is_bot: None,
+                        is_channel: true,
+                        unread_count: 0,
+                        last_message: Some("Road works on Mill Lane".to_string()),
+                    },
+                ],
                 contacts: vec![
                     ContactInfo {
                         id: 1,
@@ -4800,6 +4833,36 @@ mod tests {
     }
 
     #[test]
+    fn only_a_supergroup_with_is_channel_is_a_channel() {
+        use tdlib_rs::enums::ChatType;
+        use tdlib_rs::types::{
+            ChatTypeBasicGroup, ChatTypePrivate, ChatTypeSecret, ChatTypeSupergroup,
+        };
+
+        let supergroup = |is_channel| {
+            ChatType::Supergroup(ChatTypeSupergroup {
+                supergroup_id: 1234567890,
+                is_channel,
+            })
+        };
+        assert_eq!(chat_type_kind(&supergroup(true)), ChatTypeKind::Channel);
+        // A forum and a broadcast group are supergroups without the flag.
+        assert_eq!(chat_type_kind(&supergroup(false)), ChatTypeKind::Supergroup);
+        assert_eq!(
+            chat_type_kind(&ChatType::BasicGroup(ChatTypeBasicGroup::default())),
+            ChatTypeKind::BasicGroup
+        );
+        assert_eq!(
+            chat_type_kind(&ChatType::Private(ChatTypePrivate::default())),
+            ChatTypeKind::Private
+        );
+        assert_eq!(
+            chat_type_kind(&ChatType::Secret(ChatTypeSecret::default())),
+            ChatTypeKind::Other
+        );
+    }
+
+    #[test]
     fn extract_audio_message_metadata() {
         let content =
             tdlib_rs::enums::MessageContent::MessageAudio(tdlib_rs::types::MessageAudio {
@@ -5280,14 +5343,64 @@ mod tests {
         chats.insert(7, chat_snapshot(7, "Group D", 0, ChatTypeKind::Supergroup));
 
         let source = TestChatSource { chat_ids, chats };
-        let result = collect_filtered_chats_from_source(&source, 3, |chat| {
-            chat.chat_type == ChatTypeKind::Private
-        })
-        .await
-        .unwrap();
+        let result = collect_filtered_chats_from_source(&source, 3, is_private_chat)
+            .await
+            .unwrap();
 
         let ids: Vec<i64> = result.iter().map(|c| c.id).collect();
         assert_eq!(ids, vec![3, 4, 5]);
+    }
+
+    fn channel_among_other_chats() -> TestChatSource {
+        let mut chats = HashMap::new();
+        chats.insert(1, chat_snapshot(1, "Town Feed", 3, ChatTypeKind::Channel));
+        chats.insert(
+            2,
+            chat_snapshot(2, "Engineers", 0, ChatTypeKind::Supergroup),
+        );
+        chats.insert(3, chat_snapshot(3, "Family", 0, ChatTypeKind::BasicGroup));
+        chats.insert(4, chat_snapshot(4, "Alice", 1, ChatTypeKind::Private));
+        TestChatSource {
+            chat_ids: vec![1, 2, 3, 4],
+            chats,
+        }
+    }
+
+    fn channel_marks(chats: &[ChatInfo]) -> Vec<(i64, bool)> {
+        chats.iter().map(|c| (c.id, c.is_channel)).collect()
+    }
+
+    #[tokio::test]
+    async fn groups_lists_a_channel_and_marks_it() {
+        let source = channel_among_other_chats();
+        let result = collect_filtered_chats_from_source(&source, 50, is_group_chat)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            channel_marks(&result),
+            vec![(1, true), (2, false), (3, false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn chats_still_leaves_a_channel_out() {
+        let source = channel_among_other_chats();
+        let result = collect_filtered_chats_from_source(&source, 50, is_private_chat)
+            .await
+            .unwrap();
+
+        assert_eq!(channel_marks(&result), vec![(4, false)]);
+    }
+
+    #[tokio::test]
+    async fn unread_marks_a_channel_too() {
+        let source = channel_among_other_chats();
+        let result = collect_filtered_chats_from_source(&source, 50, |chat| chat.unread_count > 0)
+            .await
+            .unwrap();
+
+        assert_eq!(channel_marks(&result), vec![(1, true), (4, false)]);
     }
 
     #[tokio::test]

@@ -201,6 +201,28 @@ Read from TDLib's source (`MessagesManager::update_dialog_pos`, `get_chat_positi
 - Only private chats are reported: a basic group or supergroup also leaves every list when
   you leave it, but leaving a group is not deleting a chat.
 
+**A channel is a supergroup with `is_channel` (`is_channel` on every chat row, since 0.13.0):**
+TDLib has no chat type of its own for a channel. `chat.type` is `chatTypeSupergroup
+{ supergroup_id, is_channel }` for a channel and for every other supergroup, and the flag is the
+whole difference ("True, if the supergroup is a channel"); a forum and a broadcast group are
+flags on the `supergroup` object, not on the chat type. Read from the `td_api.tl` tdlib-rs 1.3.0
+pins, not measured: no test and no agent lists a real account's chats.
+
+- **`chat_type_kind` is the one place the flag is read.** It yields `ChatTypeKind::Channel`, and
+  `ChatSnapshot::to_chat_info` turns that into `is_channel` on `ChatInfo`, the row `chats`,
+  `groups` and `unread` share, in `--json` output and in a `tg serve` result alike.
+- **Always a boolean.** `is_bot` is `Option<bool>` because it takes a `getUser` that can fail;
+  `is_channel` sits on the `chat.type` that `fetch_chat_snapshot` already holds, so it costs no
+  request and is never unknown. Its `#[serde(default)]` is for `tg`'s own CLI reading rows from a
+  `tg serve` older than 0.13.0: a missing key reads `false`.
+- **`groups` lists channels, as it always has** (`is_group_chat`: basic group, supergroup,
+  channel), and `chats` leaves them out (`is_private_chat`). The row is a contract with Mycelium
+  (its spec: `docs/specs/2026-10-12-channel-kind-design.md` in mycelium), which discovers
+  Telegram's channels through `groups` and labels a row `channel` when the key is `true`, `group`
+  when it is `false` or absent. Taking channels out of `groups`, or giving them a command of
+  their own, would end that discovery. There is no filter flag, and the table and plain-text
+  output do not show the key.
+
 **TDLib `getChatMessageByDate` direction:** It returns the last message sent **no later than** the given date — the returned message's date is always `<= date` — and a **404** when the chat has no such message. It does not find the first message *after* a date. To turn a `--since-utc` cutoff into a fetch boundary, probe at `cutoff - 1` and use the returned message's `id + 1` as an exclusive lower bound (`boundary_probe_date` / `boundary_from_probe` in `client.rs`). Reading it as "at or after the date" makes the lookup silently never match.
 
 **TDLib `message.reply_to` names a chat, not just a message (since 0.8.0):**

@@ -659,6 +659,28 @@ Every JSON surface carries Telegram's own bot flag, so consumers never have to g
 
 The value is `true` or `false` when `tg` could determine it, and `null` when it could not. `null` means unknown, never "not a bot": the sender's user object was unreadable (the same case that leaves `sender` as `"Unknown"`), the chat has no single user counterpart (groups and channels), or the payload came from a `tg` older than 0.4.4. A message sent by a channel or group rather than by a user account is `false` — a chat sender carries no bot marker either way. Deleted and inaccessible accounts also report `false`: Telegram reports them as `userTypeDeleted`/`userTypeUnknown` and no longer says whether they were bots.
 
+### Channels (since 0.13.0)
+
+Each chat from `tg chats --json`, `tg groups --json`, `tg unread --json` and the server's
+`chats`/`groups`/`unread` carries `is_channel`, beside `is_bot`:
+
+```json
+{"id": -1001234567890, "name": "Town Feed", "is_bot": null, "is_channel": true, "unread_count": 3, "last_message": "…"}
+```
+
+- **`true` for a channel**, a one-way feed: TDLib's `chatTypeSupergroup` with `is_channel`.
+  `false` for everything else: a private chat, a basic group, a secret chat, and a supergroup
+  that is not a channel (a forum and a broadcast group are supergroups).
+- **Always `true` or `false`, never `null`.** Unlike `is_bot` it takes no lookup that can fail:
+  it is read off the chat's own type.
+- **`tg groups` lists channels, as it always has**, beside basic groups and supergroups; the key
+  is what tells them apart. `tg chats` lists private chats only, so there it is always `false`.
+  There is no `channels` command and no flag to filter by it, and the table and plain-text
+  output do not show it.
+- **A `tg serve` older than 0.13.0 leaves the key out.** `tg`'s own CLI reads a missing key as
+  `false`, so `tg groups --json` through such a server prints `false` for a channel too: check
+  the server's `tg --version` before relying on it.
+
 ### Reply targets (since 0.8.0)
 
 Each message from `tg messages --json`, `tg sync` and the server's `messages`/`sync` carries

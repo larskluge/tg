@@ -387,7 +387,7 @@ Member filters: `supergroupMembersFilterRecent`, `supergroupMembersFilterAdminis
 ## 7. Channels
 
 ### Currently Implemented
-- Listed in groups output
+- Listed in groups output, marked `is_channel` on the chat row (since 0.13.0)
 - Can send messages to channels
 
 ### Missing - To Implement

@@ -43,17 +43,20 @@ mod tests {
     use crate::client::mock::MockClient;
 
     #[tokio::test]
-    async fn list_groups_returns_groups() {
+    async fn list_groups_returns_groups_and_marks_the_channel() {
         let client = MockClient::default();
         let groups = list_groups(&client, 50).await.unwrap();
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].name, "Family Chat");
+        let marks: Vec<(&str, bool)> = groups
+            .iter()
+            .map(|g| (g.name.as_str(), g.is_channel))
+            .collect();
+        assert_eq!(marks, vec![("Family Chat", false), ("Town Feed", true)]);
     }
 
     #[tokio::test]
     async fn handle_uses_request_limit() {
         let client = MockClient::default();
-        let groups = handle(&client, GroupsRequest { limit: 50 }).await.unwrap();
+        let groups = handle(&client, GroupsRequest { limit: 1 }).await.unwrap();
         assert_eq!(groups.len(), 1);
     }
 }
