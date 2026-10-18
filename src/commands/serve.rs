@@ -16,11 +16,15 @@ use tokio::task::JoinSet;
 
 use crate::client::{TdLibClient, TelegramClient};
 use crate::error::{Result, TgError};
+use crate::reaction_poll;
 use crate::serve::{self, RequestEnvelope, ResponseEnvelope, StreamEvent};
 
 /// Maximum time to wait for in-flight per-connection tasks to drain after the
 /// listener stops accepting new connections.
 const SHUTDOWN_DRAIN_SECS: u64 = 5;
+
+/// Maximum time to wait for the reaction poll to end once the drain is over.
+const POLLER_STOP_SECS: u64 = 2;
 
 /// Maximum byte length of a single NDJSON request line. Any peer that can
 /// open the socket can send arbitrary input, so this cap is what stops a
@@ -53,6 +57,9 @@ pub async fn run(mut client: TdLibClient) -> Result<()> {
     let path = serve::socket_path().ok_or_else(|| {
         TgError::Other("TG_SERVE_SOCKET is empty; refusing to start tg serve".to_string())
     })?;
+
+    // Read before anything starts, so a bad value refuses to serve rather than half-starting.
+    let reaction_poll = reaction_poll::setting(std::env::var_os(reaction_poll::ENV).as_deref())?;
 
     prepare_socket_path(&path).await?;
 
@@ -88,6 +95,26 @@ pub async fn run(mut client: TdLibClient) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt())
         .map_err(|e| TgError::Other(format!("install sigint handler: {e}")))?;
 
+    // The reaction poll takes the client lock only while it reads or polls one chat, and ends with
+    // the subscriptions at shutdown: it must be gone before the client is reclaimed below, so it
+    // starts only once nothing between here and that point can return early.
+    let poller = match reaction_poll {
+        reaction_poll::Setting::On => Some(tokio::spawn(
+            reaction_poll::Poller::new(
+                client_arc.clone(),
+                subscriptions.updates.subscribe(),
+                subscriptions.shutdown.clone(),
+                reaction_poll::Timing::default(),
+                Box::new(|| chrono::Utc::now().timestamp()),
+            )
+            .run(),
+        )),
+        reaction_poll::Setting::Off => {
+            eprintln!("tg serve: reaction poll off ({}=off)", reaction_poll::ENV);
+            None
+        }
+    };
+
     loop {
         tokio::select! {
             res = listener.accept() => {
@@ -120,6 +147,20 @@ pub async fn run(mut client: TdLibClient) -> Result<()> {
     .await;
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
+    if let Some(mut poller) = poller {
+        // It has seen the switch: it is gone at once from a wait, and within one chat's poll
+        // from the middle of a round.
+        match tokio::time::timeout(Duration::from_secs(POLLER_STOP_SECS), &mut poller).await {
+            Ok(Ok(_)) => {}
+            // The panic's own message went to stderr when it happened.
+            Ok(Err(e)) if e.is_panic() => eprintln!("tg serve: the reaction poll had panicked"),
+            Ok(Err(_)) => {}
+            Err(_) => {
+                poller.abort();
+                let _ = poller.await;
+            }
+        }
+    }
 
     // Reclaim client and shut down TDLib cleanly.
     let mut client = Arc::try_unwrap(client_arc)

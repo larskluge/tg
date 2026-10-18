@@ -120,6 +120,7 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 - `output.rs` - Dual output formatting (plain text default, JSON with `--json`)
 - `reactions.rs` - Pure functions over TDLib's reaction types: `listed_reactions` (the ONE reader of `interaction_info.reactions`), `telegram_form` (which spelling of an emoji Telegram takes), `chosen_types` (what to take back)
 - `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers; `message.rs` re-reads one message; `react.rs` adds or takes back a reaction; `serve.rs` holds the socket listener and the subscription loop)
+- `reaction_poll.rs` - `tg serve`'s poll of group reactions: which groups and messages, the tiers, the guard against a drop in unread counts, and the round loop (`Poller`); `PollSource` is what it asks of TDLib, implemented for `TdLibClient` in `client.rs`
 - `serve.rs` - The serve protocol: envelopes, the dispatcher, and the `StreamEvent` frames a `subscribe` connection carries (`StreamEvent::from_update` is the one TDLib-update → event mapping)
 - `serve_client.rs` - The CLI's side of the socket: one request per connection, plus `stream` for `tg stream`
 
@@ -360,9 +361,9 @@ are a contract with Mycelium's Telegram consumer (its spec:
   `chat_last_message` frames from one `tg chats --limit 2` on 2026-09-30, and none from the
   requests after it.
 - **Supergroups and channels may not ring.** TDLib's `openChat` docs: "all updates are received
-  only for opened chats" in them. `tg` does not call `openChat`; how many synced groups ring
-  anyway is to be measured on outpost. For `message_reactions` the answer is known and is not
-  about `openChat`: see **Reactions** below.
+  only for opened chats" in them. Only the reaction poll calls `openChat`, for a moment per
+  group and interval (see **Reactions** below), and channels never; how many synced groups ring
+  in between is to be measured on outpost.
 - **`tg stream` has no in-process fallback**, unlike every other command: a second TDLib client
   on serve's database is the one thing it must never open. It exits 1 when serve is
   unreachable or ends the stream, and 0 when its stdout closes **or its stdin reaches EOF**.
@@ -438,36 +439,99 @@ docs, not measured: **no test and no agent ever sends a reaction to a real chat.
   of it. The same update carries a channel post's view and forward counters and a discussion
   thread's reply count, and an update holds only the new state, so telling those apart would
   take a cache of what each message had. The consumer compares instead.
-- **Which reaction changes reach TDLib at all** — the answer to "does a chat `tg` never opened
-  ring?". Telegram pushes `updateMessageReactions` only where it concerns the account, and
-  `openChat` is not what decides it:
+- **Which reaction changes reach TDLib on their own** — what Telegram pushes, whether or not a
+  chat is open:
   - *One-to-one chats:* every change. TDLib never polls there
     (`need_poll_dialog_message_reactions` is `false` for `DialogType::User`).
   - *Basic groups and supergroups:* a reaction to the account's OWN message (Telegram's API docs:
     "Message authors will receive an updateMessageReactions update when a user reacts to their
     message", subject to the account's reaction-notification setting), and the account's own
     reaction made through `tg`. Whether the account's own reaction made on another device arrives
-    is not established. A reaction between other people does not arrive: Telegram's docs tell apps
+    is not established. A reaction between other people is not pushed: Telegram's docs tell apps
     to "short-poll reactions for visible messages (that weren't sent by the user) once every 15-30
-    seconds", and TDLib does that (`messages.getMessagesReactions`, `process_viewed_message`) only
-    for messages reported with `viewMessages` while the chat's `open_count > 0`. `tg` calls
-    neither `openChat` nor `viewMessages`.
+    seconds", and TDLib does that only for messages reported with `viewMessages` while the chat's
+    `open_count > 0`. Hence the poll below.
   - *Reading again does not help.* `getChatHistory` returns what `ordered_messages` holds without
     asking Telegram (`get_dialog_history`), and `getMessage` asks only for a message TDLib does
-    not have. So `sync --reconcile-days` and `message` answer with the same possibly stale
-    reactions, and a consumer's periodic reconcile catches missed doorbells, not reactions TDLib
-    never received. A message `tg serve` heard arrive has, for other people's reactions, none.
-  - *What would read them*, should it be wanted. Neither is built. (1) `openChat`, `viewMessages`
-    with an explicit non-history source, `closeChat`: queues one `getMessagesReactions` per 100
-    messages, and the changes then arrive as ordinary `message_reactions` frames. The source is
-    the whole risk: `viewMessages` in an open chat with the default source reads as chat history
-    (`MessageSource::Auto` → `DialogHistory`), which MARKS THE MESSAGES READ and increments view
-    counters; `messageSourceOther` does neither (`need_read = force_read || is_dialog_history`).
-    Get Lars's go-ahead and watch an unread chat's count on the first run. (2)
-    `getMessageAddedReactions`: a plain read, one request per message, up to 100 senders with
-    dates and `is_outgoing`, only where `can_get_added_reactions` (not in channels); it makes
-    TDLib reload a message whose cached
-    reactions disagree, but only when it has cached some.
+    not have. So `sync --reconcile-days` and `message` answer with TDLib's copy, and a consumer's
+    reconcile catches missed doorbells, not reactions TDLib never received.
+
+**The reaction poll (`tg serve`, since 0.15.0; `reaction_poll.rs`).** `tg serve` does what a
+Telegram app does for the messages on its screen: every group whose last message is at most seven
+days old is opened (`openChat`), its newest messages of those seven days (at most 100, read from
+TDLib's own copy with `only_local`, never a live location) are reported with `viewMessages`, and it
+is closed (`closeChat`). TDLib then asks Telegram for their reactions, and every change rings as an
+ordinary `message_reactions` frame: no consumer changes anything. All of the following is read from
+TDLib's source at `11e254af` (1.8.61; `td/telegram/…`), so **check it again when tdlib-rs moves to
+another TDLib**:
+
+- **The source is the whole risk, and it is `messageSourceNotification`, `force_read: false`.**
+  `view_messages` (`MessagesManager.cpp:15959`) turns `Auto` into `DialogHistory` while the chat is
+  open (`:15965`), and only a history source or `force_read` sets `need_read` (`:15974`). Everything
+  that marks something read waits on it: the unread mentions and voice/video contents
+  (`read_message_contents_on_server`, `:16158`), the unread reactions to the account's messages
+  (`read_message_reactions_on_server`, `:16164`) and the inbox (`read_dialog_inbox`, `:16328`, after
+  `if (!need_read) return` at `:16261`). `messageSourceOther` would do too, but it also queues
+  `messages.getMessagesViews` for a message with views (`need_update_view_count`, `:15975`; without
+  the view-counter increment, which only history sets, `:16225`) and marks downloads viewed in the
+  download manager (`:15977`). A notification sets neither, so it is the source with the fewest side
+  effects that still polls. The default source in an open chat MARKS THE MESSAGES READ: never pass
+  `None`.
+- **A live location is never reported.** Viewing an active live location in an open chat, from any
+  source, sends `readMessageContents` for it (`on_message_live_location_viewed`, `:16153` →
+  `:18086`). `is_live_location` leaves out every `messageLocation` with a `live_period`.
+- **What polls.** A viewed server message of an open chat goes into `dialog_viewed_messages_`
+  (`:16187`) and through `process_viewed_message` (`:9584`), which queues a reaction reload for the
+  ones `need_poll_message_reactions` picks (`:6086`): a message TDLib holds reactions for, or one
+  last updated under another generation of the chat's available reactions. A message nobody reacted
+  to is not polled: Telegram sends a message's first reaction as an edit of it (tdesktop's poll says
+  so: "First reaction always edits message"; not read in Telegram's own docs), which reaches TDLib
+  with the chat's updates, and `openChat` on a supergroup fetches those (`get_channel_difference`,
+  `:16486`). `queue_message_reactions_reload` (`MessageQueryManager.cpp:2467`) sends one
+  `messages.getMessagesReactions` per 100 messages at once; the answer's `updateMessageReactions`
+  updates the message, and a message the answer leaves out is set to no reactions (`:1008`).
+- **`closeChat` right after does not cancel it.** `close_dialog` (`MessagesManager.cpp:16534`)
+  drops `dialog_viewed_messages_` (`:16576`) and the repeat timer, but the reload queue
+  (`being_reloaded_reactions_`) is `MessageQueryManager`'s and is left alone. The repeat timer would
+  not run anyway: it needs the account online (`:16251`, `:9574`, `:9617`), and `tg` never sets
+  the `online` option (`OnlineManager.h:52`: offline by default), so the poll also never shows the account
+  online. Each poll is exactly one reaction reload per chat.
+- **What `openChat` itself costs**, all reads (`open_dialog`, `:16420`): a basic group's full info
+  (`repair_chat_participants`) and peer settings; a supergroup's difference, peer settings, full
+  info when it is out of date, and its 200 recent members when it has fewer than 195; the pinned
+  message and a group call's state when not cached; and the chat goes onto TDLib's local list of
+  recently opened chats. Roughly 3 to 5 requests per open, plus the reaction reload. Reporting
+  also reloads a fact check, a paid medium or a forwarded story where a message carries one.
+  Reading the history with `only_local` waits on no request, though TDLib may preload the
+  neighbouring history in the background, as it does for every history read. Listing the chats
+  (`getChats` for Main and Archive) loads the lists from Telegram the first time, once per
+  session, and holds the client lock meanwhile.
+- **The guard.** Each poll reads the chat's read state (`unread_count`, `unread_mention_count`,
+  `unread_reaction_count`, `is_marked_as_unread`, `last_read_inbox_message_id`) before
+  `openChat` and again after `viewMessages`, before `closeChat`. TDLib changes it synchronously
+  inside `view_messages` when it reads anything (and `open_dialog` reads locally only in a chat
+  without a last message, `:16440`, which the poll never opens), while what `openChat`'s requests bring back (a read made on another device) lands
+  later. A count that falls, the mark that goes or the inbox's read mark moving up (which no new
+  message can hide, as one can hide a lower count) stops the poll until `tg serve` restarts
+  (`Stop::Dropped`), with one line on stderr; so does a read state that cannot be read
+  afterwards (`Stop::Unverified`). A read made on another device inside those few milliseconds
+  would stop it too. A chat is closed on every path once opened; one whose `closeChat` failed is
+  closed again before the next round and when the poll ends.
+- **Tiers.** By the age of a group's last message: at most an hour, every 5 minutes; a day, every
+  20; seven days, every 60. A round starts every minute and polls what is due, the most recently
+  active first, one chat at a time with 2 s between them; a round never overlaps the next, and an
+  interval runs from the round a chat was polled in. Only a basic group or a non-channel supergroup
+  of the Main or Archive list that allows reactions is polled; the first round comes a minute after
+  start. The poll holds the client lock for one chat's reads and calls at a time (local, a few
+  milliseconds), so a send waits at most that; a round reads every listed chat's state, one
+  `getChat` each, to find the groups that are due.
+- **`TG_REACTION_POLL=off`** turns it off; any value but `on` or `off` refuses to start `tg serve`.
+- **Logs are numbers only:** the first round's counts (groups in the window, polled, reported,
+  with reactions, and the unread totals before and after), a summary every hour (rounds, polls,
+  frames rung within 10 s of a poll, the unread totals now), each distinct error once, and the stop.
+- **A reaction found by a poll is dated late by the consumer.** Mycelium dates a reaction it hears
+  of by the ring. A ring from a poll comes up to one interval after the reaction was made; the first
+  poll after the roll found everything TDLib had missed until then.
 
 **Attachments (`args.files`, since 0.5.0):** 1-10 local files sent as ONE message, `args.message`
 being the caption. Validated in `send::handle` BEFORE the recipient ladder — same ordering and

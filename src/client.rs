@@ -16,6 +16,7 @@ use crate::output::{
     MessageReactionInfo, PartialSendResult, ReactionSender, SendResult,
 };
 use crate::parse_mode::ParseMode;
+use crate::reaction_poll;
 use crate::reactions::{self, CustomEmoji};
 
 // Direct FFI to TDLib's synchronous log functions (not exposed by tdlib-rs)
@@ -1269,6 +1270,161 @@ impl ChatDataSource for TdLibClient {
             chat_type,
             is_bot,
         })
+    }
+}
+
+/// How many chats of each list the reaction poll asks TDLib for. Both lists together hold far
+/// fewer on the account it runs for; TDLib answers from what it has loaded once a list is whole.
+const POLL_CHAT_LIMIT: i32 = 2000;
+
+/// Whether a message's content is a live location, ended or not. Viewing one makes TDLib mark
+/// its content read whatever the source (`on_message_live_location_viewed`), so the reaction poll
+/// never reports one.
+fn is_live_location(content: &tdlib_rs::enums::MessageContent) -> bool {
+    matches!(content, tdlib_rs::enums::MessageContent::MessageLocation(l) if l.live_period > 0)
+}
+
+/// Whether TDLib holds reactions for a message: the ones its own poll re-reads.
+fn holds_reactions(info: Option<&tdlib_rs::types::MessageInteractionInfo>) -> bool {
+    info.and_then(|i| i.reactions.as_ref())
+        .is_some_and(|r| !r.reactions.is_empty())
+}
+
+/// What the reaction poll needs of a message.
+fn recent_message(message: &tdlib_rs::types::Message) -> reaction_poll::RecentMessage {
+    reaction_poll::RecentMessage {
+        id: message.id,
+        date: i64::from(message.date),
+        has_reactions: holds_reactions(message.interaction_info.as_ref()),
+        is_live_location: is_live_location(&message.content),
+    }
+}
+
+/// The `source` and `force_read` the reaction poll reports messages with.
+///
+/// NEVER `None` or a chat-history source, and never `force_read`: in an open chat the default
+/// source is chat history, which marks the messages read. A notification is the source TDLib
+/// (1.8.61) does least for: it marks nothing read and asks Telegram only for the messages'
+/// reactions (and for a fact check, a paid medium or a story where a message carries one).
+fn poll_view_source() -> (Option<tdlib_rs::enums::MessageSource>, bool) {
+    (Some(tdlib_rs::enums::MessageSource::Notification), false)
+}
+
+/// Whether a chat takes reactions: all of them, or a list that is not empty.
+fn reactions_allowed(available: &tdlib_rs::enums::ChatAvailableReactions) -> bool {
+    match available {
+        tdlib_rs::enums::ChatAvailableReactions::All(_) => true,
+        tdlib_rs::enums::ChatAvailableReactions::Some(some) => !some.reactions.is_empty(),
+    }
+}
+
+#[async_trait]
+impl reaction_poll::LocalHistory for TdLibClient {
+    async fn local_page(
+        &self,
+        chat_id: i64,
+        from_message_id: i64,
+        limit: usize,
+    ) -> Result<Vec<reaction_poll::RecentMessage>> {
+        let client_id = self.get_client_id().await?;
+        let limit = i32::try_from(limit.min(100)).unwrap_or(100);
+        // `only_local`: what TDLib holds, from memory or its database; the answer waits on no
+        // request (TDLib may preload neighbouring history in the background, as for any read).
+        let messages = tdlib_rs::functions::get_chat_history(
+            chat_id,
+            from_message_id,
+            0,
+            limit,
+            true,
+            client_id,
+        )
+        .await
+        .map_err(|e| TgError::TdLib(e.message))?;
+        Ok(unwrap_messages(messages)
+            .messages
+            .iter()
+            .flatten()
+            .map(recent_message)
+            .collect())
+    }
+}
+
+#[async_trait]
+impl reaction_poll::PollSource for TdLibClient {
+    async fn poll_chat_ids(&self) -> Result<Vec<i64>> {
+        let client_id = self.get_client_id().await?;
+        let mut ids = Vec::new();
+        for list in [
+            tdlib_rs::enums::ChatList::Main,
+            tdlib_rs::enums::ChatList::Archive,
+        ] {
+            let chats = tdlib_rs::functions::get_chats(Some(list), POLL_CHAT_LIMIT, client_id)
+                .await
+                .map_err(|e| TgError::TdLib(e.message))?;
+            ids.extend(unwrap_chats(chats).chat_ids);
+        }
+        Ok(ids)
+    }
+
+    async fn poll_chat_state(&self, chat_id: i64) -> Result<reaction_poll::ChatState> {
+        let client_id = self.get_client_id().await?;
+        let chat = unwrap_chat(
+            tdlib_rs::functions::get_chat(chat_id, client_id)
+                .await
+                .map_err(|e| TgError::TdLib(e.message))?,
+        );
+        Ok(reaction_poll::ChatState {
+            is_group: matches!(
+                chat_type_kind(&chat.r#type),
+                ChatTypeKind::BasicGroup | ChatTypeKind::Supergroup
+            ),
+            reactions_allowed: reactions_allowed(&chat.available_reactions),
+            last_message_date: chat.last_message.as_ref().map(|m| i64::from(m.date)),
+            read: reaction_poll::ReadState {
+                unread_messages: i64::from(chat.unread_count),
+                unread_mentions: i64::from(chat.unread_mention_count),
+                unread_reactions: i64::from(chat.unread_reaction_count),
+                marked_unread: chat.is_marked_as_unread,
+                last_read_inbox_message_id: chat.last_read_inbox_message_id,
+            },
+        })
+    }
+
+    async fn local_recent_messages(
+        &self,
+        chat_id: i64,
+        since: i64,
+        limit: usize,
+    ) -> Result<Vec<reaction_poll::RecentMessage>> {
+        reaction_poll::collect_recent(self, chat_id, since, limit).await
+    }
+
+    async fn poll_open_chat(&self, chat_id: i64) -> Result<()> {
+        let client_id = self.get_client_id().await?;
+        tdlib_rs::functions::open_chat(chat_id, client_id)
+            .await
+            .map_err(|e| TgError::TdLib(e.message))
+    }
+
+    async fn report_viewed(&self, chat_id: i64, message_ids: &[i64]) -> Result<()> {
+        let client_id = self.get_client_id().await?;
+        let (source, force_read) = poll_view_source();
+        tdlib_rs::functions::view_messages(
+            chat_id,
+            message_ids.to_vec(),
+            source,
+            force_read,
+            client_id,
+        )
+        .await
+        .map_err(|e| TgError::TdLib(e.message))
+    }
+
+    async fn poll_close_chat(&self, chat_id: i64) -> Result<()> {
+        let client_id = self.get_client_id().await?;
+        tdlib_rs::functions::close_chat(chat_id, client_id)
+            .await
+            .map_err(|e| TgError::TdLib(e.message))
     }
 }
 
@@ -4649,6 +4805,95 @@ pub mod mock {
         async fn mark_chat_as_unread(&self, _chat_id: i64) -> Result<()> {
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod poll_source_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn location(live_period: i32) -> tdlib_rs::enums::MessageContent {
+        serde_json::from_value(json!({
+            "@type": "messageLocation",
+            "location": {"@type": "location", "latitude": 45.46, "longitude": 9.19, "horizontal_accuracy": 0.0},
+            "live_period": live_period,
+            "expires_in": 0,
+            "heading": 0,
+            "proximity_alert_radius": 0,
+        }))
+        .expect("fixture is a valid messageLocation")
+    }
+
+    #[test]
+    fn a_live_location_is_one_ended_or_not_and_a_plain_location_is_none() {
+        assert!(is_live_location(&location(900)));
+        assert!(is_live_location(&location(0x7FFF_FFFF)));
+        assert!(!is_live_location(&location(0)));
+        let text: tdlib_rs::enums::MessageContent = serde_json::from_value(json!({
+            "@type": "messageText",
+            "text": {"@type": "formattedText", "text": "Ciao", "entities": []},
+        }))
+        .unwrap();
+        assert!(!is_live_location(&text));
+    }
+
+    #[test]
+    fn the_poll_reports_messages_as_seen_in_a_notification_and_never_forces_a_read() {
+        let (source, force_read) = poll_view_source();
+        assert!(!force_read);
+        assert_eq!(
+            serde_json::to_value(source.expect("an explicit source, never TDLib's default"))
+                .unwrap(),
+            json!({"@type": "messageSourceNotification"})
+        );
+    }
+
+    #[test]
+    fn a_chat_takes_reactions_unless_its_list_is_empty() {
+        let all: tdlib_rs::enums::ChatAvailableReactions = serde_json::from_value(
+            json!({"@type": "chatAvailableReactionsAll", "max_reaction_count": 1}),
+        )
+        .unwrap();
+        assert!(reactions_allowed(&all));
+        let some: tdlib_rs::enums::ChatAvailableReactions = serde_json::from_value(json!({
+            "@type": "chatAvailableReactionsSome",
+            "reactions": [{"@type": "reactionTypeEmoji", "emoji": "👍"}],
+            "max_reaction_count": 1,
+        }))
+        .unwrap();
+        assert!(reactions_allowed(&some));
+        let none: tdlib_rs::enums::ChatAvailableReactions = serde_json::from_value(json!({
+            "@type": "chatAvailableReactionsSome",
+            "reactions": [],
+            "max_reaction_count": 1,
+        }))
+        .unwrap();
+        assert!(!reactions_allowed(&none));
+    }
+
+    #[test]
+    fn a_message_holds_reactions_only_with_at_least_one() {
+        assert!(!holds_reactions(None));
+        let views_only: tdlib_rs::types::MessageInteractionInfo = serde_json::from_value(json!({
+            "@type": "messageInteractionInfo", "view_count": 12, "forward_count": 0,
+        }))
+        .unwrap();
+        assert!(!holds_reactions(Some(&views_only)));
+        let reactions = |list: serde_json::Value| -> tdlib_rs::types::MessageInteractionInfo {
+            serde_json::from_value(json!({
+                "@type": "messageInteractionInfo", "view_count": 0, "forward_count": 0,
+                "reactions": {"@type": "messageReactions", "reactions": list, "are_tags": false,
+                              "paid_reactors": [], "can_get_added_reactions": true},
+            }))
+            .unwrap()
+        };
+        assert!(!holds_reactions(Some(&reactions(json!([])))));
+        assert!(holds_reactions(Some(&reactions(json!([{
+            "@type": "messageReaction",
+            "type": {"@type": "reactionTypeEmoji", "emoji": "👍"},
+            "total_count": 1, "is_chosen": false, "recent_sender_ids": [],
+        }])))));
     }
 }
 

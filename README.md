@@ -209,7 +209,7 @@ conventionally omits because it is the escape character itself. Two failure mode
 
 ## Machine use
 
-`tg serve` runs a long-lived background process that keeps one TDLib client warm and exposes it over a Unix socket. Every other `tg <cmd>` automatically routes through it when it's up — and falls back to in-process TDLib (today's behaviour) when it isn't. The server is a pure performance optimisation; nothing breaks without it.
+`tg serve` runs a long-lived background process that keeps one TDLib client warm and exposes it over a Unix socket. Every other `tg <cmd>` automatically routes through it when it's up — and falls back to in-process TDLib (today's behaviour) when it isn't. Nothing breaks without the server; what only it does is ring `subscribe`'s live events and poll group reactions (see *Reactions*).
 
 ### Running the server
 
@@ -224,6 +224,8 @@ The socket path is resolved in this order:
 2. `TG_SERVE_SOCKET=` (set but empty) — disabled; clients always use in-process TDLib.
 3. `$XDG_RUNTIME_DIR/tg.sock` if `XDG_RUNTIME_DIR` is set.
 4. `$DATA_DIR/tg/serve.sock` (e.g. `~/Library/Application Support/tg/serve.sock` on macOS).
+
+`TG_REACTION_POLL=off` turns off the server's poll of group reactions (see *Reactions*).
 
 The socket is created with `0600` permissions. Concurrent connections are accepted, but TDLib calls are serialised internally — slow commands (e.g. `download`) block the channel until they complete.
 
@@ -768,8 +770,8 @@ Telegram's order:
 - **Paid reactions are left out.**
 - **In Saved Messages** reactions are the account's own tags, and are listed like any reaction.
 
-**These are the reactions TDLib holds, and it does not hold all of them.** Telegram sends a
-reaction change on its own only where it concerns the account:
+**These are the reactions TDLib holds.** Telegram sends a reaction change on its own only where
+it concerns the account:
 
 - **A one-to-one chat:** every change arrives. TDLib itself never polls there; it relies on
   Telegram sending them.
@@ -777,15 +779,25 @@ reaction change on its own only where it concerns the account:
   (Telegram's API: "Message authors will receive an updateMessageReactions update when a user
   reacts to their message"), and so does the account's own reaction made through `tg`. Whether
   the account's own reaction made on another device arrives is not established. A reaction
-  between other people does not. A Telegram app shows those because it polls the messages on
-  screen every 15 to 30 seconds; TDLib polls only messages reported with `viewMessages` in a chat
-  opened with `openChat`, and `tg` calls neither.
+  between other people is not sent: a Telegram app polls the messages on its screen for those.
 
-So for other people's reactions to other people's messages in a group, `reactions` is what TDLib
-last received with the message, which for a message it heard arrive is nothing. No
-`message_reactions` event rings for them, and reading the message again (`message`, `sync
---reconcile-days`) answers from the same copy. Reading them would take the polling a Telegram app
-does; `tg` does not do it.
+**`tg serve` polls them (since 0.15.0)**, as an app polls its screen: each basic group and
+supergroup (not a channel) that allows reactions and has a message from the last seven days is
+opened, its newest messages of those seven days (at most 100, from TDLib's own copy) are reported
+as viewed, and it is closed again. TDLib asks Telegram for their reactions, and each change rings
+`message_reactions` like any other. A group is polled every 5 minutes while its last message is at
+most an hour old, every 20 while it is at most a day old, and hourly up to seven days.
+
+- **Nothing is marked read.** The messages are reported as seen in a notification
+  (`messageSourceNotification`, `force_read: false`), which TDLib reads nothing for, and a live
+  location, which it would, is never reported. Each poll compares the chat's unread messages,
+  mentions and reactions just before and just after; a drop stops the poll until `tg serve`
+  restarts.
+- **The account does not go online.** `tg` never sets TDLib's `online` option.
+- **`TG_REACTION_POLL=off`** in `tg serve`'s environment turns it off (unset or `on`: on).
+- Without `tg serve` (a one-off `tg` command) nothing is polled, and `reactions` is what TDLib last
+  received, which for other people's reactions to other people's messages in a group may be
+  nothing. Reading a message again (`message`, `sync --reconcile-days`) answers from that copy.
 
 ## Testing
 
