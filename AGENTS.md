@@ -550,6 +550,24 @@ another TDLib**:
 - **A reaction found by a poll is dated late by the consumer.** Mycelium dates a reaction it hears
   of by the ring. A ring from a poll comes up to one interval after the reaction was made; the first
   poll after the roll found everything TDLib had missed until then.
+- **Measured on outpost, 2026-10-18** (0.15.0 rolled at 11:47 UTC; numbers only). Before: 117
+  non-channel groups, 37 of them with a message in the last seven days (3 basic groups, 34
+  supergroups; 1 within the hour, 15 within the day), `tg groups`' unread total 109,169 over 57
+  groups with unread. The first round polled all 37 in about 75 s: 1,006 messages reported, 67 with
+  reactions, and in every polled chat the read state after reporting equalled the one before
+  (summed: 106,246 unread messages, 0 mentions, 1 reaction, 0 chats marked unread). The first hour:
+  60 rounds, 114 polls, 79 of them re-reading reactions, 6,240 messages reported, 83
+  `message_reactions` frames within 10 s of a poll, none failed and the guard never stopped it.
+  So about 114 opens of 3 to 5 requests each plus 79 `getMessagesReactions`, some 420 to 650
+  requests in the first hour, and about 77 opens (300 to 450 requests) in an hour after it. The
+  frames came with the first polls of each message: a 7-minute `tg stream` an hour later carried
+  none. Unread over all 117 groups: 109,176 at 12:48 and 109,178 at 13:20, more messages; one
+  chat's count fell by 3, which were three weeks-old messages deleted on Telegram that TDLib heard of
+  from the difference its `openChat` fetched (Mycelium recorded the three deleted at 11:49:26,
+  during the first round): a deletion, not a read. In the 13 groups Mycelium keeps durably, other
+  people's reactions to the last seven days' messages read 22 in TDLib and 22 in Mycelium after
+  the first hour, and no reaction between other people changed in any polled group between 12:50
+  and 13:20 (1,049 messages compared): a new one arriving through the poll is still to be seen.
 
 **Attachments (`args.files`, since 0.5.0):** 1-10 local files sent as ONE message, `args.message`
 being the caption. Validated in `send::handle` BEFORE the recipient ladder — same ordering and
