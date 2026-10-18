@@ -119,6 +119,7 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 - `media.rs` - `send`'s attachments: the `SendFile` wire mirror, the validated `MediaFile`, and the one validator both go through
 - `output.rs` - Dual output formatting (plain text default, JSON with `--json`)
 - `reactions.rs` - Pure functions over TDLib's reaction types: `listed_reactions` (the ONE reader of `interaction_info.reactions`), `telegram_form` (which spelling of an emoji Telegram takes), `chosen_types` (what to take back)
+- `reaction_changes.rs` - The reaction changes Telegram has not answered yet, per message (`ReactionChanges`): what `react` waits on before it asks again
 - `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers; `message.rs` re-reads one message; `react.rs` adds or takes back a reaction; `serve.rs` holds the socket listener and the subscription loop)
 - `reaction_poll.rs` - `tg serve`'s poll of group reactions: which groups and messages, the tiers, the guard against a drop in unread counts, and the round loop (`Poller`); `PollSource` is what it asks of TDLib, implemented for `TdLibClient` in `client.rs`
 - `serve.rs` - The serve protocol: envelopes, the dispatcher, and the `StreamEvent` frames a `subscribe` connection carries (`StreamEvent::from_update` is the one TDLib-update → event mapping)
@@ -429,8 +430,23 @@ docs, not measured: **no test and no agent ever sends a reaction to a real chat.
   `tg` rings a `message_reactions` frame by itself; a read-back right after an ERROR may still
   show the reaction (which is why `react` reads back only after success); and a request that
   times out says nothing about the outcome. Reactions are not in TDLib's binlog ("TODO … log
-  event"), and a repeated request is harmless: an account without Premium has one reaction per
-  message and adding the same one again is a no-op.
+  event"). An account without Premium has one reaction per message, and adding the same one again
+  changes nothing on Telegram.
+- **TDLib answers a repeat from its own copy, so `tg` keeps what Telegram has not answered (since
+  0.15.1, tavola-fkp.6).** A second `addMessageReaction` for a reaction the copy already shows is
+  answered ok at once, without asking Telegram (`MessagesManager::add_message_reaction`:
+  `add_my_reaction` returns false for one already chosen and not big, and the promise is set), and
+  `removeMessageReaction` likewise for one it no longer shows; `react`'s read-back reads that same
+  copy. So a request that stopped waiting after 10 s did not end its change: `ReactionChanges`
+  runs every reaction call on a task of its own and keeps the change, per `(chat_id, message_id)`,
+  until Telegram answers (`Settled` takes it off however the task ends). `react::handle` asks
+  `earlier_reaction_change` before anything else and waits up to 10 s more: still unanswered, it
+  fails and asks nothing; refused, a repeat of that change (`ReactionChange::repeats`: the same
+  emoji in either spelling, any taking back for a taking back of everything) gets the refusal,
+  since TDLib's copy shows the refused change until its reload lands; otherwise it goes ahead. The
+  mock models TDLib the same way (its copy first, a silent Telegram on `telegram_answers`), so the
+  tests drive the real `ReactionChanges`. What it cannot cover: a process that stops forgets what
+  it asked, and a new one's copy may show a change Telegram never got.
 - **`removeMessageReaction` takes back exactly the type it is given** and answers ok, having done
   nothing, for one the account has not chosen. What `tg` lists as one emoji can be a custom emoji,
   so `remove_message_reaction` reads the message and takes back `reactions::chosen_types`.

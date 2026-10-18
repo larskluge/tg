@@ -16,6 +16,7 @@ use crate::output::{
     MessageReactionInfo, PartialSendResult, ReactionSender, SendResult,
 };
 use crate::parse_mode::ParseMode;
+use crate::reaction_changes::{Answer, Answered, ReactionChange, ReactionChanges};
 use crate::reaction_poll;
 use crate::reactions::{self, CustomEmoji};
 
@@ -171,18 +172,30 @@ pub trait TelegramClient: Send + Sync {
 
     /// React to a message with exactly this emoji: not big, and counted among
     /// the account's recent reactions. Returns once Telegram has answered. Its
-    /// refusal is [`TgError::TdLib`] carrying Telegram's own reason.
+    /// refusal is [`TgError::TdLib`] carrying Telegram's own reason. A change
+    /// Telegram does not answer in time stays pending
+    /// ([`TelegramClient::earlier_reaction_change`]).
     async fn add_message_reaction(&self, chat_id: i64, message_id: i64, emoji: &str) -> Result<()>;
 
     /// Take back the account's reaction that [`TelegramClient::get_message`]
-    /// lists as `emoji`. Refused as [`TelegramClient::add_message_reaction`]
-    /// is.
+    /// lists as `emoji`. Refused, and left pending, as
+    /// [`TelegramClient::add_message_reaction`] is.
     async fn remove_message_reaction(
         &self,
         chat_id: i64,
         message_id: i64,
         emoji: &str,
     ) -> Result<()>;
+
+    /// The reaction change to this message an earlier request asked for and
+    /// Telegram had not answered, with Telegram's answer, waited for at most
+    /// [`crate::reaction_changes::REACTION_TIMEOUT_SECS`]. `None` when none is
+    /// pending; an error when Telegram still has not answered it.
+    async fn earlier_reaction_change(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<Option<Answered>>;
 
     /// Up to `limit` messages with id > `after_message_id` — the OLDEST ones —
     /// in ascending id order, holding at most `limit` in memory.
@@ -242,6 +255,9 @@ pub struct TdLibClient {
     sync_receiver: Option<broadcast::Receiver<tdlib_rs::enums::Update>>,
     /// Whether ConnectionState::Ready was seen during auth
     connection_ready: bool,
+    /// Reaction changes Telegram has not answered yet: TDLib's own copy
+    /// already shows them, so a repeat must not be answered from it.
+    reaction_changes: Arc<ReactionChanges>,
 }
 
 /// Maximum seconds to wait for TDLib to finish syncing updates from the server.
@@ -270,11 +286,6 @@ const REPLY_CHECK_TIMEOUT_SECS: u64 = 10;
 /// once, and fetches a message it does not hold over the network: that is the
 /// wait this bounds.
 const MESSAGE_READ_TIMEOUT_SECS: u64 = 10;
-
-/// Maximum seconds to wait for Telegram's answer to a reaction. TDLib shows a
-/// reaction on its own copy of the message at once and only then asks
-/// Telegram, so running out of time says nothing about the outcome.
-const REACTION_TIMEOUT_SECS: u64 = 10;
 
 /// Maximum seconds to learn which emoji a custom emoji stands for. TDLib
 /// answers from its cache once it has seen one and asks Telegram the first
@@ -885,21 +896,6 @@ impl TdLibClient {
         names
     }
 
-    /// Wait for Telegram's answer to a reaction change, for at most
-    /// [`REACTION_TIMEOUT_SECS`].
-    async fn reaction_answer(
-        call: impl std::future::Future<Output = std::result::Result<(), tdlib_rs::types::Error>>,
-    ) -> Result<()> {
-        let timeout = tokio::time::Duration::from_secs(REACTION_TIMEOUT_SECS);
-        match tokio::time::timeout(timeout, call).await {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(TgError::TdLib(e.message)),
-            Err(_) => Err(TgError::Other(format!(
-                "Telegram did not answer within {REACTION_TIMEOUT_SECS}s; the change may still take effect"
-            ))),
-        }
-    }
-
     pub fn new(api_id: i32, api_hash: String) -> Result<Self> {
         // Set TDLib log verbosity to fatal errors only (0) before any TDLib operations
         // Level 0 = fatal errors, 1 = errors, 2 = warnings
@@ -923,6 +919,7 @@ impl TdLibClient {
             receive_handle: Arc::new(Mutex::new(None)),
             sync_receiver: None,
             connection_ready: false,
+            reaction_changes: Arc::new(ReactionChanges::default()),
         })
     }
 
@@ -1747,6 +1744,14 @@ async fn build_media_contents(
             }
         })
         .collect())
+}
+
+/// Telegram's answer to a TDLib reaction call, as [`ReactionChanges`] keeps
+/// it: its reason when it refused.
+async fn telegrams_answer(
+    call: impl std::future::Future<Output = std::result::Result<(), tdlib_rs::types::Error>>,
+) -> Answer {
+    call.await.map_err(|e| e.message)
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -3723,10 +3728,17 @@ impl TelegramClient for TdLibClient {
         });
         // Not big, and counted among the account's recent reactions, as a
         // reaction picked in a Telegram app is.
-        Self::reaction_answer(tdlib_rs::functions::add_message_reaction(
+        let call = tdlib_rs::functions::add_message_reaction(
             chat_id, message_id, reaction, false, true, client_id,
-        ))
-        .await
+        );
+        self.reaction_changes
+            .ask(
+                chat_id,
+                message_id,
+                ReactionChange::Add(emoji.to_string()),
+                telegrams_answer(call),
+            )
+            .await
     }
 
     async fn remove_message_reaction(
@@ -3749,13 +3761,35 @@ impl TelegramClient for TdLibClient {
                 "message {message_id} in chat {chat_id} holds no reaction of the account to take back"
             )));
         }
-        for reaction in own {
-            Self::reaction_answer(tdlib_rs::functions::remove_message_reaction(
-                chat_id, message_id, reaction, client_id,
-            ))
-            .await?;
-        }
-        Ok(())
+        let calls: Vec<_> = own
+            .into_iter()
+            .map(|reaction| {
+                telegrams_answer(tdlib_rs::functions::remove_message_reaction(
+                    chat_id, message_id, reaction, client_id,
+                ))
+            })
+            .collect();
+        self.reaction_changes
+            .ask(
+                chat_id,
+                message_id,
+                ReactionChange::Remove(emoji.to_string()),
+                async move {
+                    for call in calls {
+                        call.await?;
+                    }
+                    Ok(())
+                },
+            )
+            .await
+    }
+
+    async fn earlier_reaction_change(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+    ) -> Result<Option<Answered>> {
+        self.reaction_changes.earlier(chat_id, message_id).await
     }
 
     async fn get_boundary_message_id(
@@ -4272,6 +4306,15 @@ pub mod mock {
         pub reactions_take_no_effect: bool,
         /// Every reaction call the client was asked for, refused ones too.
         pub reaction_calls: std::sync::Mutex<Vec<ReactionCall>>,
+        /// When set, Telegram answers the reaction changes it is asked for in
+        /// turn, each with the next answer a test sends; until then a change
+        /// is pending, as TdLibClient keeps it. Unset, Telegram answers ok at
+        /// once.
+        pub telegram_answers:
+            Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Answer>>>>,
+        /// The reaction changes Telegram has not answered, kept as
+        /// TdLibClient keeps them.
+        pub reaction_changes: Arc<ReactionChanges>,
         /// Tracks how many times `get_message` has been called
         pub get_message_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -4287,6 +4330,30 @@ pub mod mock {
     }
 
     impl MockClient {
+        /// Ask this mock's Telegram for a change TDLib's copy already shows.
+        async fn ask_telegram(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+            change: ReactionChange,
+        ) -> Result<()> {
+            let answers = self.telegram_answers.clone();
+            let telegram = async move {
+                match answers {
+                    None => Ok(()),
+                    Some(answers) => answers
+                        .lock()
+                        .await
+                        .recv()
+                        .await
+                        .unwrap_or_else(|| Err("the test dropped Telegram".to_string())),
+                }
+            };
+            self.reaction_changes
+                .ask(chat_id, message_id, change, telegram)
+                .await
+        }
+
         pub fn with_state(state: AuthState) -> Self {
             let client = Self::default();
             *client.auth_state.lock().unwrap() = state;
@@ -4387,6 +4454,8 @@ pub mod mock {
                 reaction_refusal: None,
                 reactions_take_no_effect: false,
                 reaction_calls: std::sync::Mutex::new(Vec::new()),
+                telegram_answers: None,
+                reaction_changes: Arc::new(ReactionChanges::default()),
                 get_message_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 messages: vec![
                     MessageInfo {
@@ -4660,7 +4729,9 @@ pub mod mock {
 
         /// Refuses, as TDLib does, an emoji that is not byte for byte one of
         /// the offered ones. An account without Premium has one reaction per
-        /// message, so another emoji replaces the one it had.
+        /// message, so another emoji replaces the one it had. Like TDLib, it
+        /// changes its own copy first and then asks Telegram, and answers a
+        /// reaction that copy already shows at once, asking nobody.
         async fn add_message_reaction(
             &self,
             chat_id: i64,
@@ -4683,27 +4754,37 @@ pub mod mock {
                 return Ok(());
             }
 
-            let mut all = self.reactions.lock().unwrap();
-            let list = all.entry((chat_id, message_id)).or_default();
-            for other in list.iter_mut().filter(|r| r.chosen && r.emoji != emoji) {
-                other.chosen = false;
-                other.count -= 1;
-            }
-            list.retain(|r| r.count > 0);
-            match list.iter_mut().find(|r| r.emoji == emoji) {
-                Some(same) if same.chosen => {}
-                Some(same) => {
-                    same.chosen = true;
-                    same.count += 1;
+            let shown = {
+                let mut all = self.reactions.lock().unwrap();
+                let list = all.entry((chat_id, message_id)).or_default();
+                for other in list.iter_mut().filter(|r| r.chosen && r.emoji != emoji) {
+                    other.chosen = false;
+                    other.count -= 1;
                 }
-                None => list.push(MessageReactionInfo {
-                    emoji: emoji.to_string(),
-                    count: 1,
-                    chosen: true,
-                    recent_senders: vec![],
-                }),
+                list.retain(|r| r.count > 0);
+                match list.iter_mut().find(|r| r.emoji == emoji) {
+                    Some(same) if same.chosen => true,
+                    Some(same) => {
+                        same.chosen = true;
+                        same.count += 1;
+                        false
+                    }
+                    None => {
+                        list.push(MessageReactionInfo {
+                            emoji: emoji.to_string(),
+                            count: 1,
+                            chosen: true,
+                            recent_senders: vec![],
+                        });
+                        false
+                    }
+                }
+            };
+            if shown {
+                return Ok(());
             }
-            Ok(())
+            self.ask_telegram(chat_id, message_id, ReactionChange::Add(emoji.to_string()))
+                .await
         }
 
         async fn remove_message_reaction(
@@ -4727,6 +4808,7 @@ pub mod mock {
                 return Ok(());
             }
 
+            let mut taken_back = false;
             if let Some(list) = self
                 .reactions
                 .lock()
@@ -4736,10 +4818,29 @@ pub mod mock {
                 for own in list.iter_mut().filter(|r| r.chosen && r.emoji == emoji) {
                     own.chosen = false;
                     own.count -= 1;
+                    taken_back = true;
                 }
                 list.retain(|r| r.count > 0);
             }
-            Ok(())
+            if !taken_back {
+                // TDLib answers ok, having done nothing, for a reaction its
+                // copy does not show.
+                return Ok(());
+            }
+            self.ask_telegram(
+                chat_id,
+                message_id,
+                ReactionChange::Remove(emoji.to_string()),
+            )
+            .await
+        }
+
+        async fn earlier_reaction_change(
+            &self,
+            chat_id: i64,
+            message_id: i64,
+        ) -> Result<Option<Answered>> {
+            self.reaction_changes.earlier(chat_id, message_id).await
         }
 
         async fn get_boundary_message_id(

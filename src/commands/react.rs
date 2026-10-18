@@ -5,6 +5,7 @@ use crate::client::TelegramClient;
 use crate::commands::send::validate_message_id;
 use crate::error::{Result, TgError};
 use crate::output::{MessageInfo, ReactResult};
+use crate::reaction_changes::{Answered, ReactionChange};
 use crate::reactions::{emoji_key, telegram_form};
 
 /// Wire mirror of the `react` socket args. Closed like `send`'s
@@ -47,6 +48,11 @@ impl From<ReactArgs> for ReactRequest {
 /// Success always means the message was read back and shows what was asked
 /// for; a read-back that disagrees is an error, never `chosen` with the other
 /// value.
+///
+/// One change per message at a time: a change to this message that Telegram
+/// has not answered yet is waited for first, because TDLib's copy already
+/// shows it and would answer a repeat itself. Still unanswered, nothing is
+/// asked; refused, a repeat of it gets that refusal.
 pub async fn handle<C: TelegramClient>(client: &C, req: ReactRequest) -> Result<ReactResult> {
     let chat_id = req.id;
     let message_id = validate_message_id("message_id", req.message_id)?;
@@ -57,15 +63,35 @@ pub async fn handle<C: TelegramClient>(client: &C, req: ReactRequest) -> Result<
         ));
     }
 
+    let target = Target {
+        chat_id,
+        message_id,
+    };
+    let asked = if req.remove {
+        ReactionChange::Remove(req.emoji.clone())
+    } else {
+        ReactionChange::Add(req.emoji.clone())
+    };
+    let earlier = client
+        .earlier_reaction_change(chat_id, message_id)
+        .await
+        .map_err(|e| TgError::Other(format!("react: {e}")))?;
+    if let Some(Answered {
+        change,
+        answer: Err(reason),
+    }) = earlier
+        && asked.repeats(&change)
+    {
+        // TDLib's copy may still show the refused change until it has
+        // reloaded the message.
+        return Err(target.refused(TgError::TdLib(reason)));
+    }
+
     let before = client
         .get_message(chat_id, message_id)
         .await
         .map_err(|e| TgError::Other(format!("react: {e}")))?;
 
-    let target = Target {
-        chat_id,
-        message_id,
-    };
     if req.remove {
         take_back(client, target, &req.emoji, &before).await
     } else {
@@ -203,7 +229,11 @@ mod tests {
     use super::*;
     use crate::client::mock::{MockClient, ReactionCall};
     use crate::output::{MessageReactionInfo, ReactionSender};
+    use crate::reaction_changes::Answer;
     use serde_json::json;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+    use tokio::time::Duration;
 
     // Fictional TDLib ids, as in `send`'s reply tests: a DM and a supergroup,
     // each holding one message.
@@ -516,6 +546,171 @@ mod tests {
             .to_string();
         assert!(err.contains("Telegram refused the reaction"), "{err}");
         assert!(err.ends_with("MESSAGE_NOT_MODIFIED"), "{err}");
+    }
+
+    /// A client whose Telegram answers each reaction change it is asked for
+    /// only when the test sends an answer on the returned sender, in turn.
+    fn with_silent_telegram(client: MockClient) -> (MockClient, mpsc::UnboundedSender<Answer>) {
+        let (telegram, answers) = mpsc::unbounded_channel();
+        let client = MockClient {
+            telegram_answers: Some(Arc::new(tokio::sync::Mutex::new(answers))),
+            ..client
+        };
+        (client, telegram)
+    }
+
+    const SILENCE: &str =
+        "react: Telegram did not answer within 10s; the change may still take effect";
+
+    /// Let the change's own task see Telegram's answer and settle.
+    async fn settle() {
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repeat_while_telegram_is_silent_is_not_answered_from_tdlibs_copy() {
+        let (client, telegram) = with_silent_telegram(mock());
+        let err = handle(&client, request("👍", false)).await.unwrap_err();
+        assert_eq!(err.to_string(), SILENCE);
+
+        // TDLib's copy shows the reaction, and TDLib would answer a second
+        // add at once without asking Telegram: nothing is asked again.
+        let err = handle(&client, request("👍", false))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            format!(
+                "react: Telegram has still not answered an earlier change to message {GROUP_MSG} \
+                 in chat {GROUP}, so nothing was asked again; that change may still take effect"
+            )
+        );
+        assert_eq!(
+            calls(&client),
+            vec![ReactionCall::Added(GROUP, GROUP_MSG, "👍".to_string())]
+        );
+
+        // Once Telegram has answered, TDLib's copy holds its answer.
+        telegram.send(Ok(())).unwrap();
+        settle().await;
+        let res = handle(&client, request("👍", false)).await.unwrap();
+        assert!(res.chosen);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repeat_is_answered_by_telegrams_late_answer_to_the_first() {
+        let (client, telegram) = with_silent_telegram(mock());
+        assert!(handle(&client, request("👍", false)).await.is_err());
+
+        let later = async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            telegram.send(Ok(())).unwrap();
+        };
+        let (res, ()) = tokio::join!(handle(&client, request("👍", false)), later);
+        let res = res.unwrap();
+        assert_eq!(res.emoji, "👍");
+        assert!(res.chosen);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repeat_gets_telegrams_late_refusal_of_the_first() {
+        // Telegram refuses after the first request stopped waiting. TDLib's
+        // copy still shows the reaction until it has reloaded the message.
+        let (client, telegram) = with_silent_telegram(mock());
+        assert!(
+            handle(&client, request(HEART_WITH_SELECTOR, false))
+                .await
+                .is_err()
+        );
+
+        let later = async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            telegram.send(Err("REACTION_INVALID".to_string())).unwrap();
+        };
+        let (res, ()) = tokio::join!(handle(&client, request(HEART_WITH_SELECTOR, false)), later);
+        assert_eq!(
+            res.unwrap_err().to_string(),
+            format!(
+                "react: Telegram refused the reaction to message {GROUP_MSG} in chat {GROUP}: REACTION_INVALID"
+            )
+        );
+        assert_eq!(calls(&client).len(), 1, "asked once: {:?}", calls(&client));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn another_change_goes_ahead_once_telegram_has_answered_the_first() {
+        // Telegram refused the thumbs-up after the first request stopped
+        // waiting; a fire asked for meanwhile is Telegram's to answer anew.
+        let (client, telegram) = with_silent_telegram(mock());
+        assert!(handle(&client, request("👍", false)).await.is_err());
+
+        let later = async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            telegram.send(Err("REACTION_INVALID".to_string())).unwrap();
+            // Telegram takes the fire at once.
+            telegram.send(Ok(())).unwrap();
+        };
+        let (res, ()) = tokio::join!(handle(&client, request("🔥", false)), later);
+        let res = res.unwrap();
+        assert_eq!(res.emoji, "🔥");
+        assert!(res.chosen);
+        assert_eq!(
+            calls(&client),
+            vec![
+                ReactionCall::Added(GROUP, GROUP_MSG, "👍".to_string()),
+                ReactionCall::Added(GROUP, GROUP_MSG, "🔥".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_repeated_taking_back_while_telegram_is_silent_is_not_answered_either() {
+        let (client, _telegram) = with_silent_telegram(client_with(vec![others("👍", 2, true)]));
+        let err = handle(&client, request("👍", true)).await.unwrap_err();
+        assert_eq!(err.to_string(), SILENCE);
+
+        // TDLib's copy no longer shows it, which used to read as "not chosen"
+        // with no call made.
+        for asked in ["👍", ""] {
+            let err = handle(&client, request(asked, true))
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("still not answered an earlier change"),
+                "{asked:?}: {err}"
+            );
+        }
+        assert_eq!(
+            calls(&client),
+            vec![ReactionCall::Removed(GROUP, GROUP_MSG, "👍".to_string())]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_change_holds_up_no_other_message() {
+        let (client, _telegram) = with_silent_telegram(mock());
+        assert!(handle(&client, request("👍", false)).await.is_err());
+
+        // The DM's message is another message: its own change goes to
+        // Telegram, which is silent there too.
+        let req = ReactRequest {
+            id: DM,
+            message_id: DM_MSG,
+            ..request("👍", false)
+        };
+        let err = handle(&client, req).await.unwrap_err();
+        assert_eq!(err.to_string(), SILENCE);
+        assert_eq!(
+            calls(&client),
+            vec![
+                ReactionCall::Added(GROUP, GROUP_MSG, "👍".to_string()),
+                ReactionCall::Added(DM, DM_MSG, "👍".to_string()),
+            ]
+        );
     }
 
     #[test]

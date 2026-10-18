@@ -465,6 +465,16 @@ delivers nothing.
   Telegram app does. Custom-emoji and paid reactions cannot be sent.
 - Telegram's answer is awaited for 10 s. Past that the request fails and says the change may still
   take effect: TDLib shows a reaction on its own copy of the message before Telegram has answered.
+- **One change per message at a time (since 0.15.1).** TDLib answers a second request for a change
+  its copy already shows at once, without asking Telegram, so a repeat after a silence used to be
+  `ok: true` from that copy alone. Now the change Telegram has not answered stays pending in the
+  process, and the next `react` for that message waits up to 10 s more for its answer before doing
+  anything. Still unanswered, it fails and asks nothing:
+  `react: Telegram has still not answered an earlier change to message 962592768 in chat -1009876543210, so nothing was asked again; that change may still take effect`.
+  Refused, a repeat of that change fails with Telegram's refusal of it; anything else then goes
+  ahead as usual, and so does every request once Telegram has answered. Only one process knows
+  what it asked: a change pending in a `tg serve` that stops is lost with it (reactions are not in
+  TDLib's binlog), and the next process's TDLib copy may still show it.
 - A client can learn whether a daemon knows `react` without reacting to anything: `"args": {}` is
   answered ``invalid args: missing field `id` `` by 0.12.0 and later, and `unknown command: react`
   before.
