@@ -226,7 +226,7 @@ pins, not measured: no test and no agent lists a real account's chats.
   output do not show the key.
 
 **A message's `text` is a body other programs store (its caption where it has one, since 0.14.0
-for animation, audio and voice):** Mycelium stores `text` as the message's body unparsed, and
+for animation, audio and voice, 0.16.0 for paid media):** Mycelium stores `text` as the message's body unparsed, and
 Tavola and every agent read that body. The shapes are in `README.md` → *A message's `text`, and
 its caption*.
 
@@ -237,8 +237,10 @@ its caption*.
   shape there and nowhere else.
 - **A caption takes the measures' place in the bracket**, for every content that has one:
   `[Photo: <caption>]`, `[Video: …]`, `[Document: …]`, `[Animation: …]`, `[Audio: …]`,
-  `[Voice: …]`. `non_empty` decides what counts as a caption, so whitespace alone is none.
-  Without one the text is the measures, byte for byte as before 0.14.0. `content` (with its
+  `[Voice: …]`, `[Paid media: …]`. `non_empty` decides what counts as a caption, so whitespace
+  alone is none. Without one the text is the measures, byte for byte as before 0.14.0; paid media,
+  whose measure is the price (`[Paid media: 25 stars]`), was `Paid media (25 stars)`, unbracketed,
+  before 0.16.0 (tavola-i4cx; Mycelium held no paid media on 2026-10-18). `content` (with its
   `caption` and measures), `content_type` and the files do not change with it. A video note has no
   caption in TDLib.
 - **A new shape does not rewrite what Mycelium already holds.** It keys a Telegram message on

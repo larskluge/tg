@@ -2805,13 +2805,15 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessagePaidMedia(p) => {
-            let caption = if p.caption.text.is_empty() {
-                None
+            // Its measure is its price: the media stay hidden until bought.
+            let caption = non_empty(&p.caption.text);
+            let text = if let Some(c) = &caption {
+                format!("Paid media: {c}")
             } else {
-                Some(p.caption.text.clone())
+                format!("Paid media: {} stars", p.star_count)
             };
             ExtractedMessageData {
-                text: format!("Paid media ({} stars)", p.star_count),
+                text: media_summary(text),
                 content_type: Some("paid_media".to_string()),
                 is_downloadable: false,
                 download_files: vec![],
@@ -5438,6 +5440,47 @@ mod tests {
             "[Voice: 0:42]",
             "a caption of whitespace alone is no caption"
         );
+    }
+
+    fn paid_media(caption: &str) -> tdlib_rs::enums::MessageContent {
+        tdlib_rs::enums::MessageContent::MessagePaidMedia(tdlib_rs::types::MessagePaidMedia {
+            star_count: 25,
+            media: vec![],
+            caption: formatted(caption),
+            show_caption_above_media: false,
+        })
+    }
+
+    #[test]
+    fn paid_medias_text_is_its_caption_else_its_price() {
+        let captioned = extract_message_data(&paid_media("The whole set from Saturday"));
+        assert_eq!(captioned.text, "[Paid media: The whole set from Saturday]");
+        assert_eq!(captioned.content_type.as_deref(), Some("paid_media"));
+        assert!(!captioned.is_downloadable);
+        match captioned.content {
+            Some(MessageContentDetails::PaidMedia {
+                star_count,
+                caption,
+            }) => {
+                assert_eq!(star_count, 25);
+                assert_eq!(caption.as_deref(), Some("The whole set from Saturday"));
+            }
+            other => panic!("expected PaidMedia details, got {other:?}"),
+        }
+
+        assert_eq!(
+            extract_message_data(&paid_media("")).text,
+            "[Paid media: 25 stars]"
+        );
+        let blank = extract_message_data(&paid_media(" \n"));
+        assert_eq!(
+            blank.text, "[Paid media: 25 stars]",
+            "a caption of whitespace alone is no caption"
+        );
+        match blank.content {
+            Some(MessageContentDetails::PaidMedia { caption, .. }) => assert_eq!(caption, None),
+            other => panic!("expected PaidMedia details, got {other:?}"),
+        }
     }
 
     #[test]

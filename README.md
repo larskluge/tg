@@ -697,8 +697,8 @@ Each chat from `tg chats --json`, `tg groups --json`, `tg unread --json` and the
 
 `text` on each message from `tg messages --json`, `tg message --json`, `tg sync` and the
 server's `messages`/`message`/`sync`, and `last_message` on a chat row, is the message's words.
-A photo, a video, a file, an animation, an audio file, a voice note and a video note say what
-they carry in brackets, and a caption takes the measures' place there:
+A photo, a video, a file, an animation, an audio file, a voice note, a video note and paid media
+say what they carry in brackets, and a caption takes the measures' place there:
 
 | `content_type` | without a caption | with one |
 |---|---|---|
@@ -709,6 +709,7 @@ they carry in brackets, and a caption takes the measures' place there:
 | `audio` | `[Audio: <title, else file name, else "Audio"> (1:05)]` | `[Audio: <caption>]` (since 0.14.0) |
 | `voice` | `[Voice: 0:42]` | `[Voice: <caption>]` (since 0.14.0) |
 | `video_note` | `[Video note: 0:15]` | none: Telegram gives a video note no caption |
+| `paid_media` | `[Paid media: 25 stars]`, its price | `[Paid media: <caption>]` (since 0.16.0) |
 
 - **A caption is inserted as written**, line breaks included. One of whitespace alone is no
   caption.
@@ -718,7 +719,8 @@ they carry in brackets, and a caption takes the measures' place there:
   voice note captioned "0:42". A caption changes nothing else: `content_type`, `download_files`
   and the measures in `content` are the same with one and without.
 - **A `tg` older than 0.14.0 kept an animation's, an audio file's and a voice note's caption in
-  `content.caption` alone**: its `text` held the measures, caption or not. A caption edited
+  `content.caption` alone**: its `text` held the measures, caption or not. **Before 0.16.0 paid
+  media were `Paid media (25 stars)`**, unbracketed, caption or not. A caption edited
   later changes `text` and moves `edit_date`, as any edit does.
 
 ### Reply targets (since 0.8.0)
