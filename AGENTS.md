@@ -223,6 +223,26 @@ pins, not measured: no test and no agent lists a real account's chats.
   their own, would end that discovery. There is no filter flag, and the table and plain-text
   output do not show the key.
 
+**A message's `text` is a body other programs store (its caption where it has one, since 0.14.0
+for animation, audio and voice):** Mycelium stores `text` as the message's body unparsed, and
+Tavola and every agent read that body. The shapes are in `README.md` → *A message's `text`, and
+its caption*.
+
+- **`extract_message_data` is the one writer of a message's text.** Every listing reaches it
+  through `message_info` (history pages via `message_infos`, `getMessage` for `message`), and a
+  chat row's `last_message` through `extract_message_text`. `subscribe` frames carry no text, and
+  an edit is read again through the same path, so an edited caption changes `text`. Change a
+  shape there and nowhere else.
+- **A caption takes the measures' place in the bracket**, for every content that has one:
+  `[Photo: <caption>]`, `[Video: …]`, `[Document: …]`, `[Animation: …]`, `[Audio: …]`,
+  `[Voice: …]`. `non_empty` decides what counts as a caption, so whitespace alone is none.
+  Without one the text is the measures, byte for byte as before 0.14.0. `content` (with its
+  `caption` and measures), `content_type` and the files do not change with it. A video note has no
+  caption in TDLib.
+- **A new shape does not rewrite what Mycelium already holds.** It keys a Telegram message on
+  `tg:<chat>:<message>:<edit_date>` and records a message again only when that changes, so a
+  message ingested before the change keeps its old body until it is edited.
+
 **TDLib `getChatMessageByDate` direction:** It returns the last message sent **no later than** the given date — the returned message's date is always `<= date` — and a **404** when the chat has no such message. It does not find the first message *after* a date. To turn a `--since-utc` cutoff into a fetch boundary, probe at `cutoff - 1` and use the returned message's `id + 1` as an exclusive lower bound (`boundary_probe_date` / `boundary_from_probe` in `client.rs`). Reading it as "at or after the date" makes the lookup silently never match.
 
 **TDLib `message.reply_to` names a chat, not just a message (since 0.8.0):**

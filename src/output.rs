@@ -770,6 +770,9 @@ pub struct MessageInfo {
     /// is not a marker.
     #[serde(default)]
     pub sender_is_bot: Option<bool>,
+    /// The message's words, or what it carries in brackets, its caption in the
+    /// measures' place (`[Voice: 0:42]`, `[Voice: <caption>]`). Consumers store
+    /// it as the message's body: README → *A message's `text`, and its caption*.
     pub text: String,
     pub date: String,
     #[serde(skip)]

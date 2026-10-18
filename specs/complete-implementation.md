@@ -213,6 +213,7 @@ WaitTdlibParameters, WaitPhoneNumber, WaitCode, WaitPassword, Ready, Closed
 - Send text messages
 - Read message history with pagination + retry
 - Parse 13 message content types
+- A caption takes the measures' place in a message's bracketed text (photo, video, document; animation, audio and voice since 0.14.0)
 - Message timestamps (RFC3339)
 
 ### Missing - To Implement

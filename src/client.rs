@@ -1682,6 +1682,9 @@ fn tdlib_type_name(content: &tdlib_rs::enums::MessageContent) -> String {
     }
 }
 
+/// The one writer of a message's `text` (AGENTS.md, *A message's `text`*): a
+/// content that can carry a caption puts it in the bracket in the measures'
+/// place, and says its measures only without one.
 fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedMessageData {
     use tdlib_rs::enums::MessageContent;
 
@@ -1833,15 +1836,15 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             let caption = non_empty(&a.caption.text);
             let title = non_empty(&a.audio.title);
             let performer = non_empty(&a.audio.performer);
-            let text_label = title
-                .clone()
-                .or_else(|| non_empty(&a.audio.file_name))
-                .unwrap_or_else(|| "Audio".to_string());
-            let text = format!(
-                "Audio: {} ({})",
-                text_label,
-                format_duration(a.audio.duration)
-            );
+            let text = if let Some(c) = &caption {
+                format!("Audio: {c}")
+            } else {
+                let label = title
+                    .clone()
+                    .or_else(|| non_empty(&a.audio.file_name))
+                    .unwrap_or_else(|| "Audio".to_string());
+                format!("Audio: {} ({})", label, format_duration(a.audio.duration))
+            };
             let files = vec![message_file_ref(
                 &a.audio.audio,
                 true,
@@ -1866,7 +1869,11 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         }
         MessageContent::MessageVoiceNote(v) => {
             let caption = non_empty(&v.caption.text);
-            let text = format!("Voice: {}", format_duration(v.voice_note.duration));
+            let text = if let Some(c) = &caption {
+                format!("Voice: {c}")
+            } else {
+                format!("Voice: {}", format_duration(v.voice_note.duration))
+            };
             let files = vec![message_file_ref(
                 &v.voice_note.voice,
                 true,
@@ -1889,12 +1896,16 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         }
         MessageContent::MessageAnimation(a) => {
             let caption = non_empty(&a.caption.text);
-            let text = format!(
-                "Animation: {}x{} {}",
-                a.animation.width,
-                a.animation.height,
-                format_duration(a.animation.duration)
-            );
+            let text = if let Some(c) = &caption {
+                format!("Animation: {c}")
+            } else {
+                format!(
+                    "Animation: {}x{} {}",
+                    a.animation.width,
+                    a.animation.height,
+                    format_duration(a.animation.duration)
+                )
+            };
             let files = vec![message_file_ref(
                 &a.animation.animation,
                 true,
@@ -4939,6 +4950,148 @@ mod tests {
         assert!(extracted.text.starts_with("[Animation:"));
         assert!(extracted.text.ends_with(']'));
         assert_ne!(extracted.text, "[Media]");
+    }
+
+    // A caption takes the measures' place in the text, as a photo's and a
+    // video's always did: the text is what a consumer stores as the message's
+    // body, and the details alone kept these three captions until 0.14.0.
+    // `non_empty` decides what counts as a caption.
+    fn animation(caption: &str) -> tdlib_rs::enums::MessageContent {
+        tdlib_rs::enums::MessageContent::MessageAnimation(tdlib_rs::types::MessageAnimation {
+            animation: tdlib_rs::types::Animation {
+                duration: 3,
+                width: 320,
+                height: 240,
+                file_name: "loop.mp4".to_string(),
+                mime_type: "video/mp4".to_string(),
+                has_stickers: false,
+                minithumbnail: None,
+                thumbnail: None,
+                animation: file(3, "/tmp/loop.mp4"),
+            },
+            caption: formatted(caption),
+            has_spoiler: false,
+            is_secret: false,
+            show_caption_above_media: false,
+        })
+    }
+
+    fn audio(caption: &str) -> tdlib_rs::enums::MessageContent {
+        tdlib_rs::enums::MessageContent::MessageAudio(tdlib_rs::types::MessageAudio {
+            audio: tdlib_rs::types::Audio {
+                duration: 65,
+                title: "Morning Rehearsal".to_string(),
+                performer: "Ensemble Lontano".to_string(),
+                file_name: "rehearsal.mp3".to_string(),
+                mime_type: "audio/mpeg".to_string(),
+                album_cover_minithumbnail: None,
+                album_cover_thumbnail: None,
+                external_album_covers: vec![],
+                audio: file(1, "/tmp/rehearsal.mp3"),
+            },
+            caption: formatted(caption),
+        })
+    }
+
+    fn voice(caption: &str) -> tdlib_rs::enums::MessageContent {
+        tdlib_rs::enums::MessageContent::MessageVoiceNote(tdlib_rs::types::MessageVoiceNote {
+            voice_note: tdlib_rs::types::VoiceNote {
+                duration: 42,
+                waveform: String::new(),
+                mime_type: "audio/ogg".to_string(),
+                speech_recognition_result: None,
+                voice: file(2, "/tmp/voice.ogg"),
+            },
+            caption: formatted(caption),
+            is_listened: false,
+        })
+    }
+
+    #[test]
+    fn an_animations_text_is_its_caption_else_its_measures() {
+        let captioned = extract_message_data(&animation("Ci vediamo alle otto"));
+        assert_eq!(captioned.text, "[Animation: Ci vediamo alle otto]");
+        assert_eq!(captioned.content_type.as_deref(), Some("animation"));
+        match captioned.content {
+            Some(MessageContentDetails::Animation {
+                width,
+                height,
+                duration_seconds,
+                caption,
+                ..
+            }) => {
+                assert_eq!((width, height, duration_seconds), (320, 240, 3));
+                assert_eq!(caption.as_deref(), Some("Ci vediamo alle otto"));
+            }
+            other => panic!("expected Animation details, got {other:?}"),
+        }
+
+        assert_eq!(
+            extract_message_data(&animation("")).text,
+            "[Animation: 320x240 0:03]"
+        );
+        assert_eq!(
+            extract_message_data(&animation(" \n\t")).text,
+            "[Animation: 320x240 0:03]",
+            "a caption of whitespace alone is no caption"
+        );
+    }
+
+    #[test]
+    fn an_audios_text_is_its_caption_else_its_title_and_length() {
+        let captioned = extract_message_data(&audio("The second take, with the cello"));
+        assert_eq!(captioned.text, "[Audio: The second take, with the cello]");
+        assert_eq!(captioned.content_type.as_deref(), Some("audio"));
+        match captioned.content {
+            Some(MessageContentDetails::Audio {
+                title,
+                duration_seconds,
+                caption,
+                file_name,
+                ..
+            }) => {
+                assert_eq!(title.as_deref(), Some("Morning Rehearsal"));
+                assert_eq!(duration_seconds, 65);
+                assert_eq!(caption.as_deref(), Some("The second take, with the cello"));
+                assert_eq!(file_name.as_deref(), Some("rehearsal.mp3"));
+            }
+            other => panic!("expected Audio details, got {other:?}"),
+        }
+
+        assert_eq!(
+            extract_message_data(&audio("")).text,
+            "[Audio: Morning Rehearsal (1:05)]"
+        );
+        assert_eq!(
+            extract_message_data(&audio("   ")).text,
+            "[Audio: Morning Rehearsal (1:05)]",
+            "a caption of whitespace alone is no caption"
+        );
+    }
+
+    #[test]
+    fn a_voice_notes_text_is_its_caption_else_its_length() {
+        let captioned = extract_message_data(&voice("Listen before Friday"));
+        assert_eq!(captioned.text, "[Voice: Listen before Friday]");
+        assert_eq!(captioned.content_type.as_deref(), Some("voice"));
+        match captioned.content {
+            Some(MessageContentDetails::Voice {
+                duration_seconds,
+                caption,
+                ..
+            }) => {
+                assert_eq!(duration_seconds, 42);
+                assert_eq!(caption.as_deref(), Some("Listen before Friday"));
+            }
+            other => panic!("expected Voice details, got {other:?}"),
+        }
+
+        assert_eq!(extract_message_data(&voice("")).text, "[Voice: 0:42]");
+        assert_eq!(
+            extract_message_data(&voice("\n")).text,
+            "[Voice: 0:42]",
+            "a caption of whitespace alone is no caption"
+        );
     }
 
     #[test]
