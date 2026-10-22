@@ -52,6 +52,9 @@ pub enum Command {
     /// Mark a chat as unread
     MarkUnread(MarkUnreadArgs),
 
+    /// Delete a one-to-one chat for yourself, unless it holds a message later than --through
+    DeleteChat(DeleteChatArgs),
+
     /// Search contacts by name
     Search(SearchArgs),
 
@@ -238,6 +241,18 @@ pub struct MarkUnreadArgs {
     /// Chat ID
     #[arg(long, allow_hyphen_values = true)]
     pub id: Option<i64>,
+}
+
+#[derive(Parser, Debug)]
+pub struct DeleteChatArgs {
+    /// Chat ID of the one-to-one chat: the other person's user id
+    #[arg(long, allow_hyphen_values = true)]
+    pub id: i64,
+
+    /// The date of the newest message you saw there, in Unix seconds: a chat
+    /// whose last message is later is not deleted
+    #[arg(long, allow_hyphen_values = true)]
+    pub through: i64,
 }
 
 #[derive(Parser, Debug)]
@@ -852,6 +867,32 @@ mod tests {
             }
             _ => panic!("Expected MarkRead command"),
         }
+    }
+
+    #[test]
+    fn parse_delete_chat() {
+        let cli = Cli::parse_from([
+            "tg",
+            "delete-chat",
+            "--id",
+            "123456789",
+            "--through",
+            "1790000000",
+        ]);
+        match cli.command {
+            Command::DeleteChat(args) => {
+                assert_eq!(args.id, 123456789);
+                assert_eq!(args.through, 1790000000);
+            }
+            _ => panic!("Expected DeleteChat command"),
+        }
+    }
+
+    #[test]
+    fn delete_chat_needs_a_through() {
+        // The bound is the whole guard: without it a chat would be deleted
+        // whatever came in since.
+        assert!(Cli::try_parse_from(["tg", "delete-chat", "--id", "123456789"]).is_err());
     }
 
     #[test]

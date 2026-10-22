@@ -57,8 +57,9 @@ pub struct ChatPresence {
     /// a chat that belongs to a list but lies beyond the part of it loaded so
     /// far — every quiet chat, until something loads the whole list.
     pub in_chat_list: bool,
-    /// `chat.last_message` is set.
-    pub has_last_message: bool,
+    /// The date of `chat.last_message`, Unix seconds; `None` while TDLib
+    /// holds no last message.
+    pub last_message_date: Option<i32>,
 }
 
 impl ChatPresence {
@@ -70,7 +71,7 @@ impl ChatPresence {
     /// load, so `sync` only trusts it after a history read from the end of
     /// the chat came back empty and the state still holds.
     pub fn looks_deleted(&self) -> bool {
-        self.is_private && !self.in_chat_list && !self.has_last_message
+        self.is_private && !self.in_chat_list && self.last_message_date.is_none()
     }
 }
 
@@ -219,6 +220,18 @@ pub trait TelegramClient: Send + Sync {
     /// request). An unknown chat is an error, never a deleted one.
     async fn get_chat_presence(&self, chat_id: i64) -> Result<ChatPresence>;
 
+    /// [`TelegramClient::get_chat_presence`] for a caller to whom an unknown
+    /// chat is an answer: `None` for TDLib's 400 "Chat not found". Any other
+    /// failure is an error.
+    async fn find_chat_presence(&self, chat_id: i64) -> Result<Option<ChatPresence>>;
+
+    /// Delete every message of the chat for this account alone and take the
+    /// chat out of every chat list: `deleteChatHistory(remove_from_chat_list:
+    /// true, revoke: false)`, what Telegram's "Delete chat" does without "Also
+    /// delete for …". TDLib asks Telegram to delete up to the last message it
+    /// knows of, so the caller makes sure it knows one first.
+    async fn delete_chat_history(&self, chat_id: i64) -> Result<()>;
+
     async fn download_message_media(
         &self,
         chat_id: i64,
@@ -281,6 +294,11 @@ const MEDIA_SEND_TIMEOUT_SECS: u64 = 300;
 /// text path's own confirmation wait, so a reply send still answers well inside a
 /// caller's socket deadline. Expiry refuses the send: see `check_reply_target`.
 const REPLY_CHECK_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum seconds to wait for Telegram to confirm deleting a chat. With
+/// `delete_chat`'s history read a request is answered within about 30 s, so
+/// tg's own words arrive before a caller that gives it 40 s gives up.
+const DELETE_CHAT_TIMEOUT_SECS: u64 = 20;
 
 /// Maximum seconds to read one message by id. TDLib answers from its cache at
 /// once, and fetches a message it does not hold over the network: that is the
@@ -1480,6 +1498,20 @@ where
     }
 
     Ok(result)
+}
+
+/// What a chat's state says of whether it still exists for this account.
+fn chat_presence(chat: &tdlib_rs::types::Chat) -> ChatPresence {
+    ChatPresence {
+        is_private: matches!(chat.r#type, tdlib_rs::enums::ChatType::Private(_)),
+        in_chat_list: !chat.chat_lists.is_empty(),
+        last_message_date: chat.last_message.as_ref().map(|m| m.date),
+    }
+}
+
+/// TDLib's error for a chat it does not know: 400 "Chat not found".
+fn is_unknown_chat(e: &tdlib_rs::types::Error) -> bool {
+    e.code == 400 && e.message == "Chat not found"
 }
 
 // Helper to extract Chat fields from the enum
@@ -3816,11 +3848,41 @@ impl TelegramClient for TdLibClient {
             .await
             .map(unwrap_chat)
             .map_err(|e| TgError::TdLib(e.message))?;
-        Ok(ChatPresence {
-            is_private: matches!(chat.r#type, tdlib_rs::enums::ChatType::Private(_)),
-            in_chat_list: !chat.chat_lists.is_empty(),
-            has_last_message: chat.last_message.is_some(),
-        })
+        Ok(chat_presence(&chat))
+    }
+
+    async fn find_chat_presence(&self, chat_id: i64) -> Result<Option<ChatPresence>> {
+        let client_id = self.get_client_id().await?;
+        match tdlib_rs::functions::get_chat(chat_id, client_id).await {
+            Ok(chat) => Ok(Some(chat_presence(&unwrap_chat(chat)))),
+            // TDLib's answer for a valid id it has never seen
+            // (`DialogManager::check_dialog_access`, `load_dialog`). An
+            // invalid id ("Invalid chat identifier specified") stays an error.
+            Err(e) if is_unknown_chat(&e) => Ok(None),
+            Err(e) => Err(TgError::TdLib(e.message)),
+        }
+    }
+
+    async fn delete_chat_history(&self, chat_id: i64) -> Result<()> {
+        let client_id = self.get_client_id().await?;
+        // Bounded, because the answer waits for Telegram, `tg serve` holds its
+        // client lock meanwhile, and nothing else is served while Telegram is
+        // out of reach. TDLib has deleted the chat on its side before it asks
+        // Telegram, and keeps the request in its binlog until Telegram answers
+        // (`delete_dialog_history_on_server`'s log event), so a delete that
+        // runs out of time here is not lost.
+        let timeout = tokio::time::Duration::from_secs(DELETE_CHAT_TIMEOUT_SECS);
+        match tokio::time::timeout(
+            timeout,
+            tdlib_rs::functions::delete_chat_history(chat_id, true, false, client_id),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|e| TgError::TdLib(e.message)),
+            Err(_) => Err(TgError::Other(format!(
+                "Telegram has not confirmed it within {DELETE_CHAT_TIMEOUT_SECS}s; TDLib has deleted the chat on its side and keeps asking Telegram until it answers"
+            ))),
+        }
     }
 
     async fn download_message_media(
@@ -4238,10 +4300,10 @@ fn files_match_sha256(left: &Path, right: &Path) -> std::io::Result<bool> {
     Ok(sha256_file(left)? == sha256_file(right)?)
 }
 
-fn format_timestamp(timestamp: i32) -> String {
+pub(crate) fn format_timestamp(timestamp: impl Into<i64>) -> String {
     use chrono::{DateTime, SecondsFormat, Utc};
 
-    DateTime::<Utc>::from_timestamp(timestamp as i64, 0)
+    DateTime::<Utc>::from_timestamp(timestamp.into(), 0)
         .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Secs, true))
         .unwrap_or_else(|| "unknown".to_string())
 }
@@ -4293,6 +4355,24 @@ pub mod mock {
         pub presence_error_chat_ids: Vec<i64>,
         /// Tracks how many times `get_chat_presence` has been called
         pub get_chat_presence_call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// What `find_chat_presence` answers per chat; a chat with none is
+        /// one TDLib does not know. As in TDLib, reading a chat's history from
+        /// its end gives one without a last message its newest message's
+        /// date, and `delete_chat_history` leaves it in no list without one.
+        pub known_chats: std::sync::Mutex<std::collections::HashMap<i64, ChatPresence>>,
+        /// When set, `find_chat_presence` fails with this as TDLib's error.
+        pub find_chat_error: Option<String>,
+        /// When set, reading a chat's history from its end leaves the chat
+        /// without a last message, though the read found one.
+        pub history_leaves_no_last_message: bool,
+        /// When set, `delete_chat_history` is refused with this as TDLib's
+        /// reason, and changes nothing.
+        pub delete_refusal: Option<String>,
+        /// When set, Telegram does not confirm `delete_chat_history` in time,
+        /// after TDLib deleted the chat on its side.
+        pub delete_unconfirmed: bool,
+        /// Every chat `delete_chat_history` was asked to delete, refused ones too.
+        pub deleted_chats: std::sync::Mutex<Vec<i64>>,
         /// The reactions a message carries, by `(chat_id, message_id)`. What
         /// `get_message` reports, and what a reaction call changes.
         pub reactions:
@@ -4446,6 +4526,12 @@ pub mod mock {
                 get_chat_presence_call_count: std::sync::Arc::new(
                     std::sync::atomic::AtomicUsize::new(0),
                 ),
+                known_chats: std::sync::Mutex::new(std::collections::HashMap::new()),
+                find_chat_error: None,
+                history_leaves_no_last_message: false,
+                delete_refusal: None,
+                delete_unconfirmed: false,
+                deleted_chats: std::sync::Mutex::new(Vec::new()),
                 reactions: std::sync::Mutex::new(std::collections::HashMap::new()),
                 // Telegram's spellings: its heart carries no variation selector.
                 available_reactions: vec![
@@ -4675,6 +4761,13 @@ pub mod mock {
                 .take(limit as usize)
                 .cloned()
                 .collect();
+            if until_message_id.is_none()
+                && !self.history_leaves_no_last_message
+                && let Some(chat) = self.known_chats.lock().unwrap().get_mut(&chat_id)
+                && chat.last_message_date.is_none()
+            {
+                chat.last_message_date = msgs.iter().map(|m| m.timestamp).max();
+            }
             Ok(msgs)
         }
 
@@ -4868,9 +4961,33 @@ pub mod mock {
                 _ => ChatPresence {
                     is_private: true,
                     in_chat_list: true,
-                    has_last_message: true,
+                    last_message_date: Some(1_790_000_000),
                 },
             })
+        }
+
+        async fn find_chat_presence(&self, chat_id: i64) -> Result<Option<ChatPresence>> {
+            if let Some(reason) = &self.find_chat_error {
+                return Err(TgError::TdLib(reason.clone()));
+            }
+            Ok(self.known_chats.lock().unwrap().get(&chat_id).copied())
+        }
+
+        async fn delete_chat_history(&self, chat_id: i64) -> Result<()> {
+            self.deleted_chats.lock().unwrap().push(chat_id);
+            if let Some(reason) = &self.delete_refusal {
+                return Err(TgError::TdLib(reason.clone()));
+            }
+            if let Some(chat) = self.known_chats.lock().unwrap().get_mut(&chat_id) {
+                chat.in_chat_list = false;
+                chat.last_message_date = None;
+            }
+            if self.delete_unconfirmed {
+                return Err(TgError::Other(
+                    "Telegram has not confirmed it in time".to_string(),
+                ));
+            }
+            Ok(())
         }
 
         async fn download_message_media(
@@ -5134,11 +5251,11 @@ mod tests {
 
     #[test]
     fn only_a_private_chat_in_no_list_without_a_last_message_looks_deleted() {
-        let looks_deleted = |is_private, in_chat_list, has_last_message| {
+        let looks_deleted = |is_private, in_chat_list, has_last_message: bool| {
             ChatPresence {
                 is_private,
                 in_chat_list,
-                has_last_message,
+                last_message_date: has_last_message.then_some(1_790_000_000),
             }
             .looks_deleted()
         };

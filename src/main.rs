@@ -7,15 +7,15 @@ use tg::bot_api;
 use tg::cli::{Cli, Command};
 use tg::client::TdLibClient;
 use tg::commands::{
-    auth_status, chats, download, groups, mark_read, mark_unread, message, messages, react, search,
-    send, serve, sync, unread, whoami,
+    auth_status, chats, delete_chat, download, groups, mark_read, mark_unread, message, messages,
+    react, search, send, serve, sync, unread, whoami,
 };
 use tg::credentials::{self, ApiCredentials, BotEntry, CredentialsFile};
 use tg::error::{Result, TgError};
 use tg::output::{
-    ChatInfo, ContactInfo, DownloadReport, DownloadStatus, MessageInfo, OutputFormat, ReactResult,
-    SendResult, UserInfo, print_chats_table, print_contacts_table, print_error, print_list,
-    print_messages_table, print_output, print_success,
+    ChatInfo, ContactInfo, DeleteChatResult, DownloadReport, DownloadStatus, MessageInfo,
+    OutputFormat, ReactResult, SendResult, UserInfo, print_chats_table, print_contacts_table,
+    print_error, print_list, print_messages_table, print_output, print_success,
 };
 use tg::resolve;
 use tg::serve_client;
@@ -252,6 +252,12 @@ async fn route_via_serve(command: Command, stream: UnixStream, format: OutputFor
             let _: serde_json::Value =
                 serve_client::send_request(stream, "mark_unread", req).await?;
             print_success("Chat marked as unread");
+        }
+        Command::DeleteChat(args) => {
+            let req = delete_chat::DeleteChatRequest::from(args);
+            let result: DeleteChatResult =
+                serve_client::send_request(stream, "delete_chat", req).await?;
+            print_output(format, &result);
         }
         Command::Sync(args) => {
             let hwm = read_sync_hwm_from_stdin()?;
@@ -597,6 +603,15 @@ async fn run_command(
 
             mark_unread::mark_as_unread(client, target).await?;
             print_success("Chat marked as unread");
+        }
+
+        Command::DeleteChat(args) => {
+            // Shared with the socket path, as `react` is, so the two cannot
+            // diverge.
+            client.start().await?;
+            let result =
+                delete_chat::handle(client, delete_chat::DeleteChatRequest::from(args)).await?;
+            print_output(format, &result);
         }
 
         Command::Sync(args) => {

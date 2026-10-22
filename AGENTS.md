@@ -100,6 +100,7 @@ tg download --chat -1001666847309 --message 42 [--output-dir .] [--priority 16]
 tg search "John"
 tg mark-read "John Doe"
 tg mark-unread --id 123456789
+tg delete-chat --id 123456789 --through 1790000000   # NEVER against a real chat from a test or an agent
 echo '{"123": 42, "-1001666847309": 89508544512}' | tg sync [--limit 1000]
 echo '{"123": 0, "-1001666847309": 0}' | tg sync --reconcile-days 7
 echo '{"123": 42, "-1001666847309": 0}' | tg sync --oldest-first --limit 100
@@ -120,7 +121,7 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 - `output.rs` - Dual output formatting (plain text default, JSON with `--json`)
 - `reactions.rs` - Pure functions over TDLib's reaction types: `listed_reactions` (the ONE reader of `interaction_info.reactions`), `telegram_form` (which spelling of an emoji Telegram takes), `chosen_types` (what to take back)
 - `reaction_changes.rs` - The reaction changes Telegram has not answered yet, per message (`ReactionChanges`): what `react` waits on before it asks again
-- `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers; `message.rs` re-reads one message; `react.rs` adds or takes back a reaction; `serve.rs` holds the socket listener and the subscription loop)
+- `commands/` - One file per command (`sync.rs` handles bulk message sync for machine consumers; `message.rs` re-reads one message; `react.rs` adds or takes back a reaction; `delete_chat.rs` deletes a one-to-one chat up to a date; `serve.rs` holds the socket listener and the subscription loop)
 - `reaction_poll.rs` - `tg serve`'s poll of group reactions: which groups and messages, the tiers, the guard against a drop in unread counts, and the round loop (`Poller`); `PollSource` is what it asks of TDLib, implemented for `TdLibClient` in `client.rs`
 - `serve.rs` - The serve protocol: envelopes, the dispatcher, and the `StreamEvent` frames a `subscribe` connection carries (`StreamEvent::from_update` is the one TDLib-update → event mapping)
 - `serve_client.rs` - The CLI's side of the socket: one request per connection, plus `stream` for `tg stream`
@@ -202,6 +203,56 @@ Read from TDLib's source (`MessagesManager::update_dialog_pos`, `get_chat_positi
   not know at all — and the other 71 DMs and 6 groups read as ordinary chats.
 - Only private chats are reported: a basic group or supergroup also leaves every list when
   you leave it, but leaving a group is not deleting a chat.
+
+**Deleting a private chat (`delete_chat`, since 0.17.0):** for Tavola's Delete
+(`docs/specs/2026-10-22-delete-conversation-design.md` in tavola, through Postmaster's
+`delete_chat`). The contract is in `README.md` → *`delete_chat`*. Read from TDLib's source at
+`11e254af` (1.8.61; `td/telegram/…`), not measured: **no test and no agent ever deletes a real
+chat.**
+
+- **`deleteChatHistory` has no upper bound of its own.** `MessagesManager::delete_dialog_history`
+  (`MessagesManager.cpp:8308`) sends `messages.deleteHistory` (`MessageQueryManager.cpp:1322`)
+  with `max_id` = the chat's `last_new_message_id`, the newest message TDLib knows, and while it
+  knows none it sends 0 (a "TODO get dialog from the server" sits there), which bounds nothing,
+  and the request is in TDLib's binlog until Telegram answers, so one sent with no bound while
+  Telegram is out of reach would also delete what came in until it went out. So `delete_chat`
+  reads `getChat`; when `last_message` is null (also the moment after a chat is loaded from the
+  database) it reads the history from its end (8 s at most), which makes TDLib load it, and reads
+  the chat again; and it asks for the delete only while the chat shows a last message no later
+  than `through`. A chat still without one is answered `deleted` with no call when it looks
+  deleted (`ChatPresence::looks_deleted`, read after a history read from the end, as `sync`'s
+  check reads it), and is an error otherwise. A message Telegram holds that TDLib has not
+  received yet stays, and keeps the chat. One TDLib receives between the last read and the call,
+  a local round trip under the client lock, is deleted with the rest: there is no
+  `deleteChatHistory` up to a message id. (`deleteChatMessagesByDate` takes a date range, but
+  leaves the chat in its lists and spares the last 30 seconds' messages.)
+- **`revoke: false` is never upgraded.** TDLib turns `revoke: true` into false when the chat
+  cannot be deleted for everyone, never the other way; with false it refuses only a chat that
+  cannot be deleted even for oneself (400 "Can't delete history of … only for self").
+- **The state it leaves is a chat deleted in a Telegram app's.** `delete_all_dialog_messages`
+  (`:8585`) clears `last_message` (`updateChatLastMessage` with none) and sets the order to
+  `DEFAULT_ORDER`, which takes the chat out of every list, then sends `updateDeleteMessages`
+  with `is_permanent: true`, `from_cache: false` for the messages it held in memory (not those
+  only in its database). So `subscribe` rings `chat_last_message` with `message_id: null` and
+  `messages_deleted`, and `sync --report-deleted` answers `{"chat_deleted": true}`: in no list,
+  no last message, and the history from the end empty (`delete_dialog_history` sets
+  `max_unavailable_message_id` to the last message it deleted up to, which hides everything up
+  to it). Mycelium's Telegram adapter marks the messages of `messages_deleted` deleted at once,
+  ignores the null `chat_last_message`, and records the chat deleted (`chats.deleted_at`, every
+  message deleted) when a full pull's `chat_deleted` still holds `deletion_confirm_after` (5
+  minutes) later: 5 to 10 minutes after the delete, with its 5-minute pull.
+- **A repeat answers `deleted` without a call.** The chat is still known (`getChat` answers),
+  in no list, with no last message and no history: deleted, by the request whose answer was lost
+  or in a Telegram app. (`delete_dialog_history` would also answer ok, finding the history
+  cleared already, "nothing to do", but only while `last_new_message_id` is known.)
+- **Telegram's answer is awaited for 20 s** (`DELETE_CHAT_TIMEOUT_SECS`), because `tg serve`
+  holds its client lock meanwhile. TDLib clears the chat on its side before it asks Telegram and,
+  with the message database on (as `tg` runs it), logs the request to the binlog and erases it
+  only once Telegram answered (`delete_dialog_history_on_server`), so a delete that runs out of
+  time is answered as not confirmed, never as failed, and goes through later.
+- **`not_found` is TDLib's 400 "Chat not found"**, what `getChat` answers for a valid id it has
+  never seen (`load_dialog`, `DialogManager::check_dialog_access`): a chat Telegram may well hold,
+  but that this session never loaded. "Invalid chat identifier specified" stays an error.
 
 **A channel is a supergroup with `is_channel` (`is_channel` on every chat row, since 0.13.0):**
 TDLib has no chat type of its own for a channel. `chat.type` is `chatTypeSupergroup
@@ -377,8 +428,8 @@ are a contract with Mycelium's Telegram consumer (its spec:
   tokio's `stdin()` cannot be cancelled and would hold the runtime's shutdown — and so the exit
   after `tg serve closed the stream` — until stdin closed.
 
-**Serve request strictness:** `SendRequest`, its nested `media::SendFile` and `ReactRequest` —
-the requests that put something in a chat — are the only serve request structs carrying
+**Serve request strictness:** `SendRequest`, its nested `media::SendFile`, `ReactRequest` and
+`DeleteChatRequest` — the requests that change a chat — are the only serve request structs carrying
 `#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs
 the container's `HealthCmd` (`tg whoami`, `HealthStartupTimeout=2m`), so tightening it risks
 the health gate for no benefit, and the remaining structs have caller sets that were never

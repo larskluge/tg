@@ -1060,6 +1060,30 @@ impl PlainText for ReactResult {
     }
 }
 
+/// What `delete_chat` answers when it deleted the chat. Its refusals are
+/// failures with a `code` of their own (`not_found`, `newer_messages`,
+/// `not_private`), so `code` here is always `deleted`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteChatResult {
+    pub chat_id: i64,
+    pub code: String,
+}
+
+impl DeleteChatResult {
+    pub fn deleted(chat_id: i64) -> Self {
+        Self {
+            chat_id,
+            code: "deleted".to_string(),
+        }
+    }
+}
+
+impl PlainText for DeleteChatResult {
+    fn to_plain_text(&self) -> String {
+        format!("Chat {} deleted", self.chat_id)
+    }
+}
+
 impl PlainText for SendResult {
     fn to_plain_text(&self) -> String {
         format!("Message sent (id: {})", self.message_id)

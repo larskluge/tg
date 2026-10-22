@@ -144,6 +144,7 @@ WaitTdlibParameters, WaitPhoneNumber, WaitCode, WaitPassword, Ready, Closed
 ### Currently Implemented
 - List private chats, groups, unread chats
 - Basic chat info (id, name, unread_count, last_message)
+- Delete a one-to-one chat for yourself, unless it holds a message later than a date: `deleteChatHistory(chat_id, true, false)`, `tg delete-chat --id <ID> --through <UNIX SECONDS>` (since 0.17.0)
 
 ### Missing - To Implement
 
@@ -160,7 +161,7 @@ WaitTdlibParameters, WaitPhoneNumber, WaitCode, WaitPassword, Ready, Closed
 |---------|----------------|--------|
 | Open chat | `openChat(chat_id)` | Internal (before reading messages) |
 | Close chat | `closeChat(chat_id)` | Internal (after reading messages) |
-| Delete chat | `deleteChatHistory(chat_id, remove_from_chat_list, revoke)` | `tg chat delete <ID> [--revoke]` |
+| Delete chat (groups, and for everyone; a one-to-one chat for yourself is `tg delete-chat`) | `deleteChatHistory(chat_id, remove_from_chat_list, revoke)` | `tg chat delete <ID> [--revoke]` |
 | Archive chat | `addChatToList(chat_id, chatListArchive)` | `tg chat archive <ID>` |
 | Unarchive chat | `addChatToList(chat_id, chatListMain)` | `tg chat unarchive <ID>` |
 | Pin chat | `toggleChatIsPinned(chat_list, chat_id, is_pinned)` | `tg chat pin <ID>` |

@@ -631,7 +631,7 @@ mod tests {
         ChatPresence {
             is_private,
             in_chat_list,
-            has_last_message,
+            last_message_date: has_last_message.then_some(1_790_000_000),
         }
     }
 

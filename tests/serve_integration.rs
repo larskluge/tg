@@ -159,6 +159,57 @@ async fn wire_surfaces_server_side_error_as_tg_error() {
 }
 
 #[tokio::test]
+async fn a_refusals_code_travels_beside_its_sentence() {
+    // What a socket client such as Postmaster reads off the wire for a
+    // `delete_chat` that deleted nothing: the word to act on, and the sentence.
+    let dir = TempDir::new().unwrap();
+    let path = sock_path(&dir, "refused.sock");
+
+    let server_path = path.clone();
+    let server = tokio::spawn(async move {
+        stub_server(&server_path, |req| {
+            ResponseEnvelope::refused(
+                req.id.clone(),
+                "newer_messages",
+                "delete_chat: chat 555000111 has a message of 2026-09-21T14:13:20Z, later than through (2026-09-21T13:56:40Z), so nothing was deleted",
+            )
+        })
+        .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let stream = UnixStream::connect(&path).await.unwrap();
+    let (read, mut write) = stream.into_split();
+    write
+        .write_all(
+            b"{\"id\":\"7\",\"cmd\":\"delete_chat\",\"args\":{\"id\":555000111,\"through\":1789999000}}\n",
+        )
+        .await
+        .unwrap();
+    let line = BufReader::new(read)
+        .lines()
+        .next_line()
+        .await
+        .unwrap()
+        .unwrap();
+    let wire: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(wire["id"], "7");
+    assert_eq!(wire["ok"], false);
+    assert_eq!(wire["code"], "newer_messages");
+    assert!(
+        wire["error"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was deleted")
+    );
+    assert!(wire.get("result").is_none());
+    drop(write);
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
 async fn pipelined_requests_preserve_arrival_order() {
     let dir = TempDir::new().unwrap();
     let path = sock_path(&dir, "pipe.sock");

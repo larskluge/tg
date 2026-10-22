@@ -13,6 +13,7 @@ A modern CLI tool for interacting with Telegram, built in Rust using [TDLib](htt
 - **Download** — download media attachments from messages
 - **Reactions** — every listed message carries its emoji reactions; `tg react` adds one or takes it back, and `tg message` reads one message again
 - **Mark read/unread** — manage read state of chats
+- **Delete a chat** — `tg delete-chat` deletes a one-to-one chat for yourself, unless it holds a message later than the one you saw
 - **Long-lived server** — `tg serve` keeps a TDLib client warm so every other `tg <cmd>` skips cold start
 - **Live events** — `tg stream` prints new, edited and deleted messages from `tg serve` as they happen (machine use)
 - **Bulk sync** — fetch new messages for multiple chats in a single session (machine use)
@@ -117,6 +118,9 @@ tg search "John"
 # Manage read state
 tg mark-read "John Doe"
 tg mark-unread --id 123456789
+
+# Delete a one-to-one chat for yourself, unless it holds a message later than --through (Unix seconds)
+tg delete-chat --id 123456789 --through 1790000000
 
 # Run the long-lived server so other commands skip cold start
 tg serve
@@ -251,7 +255,11 @@ only `ok` is never told a failure succeeded; what it gains is being able to lear
 which elements arrived instead of assuming none did. Every other failure has no
 `result`.
 
-`cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `message`, `send`, `react`, `download`, `mark_read`, `mark_unread`, `sync`, `subscribe`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today. `subscribe` is different: it turns the connection into an event stream — see [Live events](#live-events-subscribe-and-tg-stream-since-0110).
+A refusal whose caller acts on why carries the reason as one word, `code`, beside
+`error` (since 0.17.0): `{"id": "1", "ok": false, "code": "newer_messages", "error": "…"}`.
+Only [`delete_chat`](#delete_chat-since-0170) refuses so. Every other failure has no `code`.
+
+`cmd` is one of: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`, `message`, `send`, `react`, `download`, `mark_read`, `mark_unread`, `delete_chat`, `sync`, `subscribe`. `args` field names are snake_case and match the corresponding CLI flags. The `result` shape matches each command's `--json` output today. `subscribe` is different: it turns the connection into an event stream — see [Live events](#live-events-subscribe-and-tg-stream-since-0110).
 
 `send` rejects unknown `args` keys rather than ignoring them:
 
@@ -259,7 +267,7 @@ which elements arrived instead of assuming none did. Every other failure has no
 {"id": "1", "ok": false, "error": "invalid args: unknown field `x`, expected one of `message`, `name`, `id`, `to`, `group`, `parse_mode`, `files`, `reply_to`"}
 ```
 
-So does [`react`](#react-since-0120). The other commands still ignore unknown keys. For a
+So do [`react`](#react-since-0120) and [`delete_chat`](#delete_chat-since-0170). The other commands still ignore unknown keys. For a
 recipient or identity field, a silent drop means a message delivered to the wrong place with
 `ok: true`, which is worse than a refusal the caller can retry.
 
@@ -480,6 +488,60 @@ delivers nothing.
   before.
 
 The CLI is `tg react --chat <id> --message <id> <emoji> [--remove]`.
+
+#### `delete_chat` (since 0.17.0)
+
+`delete_chat` deletes a one-to-one chat for the account alone, as Telegram's "Delete chat" does
+without "Also delete for …": every message goes from the account's side, the chat leaves every
+chat list, and the other person keeps theirs. It deletes nothing when the chat holds a message
+later than `through`, the date of the newest message the caller saw there:
+
+```json
+{"id": "1", "cmd": "delete_chat", "args": {"id": 555000111, "through": 1790000000}}
+-> {"id": "1", "ok": true, "result": {"chat_id": 555000111, "code": "deleted"}}
+
+{"id": "2", "cmd": "delete_chat", "args": {"id": 555000111, "through": 1789999000}}
+-> {"id": "2", "ok": false, "code": "newer_messages", "error": "delete_chat: chat 555000111 has a message of 2026-09-21T14:13:20Z, later than through (2026-09-21T13:56:40Z), so nothing was deleted"}
+```
+
+| arg | | |
+|---|---|---|
+| `id` | i64, required | the chat: for a one-to-one chat, the other person's user id |
+| `through` | i64, required | Unix seconds, as Telegram dates a message: a chat whose last message is later is not deleted |
+
+| answer | `ok` | |
+|---|---|---|
+| `result.code`: `deleted` | `true` | the chat is deleted. Also the answer, without asking Telegram anything, for a chat that is deleted already (in no chat list, no messages), so a request whose answer was lost may be repeated |
+| `code`: `newer_messages` | `false` | its last message is later than `through`; nothing was deleted |
+| `code`: `not_found` | `false` | TDLib does not know the chat (`getChat`: 400 "Chat not found"); nothing was deleted |
+| `code`: `not_private` | `false` | a basic group, a supergroup, a channel or a secret chat; nothing was deleted |
+| no `code` | `false` | anything else, in its own words. Telegram refused the delete (`delete_chat: Telegram did not delete chat …: <Telegram's reason>`). Telegram did not confirm it within 20 s (`… has not confirmed it …`): TDLib has deleted the chat on its side and keeps asking Telegram, and a repeat answers `deleted`. TDLib still knows no last message of the chat after reading its history (the delete would have no bound), or that read did not finish within 8 s: nothing was deleted. The chat could not be read. `through` lies more than 5 minutes ahead of the clock (a date in milliseconds, say): nothing was asked |
+
+- **Closed like `send`.** An unknown key is refused (`invalid args: unknown field …`), and nothing
+  is deleted; `revoke` in particular is no arg: this never deletes the other person's copy.
+- **The bound is the last message TDLib knows.** `deleteChatHistory(remove_from_chat_list: true,
+  revoke: false)` asks Telegram to delete up to the last message TDLib knows of, and with no
+  bound at all while it knows none. So `delete_chat` reads `getChat`; when it shows no last
+  message (as it does for a moment after loading a chat from its database), it reads the
+  history from its end, which makes TDLib load it, and reads the chat again; and it asks for
+  the delete only while TDLib shows a last message, no later than `through`. A message Telegram
+  holds that TDLib has not received yet stays, and so does the chat with it. A message TDLib
+  receives in the moment between the last read and the delete, one local round trip, is deleted
+  with the rest.
+- **`through` is in whole seconds**, as Telegram dates messages: a message of the same second
+  as the newest one the caller saw is not later, and is deleted with it.
+- **Any one-to-one chat is taken**, a bot's, Telegram's service notifications and the account's
+  own Saved Messages included. The caller decides which chats to delete.
+- **It answers within about 30 s.** The history read is given 8 s and Telegram's confirmation
+  20 s, and `tg serve` holds its client lock meanwhile. Give a request 40 s, as for `react`.
+- **What a subscriber sees** is what a chat deleted in a Telegram app shows: `messages_deleted`
+  for the messages TDLib held in memory, `chat_last_message` with `message_id: null`, and from
+  then on `sync` with `report_deleted` answers `{"chat_deleted": true}` for the chat.
+- A client can learn whether a daemon knows `delete_chat` without deleting anything: `"args": {}`
+  is answered ``invalid args: missing field `id` `` by 0.17.0 and later, and `unknown command:
+  delete_chat` before.
+
+The CLI is `tg delete-chat --id <id> --through <unix seconds>`.
 
 ### Live events: `subscribe` and `tg stream` (since 0.11.0)
 

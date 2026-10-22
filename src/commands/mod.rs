@@ -1,5 +1,6 @@
 pub mod auth_status;
 pub mod chats;
+pub mod delete_chat;
 pub mod download;
 pub mod groups;
 pub mod mark_read;

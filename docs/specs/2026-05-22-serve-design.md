@@ -43,7 +43,8 @@ Failure:
 ```
 
 - `result` shape matches the existing `--json` output of the corresponding subcommand (`MessageInfo`, `ChatInfo`, `SendResult`, `DownloadReport`, etc.). When today's CLI prints an array, `result` is that array. When it prints a single object, `result` is that object. When the CLI emits no payload (e.g. `tg mark-read`), `result` is `null`.
-- `error` is a single human-readable string sourced from `TgError::to_string()`. No nested envelope, no machine-readable error code in v1.
+- `error` is a single human-readable string sourced from `TgError::to_string()`. No nested envelope, and no machine-readable error code in v1.
+- **`code` (since 0.17.0)** sits beside `error` on a refusal whose caller acts on why, as one word: `{"id": "<echoed>", "ok": false, "code": "newer_messages", "error": "<message>"}`. Only `delete_chat` refuses so (`not_found`, `newer_messages`, `not_private`; `TgError::Refused`). Every other failure carries no `code`, so it is the bytes it always was, and a client that does not read the key loses nothing but the word.
 
 ### Framing rules
 
@@ -209,6 +210,7 @@ The server accepts every subcommand whose handler talks to TDLib:
 | `download`    | `DownloadRequest`     | `DownloadReport`              |
 | `mark_read`   | `MarkReadRequest`     | `null`                        |
 | `mark_unread` | `MarkUnreadRequest`   | `null`                        |
+| `delete_chat` | `DeleteChatRequest`   | `DeleteChatResult` (since 0.17.0) |
 | `sync`        | `SyncRequest`         | `HashMap<String, SyncResult>` |
 | `subscribe`   | _none_                | `{"subscribed": true}`, then event frames |
 

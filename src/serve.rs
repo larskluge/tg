@@ -11,8 +11,8 @@ use tdlib_rs::enums::Update;
 
 use crate::client::TelegramClient;
 use crate::commands::{
-    chats, download, groups, mark_read, mark_unread, message, messages, react, search, send, sync,
-    unread, whoami,
+    chats, delete_chat, download, groups, mark_read, mark_unread, message, messages, react, search,
+    send, sync, unread, whoami,
 };
 use crate::credentials::tg_data_dir;
 use crate::error::{Result, TgError};
@@ -68,6 +68,11 @@ pub struct ResponseEnvelope {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub error: Option<String>,
+    /// A failure's reason as a word, beside its sentence, where the caller
+    /// acts on why (since 0.17.0): `delete_chat`'s refusals. Absent from every
+    /// other answer, so an answer without one is the bytes it always was.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub code: Option<String>,
 }
 
 impl ResponseEnvelope {
@@ -77,6 +82,7 @@ impl ResponseEnvelope {
             ok: true,
             result: Some(value),
             error: None,
+            code: None,
         }
     }
 
@@ -86,6 +92,16 @@ impl ResponseEnvelope {
             ok: false,
             result: None,
             error: Some(message.into()),
+            code: None,
+        }
+    }
+
+    /// A refusal: nothing was done, and `code` says why in a word the caller
+    /// acts on.
+    pub fn refused(id: serde_json::Value, code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: Some(code.to_string()),
+            ..Self::err(id, message)
         }
     }
 
@@ -101,6 +117,7 @@ impl ResponseEnvelope {
             ok: false,
             result: Some(value),
             error: Some(message.into()),
+            code: None,
         }
     }
 }
@@ -212,6 +229,9 @@ impl StreamEvent {
 /// the error carries one.
 fn error_response(id: serde_json::Value, e: TgError) -> ResponseEnvelope {
     let message = e.to_string();
+    if let Some(code) = e.code() {
+        return ResponseEnvelope::refused(id, code, message);
+    }
     match e.partial_send() {
         None => ResponseEnvelope::err(id, message),
         Some(partial) => match serde_json::to_value(partial) {
@@ -246,6 +266,7 @@ pub async fn dispatch<C: TelegramClient>(client: &C, env: RequestEnvelope) -> Re
         "download" => execute(env.args, |r| download::handle(client, r)).await,
         "mark_read" => execute(env.args, |r| mark_read::handle(client, r)).await,
         "mark_unread" => execute(env.args, |r| mark_unread::handle(client, r)).await,
+        "delete_chat" => execute(env.args, |r| delete_chat::handle(client, r)).await,
         "sync" => execute(env.args, |r| sync::handle(client, r)).await,
         SUBSCRIBE_CMD => Err(TgError::Other(
             "subscribe turns the connection into an event stream, so only `tg serve`'s connection loop can answer it"
@@ -468,7 +489,102 @@ mod tests {
         let res = error_response(json!("1"), TgError::Other("nope".to_string()));
         assert!(!res.ok);
         assert!(res.result.is_none());
+        assert!(res.code.is_none());
+        // Without a code, a failure is the bytes it was before codes existed.
+        assert_eq!(
+            serde_json::to_value(&res).unwrap(),
+            json!({"id": "1", "ok": false, "error": "nope"})
+        );
         assert_eq!(res.error.unwrap(), "nope");
+    }
+
+    #[tokio::test]
+    async fn dispatch_delete_chat_answers_deleted() {
+        let client = MockClient::default();
+        client.known_chats.lock().unwrap().insert(
+            555_000_111,
+            crate::client::ChatPresence {
+                is_private: true,
+                in_chat_list: true,
+                last_message_date: Some(1_790_000_000),
+            },
+        );
+        let res = dispatch(
+            &client,
+            req(
+                "d1",
+                "delete_chat",
+                json!({"id": 555_000_111, "through": 1_790_000_000}),
+            ),
+        )
+        .await;
+        assert!(res.ok, "{:?}", res.error);
+        assert!(res.code.is_none());
+        assert_eq!(
+            res.result.unwrap(),
+            json!({"chat_id": 555_000_111, "code": "deleted"})
+        );
+        assert_eq!(*client.deleted_chats.lock().unwrap(), vec![555_000_111]);
+    }
+
+    #[tokio::test]
+    async fn dispatch_delete_chat_refusal_carries_its_code() {
+        // A caller acts on why: a chat Telegram's client does not know is done
+        // with, a newer message is not. The word travels beside the sentence.
+        let client = MockClient::default();
+        client.known_chats.lock().unwrap().insert(
+            555_000_111,
+            crate::client::ChatPresence {
+                is_private: true,
+                in_chat_list: true,
+                last_message_date: Some(1_790_000_060),
+            },
+        );
+        let newer = dispatch(
+            &client,
+            req(
+                "d2",
+                "delete_chat",
+                json!({"id": 555_000_111, "through": 1_790_000_000}),
+            ),
+        )
+        .await;
+        let unknown = dispatch(
+            &client,
+            req(
+                "d3",
+                "delete_chat",
+                json!({"id": 555_000_222, "through": 1_790_000_000}),
+            ),
+        )
+        .await;
+        for (res, code) in [(&newer, "newer_messages"), (&unknown, "not_found")] {
+            assert!(!res.ok);
+            assert!(res.result.is_none(), "a refusal did nothing");
+            assert_eq!(res.code.as_deref(), Some(code));
+            assert!(res.error.as_ref().unwrap().contains("nothing was deleted"));
+        }
+        let wire = serde_json::to_value(&unknown).unwrap();
+        assert_eq!(wire["code"], "not_found");
+        assert_eq!(wire["id"], "d3");
+        assert!(client.deleted_chats.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn dispatch_delete_chat_refuses_unknown_args() {
+        let client = MockClient::default();
+        let res = dispatch(
+            &client,
+            req(
+                "d4",
+                "delete_chat",
+                json!({"id": 555_000_111, "through": 1_790_000_000, "revoke": true}),
+            ),
+        )
+        .await;
+        assert!(!res.ok);
+        assert!(res.error.unwrap().contains("unknown field `revoke`"));
+        assert!(client.deleted_chats.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -802,9 +918,9 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_other_commands_still_ignore_unknown_args() {
-        // Only `send` and `react`, the two that put something in a chat, are
-        // strict. `whoami` in particular backs the container's health check, so
-        // tightening the rest has to be a conscious act.
+        // Only `send`, `react` and `delete_chat`, the three that change a
+        // chat, are strict. `whoami` in particular backs the container's
+        // health check, so tightening the rest has to be a conscious act.
         let client = MockClient::default();
         let res = dispatch(&client, req("11", "chats", json!({"limit": 5, "bogus": 1}))).await;
         assert!(res.ok, "{:?}", res.error);

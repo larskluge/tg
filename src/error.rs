@@ -56,9 +56,44 @@ pub enum TgError {
         message: String,
         partial: Box<crate::output::PartialSendResult>,
     },
+
+    /// A request refused for a reason its caller acts on, so the reason travels
+    /// as a word as well as a sentence: `serve::dispatch` answers it as
+    /// `{"ok": false, "code": ..., "error": ...}`. Nothing was changed.
+    #[error("{message}")]
+    Refused { refusal: Refusal, message: String },
+}
+
+/// Why a request was refused, as the `code` of its failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// TDLib does not know the chat (`getChat`: "Chat not found").
+    NotFound,
+    /// The chat holds a message later than the caller had seen.
+    NewerMessages,
+    /// The chat is no one-to-one chat.
+    NotPrivate,
+}
+
+impl Refusal {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotFound => "not_found",
+            Self::NewerMessages => "newer_messages",
+            Self::NotPrivate => "not_private",
+        }
+    }
 }
 
 impl TgError {
+    /// The word a caller acts on, for a refusal; `None` for every other error.
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Refused { refusal, .. } => Some(refusal.code()),
+            _ => None,
+        }
+    }
+
     /// The structured payload a transport must report ALONGSIDE this error, if
     /// it has one. `None` for every error that left nothing behind.
     pub fn partial_send(&self) -> Option<&crate::output::PartialSendResult> {
