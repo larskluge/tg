@@ -12,7 +12,11 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    # Not ubuntu-latest: on 26.04 `libc++1` no longer pulls in LLVM's
+    # libunwind, and TDLib's prebuilt libtdjson needs `libunwind.so.1`, so the
+    # test binary cannot load (24.04's libc++1 brings libunwind-18). The image
+    # is built from its own Containerfile and does not depend on the runner.
+    runs-on: ubuntu-24.04
 
     steps:
       - uses: actions/checkout@v6
