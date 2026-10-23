@@ -4,7 +4,7 @@ This file provides guidance to agents when working with code in this repository.
 
 ## Tracking work
 
-This project tracks its work in Beads (`bd`) since 2026-10-23: run `bd prime`, then `bd ready`, and file new work with `bd create`. Storage, the Dolt remote on outpost (`refs/dolt/data`) and recovery: `.beads/README.md`.
+This project tracks its work in Beads (`bd`) since 2026-10-23: run `bd prime`, then `bd ready`, and file new work with `bd create`, never `gh issue create` (GitHub Issues stay on, but are no longer where work is tracked). The 9 GitHub issues moved here as `tg-gh<N>`, keeping their numbers (`tg-gh1` to `tg-gh19`). Storage, the Dolt remote on outpost (`refs/dolt/data`) and recovery: `.beads/README.md`.
 
 ## Build Commands
 
