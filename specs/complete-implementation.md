@@ -216,6 +216,7 @@ WaitTdlibParameters, WaitPhoneNumber, WaitCode, WaitPassword, Ready, Closed
 - Parse 13 message content types
 - A caption takes the measures' place in a message's bracketed text (photo, video, document; animation, audio and voice since 0.14.0; paid media since 0.16.0)
 - Message timestamps (RFC3339)
+- Send a voice note through `tg serve`: `sendMessage(...)` with `inputMessageVoiceNote(voice_note, duration, waveform, caption, self_destruct_type)`, `files[]` entry of kind `voice` (since 0.18.0; no CLI flag yet)
 
 ### Missing - To Implement
 
@@ -227,7 +228,7 @@ WaitTdlibParameters, WaitPhoneNumber, WaitCode, WaitPassword, Ready, Closed
 | Send video | `sendMessage(...)` with `inputMessageVideo(video, thumbnail, added_sticker_file_ids, duration, width, height, supports_streaming, caption, show_caption_above_media, self_destruct_type, has_spoiler)` | `tg send <TARGET> --video <FILE> [-m "caption"]` |
 | Send document | `sendMessage(...)` with `inputMessageDocument(document, thumbnail, disable_content_type_detection, caption)` | `tg send <TARGET> --file <FILE> [-m "caption"]` |
 | Send audio | `sendMessage(...)` with `inputMessageAudio(audio, album_cover_thumbnail, duration, title, performer, caption)` | `tg send <TARGET> --audio <FILE> [-m "caption"]` |
-| Send voice note | `sendMessage(...)` with `inputMessageVoiceNote(voice_note, duration, waveform, caption, self_destruct_type)` | `tg send <TARGET> --voice <FILE>` |
+| Send voice note from the CLI (`tg serve`'s `send` takes one since 0.18.0) | `sendMessage(...)` with `inputMessageVoiceNote(voice_note, duration, waveform, caption, self_destruct_type)` | `tg send <TARGET> --voice <FILE>` |
 | Send video note | `sendMessage(...)` with `inputMessageVideoNote(video_note, thumbnail, duration, length, self_destruct_type)` | `tg send <TARGET> --video-note <FILE>` |
 | Send location | `sendMessage(...)` with `inputMessageLocation(location, live_period, heading, proximity_alert_radius)` | `tg send <TARGET> --location <LAT,LON> [--live <SECONDS>]` |
 | Send contact | `sendMessage(...)` with `inputMessageContact(contact)` | `tg send <TARGET> --contact <PHONE> <FIRST> [LAST]` |

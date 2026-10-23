@@ -677,6 +677,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_voice_note_goes_out_alone_with_no_words_as_a_reply() {
+        // The request Postmaster sends for a recording: no caption, one file,
+        // its length and 64 levels, answering a message.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("voice-note.ogg");
+        std::fs::write(&path, b"OggS fictional").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let client = client_with_reply_targets();
+        let req = send_req(json!({
+            "message": "",
+            "id": DM,
+            "files": [{"path": path, "kind": "voice", "duration": 42, "waveform": vec![100; 64]}],
+            "reply_to": DM_MSG,
+        }))
+        .unwrap();
+        let res = handle(&client, req).await.unwrap();
+
+        assert_eq!(res.reply_to_message_id, Some(DM_MSG));
+        let delivered = &res.elements.as_ref().unwrap().delivered;
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].index, 0);
+        let media = client.media_sent.lock().unwrap();
+        let (chat_id, caption, parse_mode, files) = &media[0];
+        assert_eq!((*chat_id, caption.as_str(), *parse_mode), (DM, "", None));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path.to_string_lossy(), path);
+        assert_eq!(
+            files[0].presentation,
+            crate::media::Presentation::Voice(crate::media::VoiceNote {
+                duration: 42,
+                levels: vec![100; 64],
+            })
+        );
+        assert_eq!(*client.replies_sent.lock().unwrap(), vec![Some(DM_MSG)]);
+    }
+
+    #[tokio::test]
+    async fn a_voice_note_beside_another_file_is_refused_before_the_recipient() {
+        // No recipient on purpose: the refusal must be about the voice note,
+        // so no TDLib lookup is spent on a request that can never be sent.
+        let client = MockClient::default();
+        let req = send_req(json!({
+            "message": "listen",
+            "files": [
+                {"path": "/nope/voice-note.ogg", "kind": "voice", "duration": 3, "waveform": vec![0; 64]},
+                {"path": "/nope/a.pdf"},
+            ],
+        }))
+        .unwrap();
+        let err = handle(&client, req).await.unwrap_err().to_string();
+        assert!(err.contains("a voice note is sent alone"), "{err}");
+        assert!(!err.contains("one of"), "{err}");
+        assert!(client.media_sent.lock().unwrap().is_empty());
+        assert!(client.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn an_ordinary_send_checks_nothing_and_replies_to_nothing() {
         let client = client_with_reply_targets();
         let req = SendRequest {
@@ -1018,7 +1075,7 @@ mod tests {
         assert_eq!(*parse_mode, None);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path.to_string_lossy(), path);
-        assert_eq!(files[0].kind, crate::media::MediaKind::File);
+        assert_eq!(files[0].presentation, crate::media::Presentation::File);
         // The basename is the only filename Telegram can show, so it must be
         // carried through untouched — spaces included.
         assert_eq!(files[0].display_name(), "Q3 report.pdf");
@@ -1044,6 +1101,7 @@ mod tests {
                     kind: Some("photo".to_string()),
                     width: Some(800),
                     height: Some(600),
+                    ..Default::default()
                 },
                 SendFile {
                     path: second.clone(),
@@ -1063,9 +1121,21 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].path.to_string_lossy(), first);
         assert_eq!(files[1].path.to_string_lossy(), second);
-        assert_eq!((files[0].width, files[0].height), (800, 600));
+        assert_eq!(
+            files[0].presentation,
+            crate::media::Presentation::Photo {
+                width: 800,
+                height: 600
+            }
+        );
         // Absent dimensions mean "let Telegram work it out".
-        assert_eq!((files[1].width, files[1].height), (0, 0));
+        assert_eq!(
+            files[1].presentation,
+            crate::media::Presentation::Photo {
+                width: 0,
+                height: 0
+            }
+        );
     }
 
     #[tokio::test]

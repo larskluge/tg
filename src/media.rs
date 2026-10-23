@@ -8,16 +8,25 @@
 //! name it should arrive as, and `tg` renames nothing. Second, TDLib groups
 //! only same-typed contents into an album, so a request that mixes a photo with
 //! a document has no single-message rendering and is refused rather than
-//! silently split into two messages.
+//! silently split into two messages. A voice note goes in no album at all, so
+//! it is always the request's one file.
 
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, TgError};
 
 /// TDLib albums carry 2-10 contents; a single file is sent as one message.
 pub const MAX_FILES: usize = 10;
+
+/// A voice note's waveform as the caller passes it: this many levels, oldest
+/// first, each `0..=`[`WAVEFORM_MAX`].
+pub const WAVEFORM_LEVELS: usize = 64;
+
+/// The loudest level a caller passes; Telegram's own scale tops out at 31.
+pub const WAVEFORM_MAX: i64 = 100;
 
 /// Wire mirror of one `args.files[]` entry. `deny_unknown_fields` for the same
 /// reason [`crate::commands::send::SendRequest`] carries it: a dropped key here
@@ -27,8 +36,9 @@ pub const MAX_FILES: usize = 10;
 pub struct SendFile {
     /// Absolute path to the file. Its basename is what the recipient sees.
     pub path: String,
-    /// `photo` or `file`; absent means `file`. Kept as a string so this struct
-    /// stays a transparent wire mirror and the error text stays ours.
+    /// `photo`, `file` or `voice`; absent means `file`. Kept as a string so
+    /// this struct stays a transparent wire mirror and the error text stays
+    /// ours.
     #[serde(default)]
     pub kind: Option<String>,
     /// Photo pixel width; `0` or absent lets TDLib work it out.
@@ -37,6 +47,15 @@ pub struct SendFile {
     /// Photo pixel height; `0` or absent lets TDLib work it out.
     #[serde(default)]
     pub height: Option<i32>,
+    /// A voice note's length in whole seconds, 1 or more. Required for kind
+    /// `voice`, refused for any other. Wider than TDLib's `int32` so an
+    /// out-of-range value is refused in our words, not serde's.
+    #[serde(default)]
+    pub duration: Option<i64>,
+    /// A voice note's waveform: exactly [`WAVEFORM_LEVELS`] levels, oldest
+    /// first, each `0..=100`. Required for kind `voice`, refused for any other.
+    #[serde(default)]
+    pub waveform: Option<Vec<i64>>,
 }
 
 /// How a file is presented to the recipient. Decided by the caller and never
@@ -48,6 +67,9 @@ pub enum MediaKind {
     Photo,
     /// A document — an attachment with a filename, whatever its content type.
     File,
+    /// A voice note: an Ogg Opus recording shown with a play button, its
+    /// length and its waveform. Always sent alone.
+    Voice,
 }
 
 impl MediaKind {
@@ -58,8 +80,9 @@ impl MediaKind {
         match value {
             None | Some("file") => Ok(Self::File),
             Some("photo") => Ok(Self::Photo),
+            Some("voice") => Ok(Self::Voice),
             Some(other) => Err(TgError::Other(format!(
-                "kind '{other}' is not supported. Expected `photo` or `file`"
+                "kind '{other}' is not supported. Expected `photo`, `file` or `voice`"
             ))),
         }
     }
@@ -68,8 +91,81 @@ impl MediaKind {
         match self {
             Self::Photo => "photo",
             Self::File => "file",
+            Self::Voice => "voice",
         }
     }
+}
+
+/// What the client builds for one file, with exactly the measures its kind
+/// reads: a photo's dimensions, a voice note's length and waveform, nothing
+/// for a document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Presentation {
+    /// `0` for a dimension lets TDLib work it out.
+    Photo {
+        width: i32,
+        height: i32,
+    },
+    File,
+    Voice(VoiceNote),
+}
+
+impl Presentation {
+    pub fn kind(&self) -> MediaKind {
+        match self {
+            Self::Photo { .. } => MediaKind::Photo,
+            Self::File => MediaKind::File,
+            Self::Voice(_) => MediaKind::Voice,
+        }
+    }
+}
+
+/// A voice note's measures, as the caller passed them. `tg` neither probes
+/// nor transcodes the recording: there is no decoder in its image, and the
+/// caller already measured what it recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceNote {
+    /// Whole seconds, 1 or more.
+    pub duration: i32,
+    /// [`WAVEFORM_LEVELS`] levels, oldest first, each `0..=100`.
+    pub levels: Vec<u8>,
+}
+
+impl VoiceNote {
+    /// The waveform as `inputMessageVoiceNote.waveform` takes it: Telegram's
+    /// 5-bit form ([`pack_waveform`]), in base64 because TDLib's JSON interface
+    /// carries every `bytes` field so.
+    pub fn tdlib_waveform(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(pack_waveform(&self.levels))
+    }
+}
+
+/// One level `0..=100` on Telegram's waveform scale `0..=31`, rounded to the
+/// nearest step.
+pub fn five_bit(level: u8) -> u8 {
+    ((u16::from(level) * 31 + 50) / 100) as u8
+}
+
+/// Pack levels `0..=100` into Telegram's 5-bit waveform: each level, scaled by
+/// [`five_bit`], takes the next 5 bits of a little-endian bit stream, the
+/// first level in the lowest bits of the first byte. That is how Telegram's
+/// clients write the voice note attribute's waveform and how they read it
+/// back (tdesktop's `documentWaveformEncode5bit`, Android's `getWaveform2`), so
+/// 64 levels are 40 bytes.
+pub fn pack_waveform(levels: &[u8]) -> Vec<u8> {
+    let mut packed = vec![0u8; (levels.len() * 5).div_ceil(8)];
+    for (i, &level) in levels.iter().enumerate() {
+        let bit = i * 5;
+        let spread = u16::from(five_bit(level)) << (bit % 8);
+        packed[bit / 8] |= spread as u8;
+        // A value that crosses a byte boundary ends inside the vector: the
+        // last level's bits end at bit `len * 5 - 1`, which the length rounds
+        // up to cover.
+        if spread > 0xFF {
+            packed[bit / 8 + 1] |= (spread >> 8) as u8;
+        }
+    }
+    packed
 }
 
 /// A validated attachment: an existing, readable, absolute path plus the
@@ -77,13 +173,14 @@ impl MediaKind {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MediaFile {
     pub path: PathBuf,
-    pub kind: MediaKind,
-    /// `0` means "let TDLib work it out"; always `0` for [`MediaKind::File`].
-    pub width: i32,
-    pub height: i32,
+    pub presentation: Presentation,
 }
 
 impl MediaFile {
+    pub fn kind(&self) -> MediaKind {
+        self.presentation.kind()
+    }
+
     /// The basename the recipient will see. Empty only for a path that
     /// validation already refused.
     pub fn display_name(&self) -> String {
@@ -124,16 +221,18 @@ pub fn validate_files(files: Option<&[SendFile]>) -> Result<Vec<MediaFile>> {
         )));
     }
 
-    // Shape first, filesystem second: the kind and dimension faults cost
-    // nothing to find, and the mixed-kind refusal is about the request as a
-    // whole, so it must be reported before any single path is blamed.
-    let mut kinds = Vec::with_capacity(files.len());
-    for (i, file) in files.iter().enumerate() {
-        let kind = MediaKind::parse(file.kind.as_deref())
-            .map_err(|e| TgError::Other(format!("send: files[{i}]: {e}")))?;
-        validate_dimensions(i, file, kind)?;
-        kinds.push(kind);
-    }
+    // Shape first, filesystem second: the kind and measure faults cost
+    // nothing to find, and the voice-alone and mixed-kind refusals are about
+    // the request as a whole, so they must be reported before any single path
+    // is blamed.
+    let presentations = files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| presentation(i, file))
+        .collect::<Result<Vec<_>>>()?;
+    let kinds: Vec<MediaKind> = presentations.iter().map(Presentation::kind).collect();
+
+    check_voice_alone(&kinds)?;
 
     if let Some(kind) = kinds.first()
         && let Some(other) = kinds.iter().position(|k| k != kind)
@@ -147,18 +246,63 @@ pub fn validate_files(files: Option<&[SendFile]>) -> Result<Vec<MediaFile>> {
 
     files
         .iter()
-        .zip(kinds)
+        .zip(presentations)
         .enumerate()
-        .map(|(i, (file, kind))| {
-            let path = validate_path(i, &file.path)?;
+        .map(|(i, (file, presentation))| {
             Ok(MediaFile {
-                path,
-                kind,
-                width: dimension(file.width, kind),
-                height: dimension(file.height, kind),
+                path: validate_path(i, &file.path)?,
+                presentation,
             })
         })
         .collect()
+}
+
+/// A voice note is never part of an album: Telegram groups photos, videos,
+/// documents and audio files, and a voice note in a several-file request has
+/// no single-message rendering. Refused, never split, as a mixed request is.
+/// Shared with the client's own belt-and-braces check.
+pub fn check_voice_alone(kinds: &[MediaKind]) -> Result<()> {
+    if kinds.len() < 2 {
+        return Ok(());
+    }
+    match kinds.iter().position(|k| *k == MediaKind::Voice) {
+        Some(voice) => Err(TgError::Other(format!(
+            "send: files[{voice}] is kind `voice` and the request has {} files; a voice note is sent alone (Telegram puts none in an album) — send it by itself",
+            kinds.len()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// One entry's kind with exactly the measures it reads, every other measure
+/// refused rather than ignored: a measure on the wrong kind says something
+/// about the payload that kind cannot honour, and a dropped field is how a
+/// caller ends up believing it asked for another presentation.
+fn presentation(i: usize, file: &SendFile) -> Result<Presentation> {
+    let kind = MediaKind::parse(file.kind.as_deref())
+        .map_err(|e| TgError::Other(format!("send: files[{i}]: {e}")))?;
+    validate_dimensions(i, file, kind)?;
+    if kind != MediaKind::Voice {
+        for (name, set) in [
+            ("duration", file.duration.is_some()),
+            ("waveform", file.waveform.is_some()),
+        ] {
+            if set {
+                return Err(TgError::Other(format!(
+                    "send: files[{i}].{name} is set but kind is `{}`; duration and waveform are read only for kind `voice`",
+                    kind.as_str()
+                )));
+            }
+        }
+    }
+    Ok(match kind {
+        MediaKind::Photo => Presentation::Photo {
+            width: file.width.unwrap_or(0),
+            height: file.height.unwrap_or(0),
+        },
+        MediaKind::File => Presentation::File,
+        MediaKind::Voice => Presentation::Voice(voice_note(i, file)?),
+    })
 }
 
 fn validate_dimensions(i: usize, file: &SendFile, kind: MediaKind) -> Result<()> {
@@ -169,11 +313,9 @@ fn validate_dimensions(i: usize, file: &SendFile, kind: MediaKind) -> Result<()>
                 "send: files[{i}].{name} is {value}; pixel dimensions cannot be negative (use 0 to let Telegram work it out)"
             )));
         }
-        // Refusing rather than ignoring: a dimension on a document says
-        // something about the payload that `kind: file` cannot honour, and a
-        // dropped field here is how a caller ends up believing it asked for a
-        // photo.
-        if value != 0 && kind != MediaKind::Photo {
+        // A voice note takes no dimension at all, not even the `0` a document
+        // tolerates: there is nothing for one to describe.
+        if (value != 0 && kind != MediaKind::Photo) || kind == MediaKind::Voice {
             return Err(TgError::Other(format!(
                 "send: files[{i}].{name} is set but kind is `{}`; dimensions are read only for kind `photo`",
                 kind.as_str()
@@ -183,11 +325,55 @@ fn validate_dimensions(i: usize, file: &SendFile, kind: MediaKind) -> Result<()>
     Ok(())
 }
 
-fn dimension(value: Option<i32>, kind: MediaKind) -> i32 {
-    match kind {
-        MediaKind::Photo => value.unwrap_or(0),
-        MediaKind::File => 0,
+/// A voice note's length and waveform, both required: without them Telegram
+/// shows `0:00` and a flat line, a voice note nobody approved.
+fn voice_note(i: usize, file: &SendFile) -> Result<VoiceNote> {
+    let duration = match file.duration {
+        None => {
+            return Err(TgError::Other(format!(
+                "send: files[{i}].duration is missing; kind `voice` needs its length in whole seconds (1 or more)"
+            )));
+        }
+        Some(seconds) if seconds < 1 => {
+            return Err(TgError::Other(format!(
+                "send: files[{i}].duration is {seconds}; a voice note lasts 1 second or more"
+            )));
+        }
+        Some(seconds) => i32::try_from(seconds).map_err(|_| {
+            TgError::Other(format!(
+                "send: files[{i}].duration is {seconds}; that is more seconds than Telegram takes ({})",
+                i32::MAX
+            ))
+        })?,
+    };
+
+    let Some(waveform) = &file.waveform else {
+        return Err(TgError::Other(format!(
+            "send: files[{i}].waveform is missing; kind `voice` needs {WAVEFORM_LEVELS} levels, each 0-{WAVEFORM_MAX}"
+        )));
+    };
+    if waveform.len() != WAVEFORM_LEVELS {
+        return Err(TgError::Other(format!(
+            "send: files[{i}].waveform has {} levels; kind `voice` needs exactly {WAVEFORM_LEVELS}, each 0-{WAVEFORM_MAX}",
+            waveform.len()
+        )));
     }
+    let levels = waveform
+        .iter()
+        .enumerate()
+        .map(|(j, &level)| {
+            u8::try_from(level)
+                .ok()
+                .filter(|_| (0..=WAVEFORM_MAX).contains(&level))
+                .ok_or_else(|| {
+                    TgError::Other(format!(
+                        "send: files[{i}].waveform[{j}] is {level}; each level is 0-{WAVEFORM_MAX}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<u8>>>()?;
+
+    Ok(VoiceNote { duration, levels })
 }
 
 /// Require an absolute path that exists as a regular file and opens for
@@ -252,7 +438,7 @@ mod tests {
     fn absent_kind_means_file() {
         let dir = TempDir::new().unwrap();
         let files = validate_files(Some(&[entry(&file_at(&dir, "a.pdf"), None)])).unwrap();
-        assert_eq!(files[0].kind, MediaKind::File);
+        assert_eq!(files[0].presentation, Presentation::File);
     }
 
     #[test]
@@ -348,7 +534,7 @@ mod tests {
             path: "/nope/a.jpg".to_string(),
             kind: Some("photo".to_string()),
             width: Some(-1),
-            height: None,
+            ..Default::default()
         }]))
         .unwrap_err()
         .to_string();
@@ -361,7 +547,7 @@ mod tests {
             path: "/nope/a.pdf".to_string(),
             kind: None,
             width: Some(640),
-            height: None,
+            ..Default::default()
         }]))
         .unwrap_err()
         .to_string();
@@ -376,9 +562,16 @@ mod tests {
             kind: Some("photo".to_string()),
             width: Some(800),
             height: Some(600),
+            ..Default::default()
         }]))
         .unwrap();
-        assert_eq!((files[0].width, files[0].height), (800, 600));
+        assert_eq!(
+            files[0].presentation,
+            Presentation::Photo {
+                width: 800,
+                height: 600
+            }
+        );
     }
 
     #[test]
@@ -389,18 +582,308 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("unknown field `mime`"), "{err}");
-        for field in ["path", "kind", "width", "height"] {
+        for field in ["path", "kind", "width", "height", "duration", "waveform"] {
             assert!(err.contains(field), "error should name `{field}`: {err}");
         }
+    }
+
+    fn voice(path: &str) -> SendFile {
+        SendFile {
+            path: path.to_string(),
+            kind: Some("voice".to_string()),
+            duration: Some(42),
+            waveform: Some(vec![50; WAVEFORM_LEVELS]),
+            ..Default::default()
+        }
+    }
+
+    fn refusal(file: SendFile) -> String {
+        validate_files(Some(&[file])).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn a_voice_note_carries_its_length_and_levels() {
+        let dir = TempDir::new().unwrap();
+        let mut file = voice(&file_at(&dir, "voice-note.ogg"));
+        let levels: Vec<i64> = (0..64).map(|i| i * 100 / 63).collect();
+        file.waveform = Some(levels.clone());
+        let files = validate_files(Some(&[file])).unwrap();
+        assert_eq!(
+            files[0].presentation,
+            Presentation::Voice(VoiceNote {
+                duration: 42,
+                levels: levels.iter().map(|&l| l as u8).collect(),
+            })
+        );
+        assert_eq!(files[0].kind(), MediaKind::Voice);
+    }
+
+    #[test]
+    fn a_voice_note_reads_from_the_wire_with_its_measures() {
+        let file: SendFile = serde_json::from_value(serde_json::json!({
+            "path": "/outbox/voice-note.ogg",
+            "kind": "voice",
+            "duration": 7,
+            "waveform": vec![100; 64],
+        }))
+        .unwrap();
+        assert_eq!(file.duration, Some(7));
+        assert_eq!(file.waveform.as_deref(), Some(&[100; 64][..]));
+    }
+
+    #[test]
+    fn a_voice_note_without_its_length_is_refused() {
+        let mut file = voice("/nope/v.ogg");
+        file.duration = None;
+        let err = refusal(file);
+        assert!(err.contains("files[0].duration is missing"), "{err}");
+    }
+
+    #[test]
+    fn a_voice_note_shorter_than_a_second_is_refused() {
+        for seconds in [0, -3] {
+            let mut file = voice("/nope/v.ogg");
+            file.duration = Some(seconds);
+            let err = refusal(file);
+            assert!(
+                err.contains(&format!(
+                    "duration is {seconds}; a voice note lasts 1 second or more"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_length_past_tdlibs_range_is_refused() {
+        let mut file = voice("/nope/v.ogg");
+        file.duration = Some(i64::from(i32::MAX) + 1);
+        let err = refusal(file);
+        assert!(err.contains("more seconds than Telegram takes"), "{err}");
+    }
+
+    #[test]
+    fn a_voice_note_without_its_waveform_is_refused() {
+        let mut file = voice("/nope/v.ogg");
+        file.waveform = None;
+        let err = refusal(file);
+        assert!(err.contains("files[0].waveform is missing"), "{err}");
+    }
+
+    #[test]
+    fn a_waveform_of_other_than_64_levels_is_refused() {
+        for count in [0, 63, 65, 100] {
+            let mut file = voice("/nope/v.ogg");
+            file.waveform = Some(vec![0; count]);
+            let err = refusal(file);
+            assert!(
+                err.contains(&format!(
+                    "waveform has {count} levels; kind `voice` needs exactly 64"
+                )),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_level_outside_0_to_100_is_refused_by_its_index() {
+        for level in [-1, 101, 256, 1000] {
+            let mut file = voice("/nope/v.ogg");
+            let mut levels = vec![0; 64];
+            levels[17] = level;
+            file.waveform = Some(levels);
+            let err = refusal(file);
+            assert!(
+                err.contains(&format!("waveform[17] is {level}; each level is 0-100")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dimension_on_a_voice_note_is_refused_even_a_zero() {
+        for (width, height) in [(Some(0), None), (None, Some(480))] {
+            let mut file = voice("/nope/v.ogg");
+            file.width = width;
+            file.height = height;
+            let err = refusal(file);
+            assert!(err.contains("is set but kind is `voice`"), "{err}");
+            assert!(err.contains("read only for kind `photo`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_length_or_waveform_on_another_kind_is_refused() {
+        for kind in [None, Some("file"), Some("photo")] {
+            let mut file = entry("/nope/a.jpg", kind);
+            file.duration = Some(3);
+            let err = refusal(file);
+            assert!(err.contains("files[0].duration is set"), "{err}");
+            assert!(err.contains("read only for kind `voice`"), "{err}");
+
+            let mut file = entry("/nope/a.jpg", kind);
+            file.waveform = Some(vec![0; 64]);
+            let err = refusal(file);
+            assert!(err.contains("files[0].waveform is set"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_voice_note_beside_any_other_file_is_refused_before_any_path_is_touched() {
+        // Deliberately nonexistent paths: whatever is on disk, a voice note in
+        // a several-file request has no single-message rendering.
+        let cases = [
+            (
+                vec![voice("/nope/v.ogg"), entry("/nope/a.jpg", Some("photo"))],
+                0,
+            ),
+            (vec![entry("/nope/a.pdf", None), voice("/nope/v.ogg")], 1),
+            (vec![voice("/nope/v.ogg"), voice("/nope/w.ogg")], 0),
+        ];
+        for (files, at) in cases {
+            let err = validate_files(Some(&files)).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "files[{at}] is kind `voice` and the request has 2 files"
+                )),
+                "{err}"
+            );
+            assert!(err.contains("a voice note is sent alone"), "{err}");
+            assert!(!err.contains("unreadable"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_voice_note_alone_still_needs_a_readable_path() {
+        let err = refusal(voice("/nonexistent/v.ogg"));
+        assert!(err.contains("unreadable"), "{err}");
+    }
+
+    #[test]
+    fn levels_scale_to_telegrams_five_bits_rounded() {
+        let cases = [
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (4, 1),
+            (5, 2),
+            (50, 16),
+            (98, 30),
+            (99, 31),
+            (100, 31),
+        ];
+        for (level, expected) in cases {
+            assert_eq!(five_bit(level), expected, "level {level}");
+        }
+    }
+
+    /// Telegram's reader of a 5-bit waveform, as tdesktop's
+    /// `documentWaveformDecode` reads it: value `i` is the 5 bits at bit
+    /// `5 * i` of the little-endian stream. An independent second form of the
+    /// layout the packer writes.
+    fn unpack(packed: &[u8]) -> Vec<u8> {
+        (0..packed.len() * 8 / 5)
+            .map(|i| {
+                let (byte, shift) = (i * 5 / 8, i * 5 % 8);
+                let low = u16::from(packed[byte]);
+                let high = u16::from(packed.get(byte + 1).copied().unwrap_or(0));
+                (((low | (high << 8)) >> shift) & 0x1F) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn silence_packs_to_forty_zero_bytes() {
+        assert_eq!(pack_waveform(&[0; 64]), vec![0u8; 40]);
+        let note = VoiceNote {
+            duration: 1,
+            levels: vec![0; 64],
+        };
+        assert_eq!(note.tdlib_waveform(), "A".repeat(52) + "AA==");
+    }
+
+    #[test]
+    fn full_loudness_packs_to_forty_set_bytes() {
+        assert_eq!(pack_waveform(&[100; 64]), vec![0xFFu8; 40]);
+        let note = VoiceNote {
+            duration: 1,
+            levels: vec![100; 64],
+        };
+        assert_eq!(note.tdlib_waveform(), "/".repeat(52) + "/w==");
+    }
+
+    #[test]
+    fn the_first_level_takes_the_lowest_bits() {
+        let one = |at: usize, level: u8| {
+            let mut levels = [0u8; 64];
+            levels[at] = level;
+            pack_waveform(&levels)
+        };
+        // Bits 0-4, then bits 5-9 across the first byte boundary.
+        assert_eq!(one(0, 100)[..2], [0x1F, 0x00]);
+        assert_eq!(one(1, 100)[..2], [0xE0, 0x03]);
+        // Scaled 1, 1, 1 (levels 3, 4, 2) at bits 0, 5 and 10.
+        assert_eq!(pack_waveform(&[3, 4, 2])[..2], [0x21, 0x04]);
+    }
+
+    #[test]
+    fn a_ramp_packs_as_telegrams_clients_pack_it() {
+        // 5-bit values 0..=31 twice, reached from levels 0..=100: each value's
+        // smallest level that rounds to it.
+        let levels: Vec<u8> = (0..64)
+            .map(|i| {
+                (0..=100u8)
+                    .find(|&l| five_bit(l) == (i % 32) as u8)
+                    .unwrap()
+            })
+            .collect();
+        let packed = pack_waveform(&levels);
+        // Computed by the tdesktop encoder (uint16 OR at byte `5i/8`, shift
+        // `5i%8`), independently of this packer.
+        let twenty = [
+            0x20, 0x88, 0x41, 0x8a, 0x39, 0x28, 0xa9, 0xc5, 0x9a, 0x7b, 0x30, 0xca, 0x49, 0xab,
+            0xbd, 0x38, 0xeb, 0xcd, 0xbb, 0xff,
+        ];
+        assert_eq!(packed.len(), 40);
+        assert_eq!(packed[..20], twenty);
+        assert_eq!(packed[20..], twenty);
+        assert_eq!(
+            unpack(&packed),
+            (0..64).map(|i| (i % 32) as u8).collect::<Vec<_>>()
+        );
+        let note = VoiceNote {
+            duration: 2,
+            levels,
+        };
+        assert_eq!(
+            note.tdlib_waveform(),
+            "IIhBijkoqcWaezDKSau9OOvNu/8giEGKOSipxZp7MMpJq7046827/w=="
+        );
+    }
+
+    #[test]
+    fn a_level_ramp_reads_back_scaled() {
+        let levels: Vec<u8> = (0..64).map(|i| ((i * 100 + 31) / 63) as u8).collect();
+        let packed = pack_waveform(&levels);
+        assert_eq!(
+            unpack(&packed),
+            levels.iter().map(|&l| five_bit(l)).collect::<Vec<_>>()
+        );
+        let note = VoiceNote {
+            duration: 2,
+            levels,
+        };
+        assert_eq!(
+            note.tdlib_waveform(),
+            "IAQhxBiElGLOOQilpNRajLXm3HsQxijlnJTWau29GOOs9d6c9969/w=="
+        );
     }
 
     #[test]
     fn display_name_is_the_basename() {
         let file = MediaFile {
             path: PathBuf::from("/outbox/item/0/Q3 report.pdf"),
-            kind: MediaKind::File,
-            width: 0,
-            height: 0,
+            presentation: Presentation::File,
         };
         assert_eq!(file.display_name(), "Q3 report.pdf");
     }

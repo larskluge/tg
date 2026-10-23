@@ -9,7 +9,7 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::credentials::tg_data_dir;
 use crate::error::{Result, TgError};
-use crate::media::{MediaFile, MediaKind};
+use crate::media::{MediaFile, Presentation};
 use crate::output::{
     ChatInfo, ContactInfo, DeliveredElement, DownloadReport, DownloadStatus, DownloadedFileResult,
     FailedElement, MediaElements, MessageContentDetails, MessageFileRef, MessageInfo,
@@ -1730,6 +1730,10 @@ async fn build_formatted_body(
 /// caller's `kind` authoritative: without it Telegram may re-read a `.jpg` sent
 /// as a file and present it as a photo, changing a payload a human already
 /// approved.
+///
+/// A voice note carries the caller's length and waveform as they are: `tg`
+/// neither probes nor transcodes the recording (Ogg Opus, mono, as TDLib
+/// documents `inputMessageVoiceNote`), and it is always the one file.
 async fn build_media_contents(
     caption: &str,
     parse_mode: Option<ParseMode>,
@@ -1737,7 +1741,9 @@ async fn build_media_contents(
     client_id: i32,
 ) -> Result<Vec<tdlib_rs::enums::InputMessageContent>> {
     use tdlib_rs::enums::{InputFile, InputMessageContent};
-    use tdlib_rs::types::{InputFileLocal, InputMessageDocument, InputMessagePhoto};
+    use tdlib_rs::types::{
+        InputFileLocal, InputMessageDocument, InputMessagePhoto, InputMessageVoiceNote,
+    };
 
     let caption = if caption.trim().is_empty() {
         None
@@ -1753,24 +1759,35 @@ async fn build_media_contents(
             let input = InputFile::Local(InputFileLocal {
                 path: file.path.to_string_lossy().into_owned(),
             });
-            match file.kind {
-                MediaKind::Photo => InputMessageContent::InputMessagePhoto(InputMessagePhoto {
-                    photo: input,
-                    thumbnail: None,
-                    added_sticker_file_ids: vec![],
-                    width: file.width,
-                    height: file.height,
-                    caption,
-                    show_caption_above_media: false,
-                    self_destruct_type: None,
-                    has_spoiler: false,
-                }),
-                MediaKind::File => {
+            match &file.presentation {
+                Presentation::Photo { width, height } => {
+                    InputMessageContent::InputMessagePhoto(InputMessagePhoto {
+                        photo: input,
+                        thumbnail: None,
+                        added_sticker_file_ids: vec![],
+                        width: *width,
+                        height: *height,
+                        caption,
+                        show_caption_above_media: false,
+                        self_destruct_type: None,
+                        has_spoiler: false,
+                    })
+                }
+                Presentation::File => {
                     InputMessageContent::InputMessageDocument(InputMessageDocument {
                         document: input,
                         thumbnail: None,
                         disable_content_type_detection: true,
                         caption,
+                    })
+                }
+                Presentation::Voice(voice) => {
+                    InputMessageContent::InputMessageVoiceNote(InputMessageVoiceNote {
+                        voice_note: input,
+                        duration: voice.duration,
+                        waveform: voice.tdlib_waveform(),
+                        caption,
+                        self_destruct_type: None,
                     })
                 }
             }
@@ -3583,6 +3600,7 @@ impl TelegramClient for TdLibClient {
                 crate::media::MAX_FILES
             )));
         }
+        crate::media::check_voice_alone(&files.iter().map(MediaFile::kind).collect::<Vec<_>>())?;
 
         let client_id = self.get_client_id().await?;
 
@@ -7936,6 +7954,89 @@ mod tdlib_parse_tests {
                 .await
                 .expect("a whitespace body is not something the markup ate");
             assert_eq!(sent_text(&content).text, "   ");
+        })
+        .await;
+    }
+
+    fn voice_file(levels: Vec<u8>) -> MediaFile {
+        MediaFile {
+            path: std::path::PathBuf::from("/outbox/42/0/voice-note.ogg"),
+            presentation: Presentation::Voice(crate::media::VoiceNote {
+                duration: 42,
+                levels,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_voice_note_is_tdlibs_voice_note_with_the_callers_measures() {
+        // What `sendMessage` hands TDLib for a voice file: its JSON is the
+        // request's `input_message_content`, so the `@type` and the base64
+        // waveform are read here as TDLib will read them.
+        with_tdlib(|cid| async move {
+            let contents = build_media_contents("", None, &[voice_file(vec![100; 64])], cid)
+                .await
+                .expect("a voice note with no caption builds");
+            assert_eq!(contents.len(), 1);
+            let tdlib_rs::enums::InputMessageContent::InputMessageVoiceNote(note) = &contents[0]
+            else {
+                panic!("expected InputMessageVoiceNote, got {:?}", contents[0]);
+            };
+            assert_eq!(note.duration, 42);
+            assert_eq!(note.waveform, "/".repeat(52) + "/w==");
+            assert!(note.caption.is_none(), "no words, no caption");
+            assert!(note.self_destruct_type.is_none());
+
+            let wire = serde_json::to_value(&contents[0]).unwrap();
+            assert_eq!(wire["@type"], "inputMessageVoiceNote");
+            assert_eq!(wire["voice_note"]["@type"], "inputFileLocal");
+            assert_eq!(wire["voice_note"]["path"], "/outbox/42/0/voice-note.ogg");
+            assert_eq!(wire["duration"], 42);
+            assert_eq!(wire["waveform"], "/".repeat(52) + "/w==");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_voice_notes_caption_is_parsed_as_any_caption() {
+        with_tdlib(|cid| async move {
+            let contents = build_media_contents(
+                "<b>listen</b>",
+                Some(ParseMode::Html),
+                &[voice_file(vec![0; 64])],
+                cid,
+            )
+            .await
+            .expect("valid HTML must parse");
+            let tdlib_rs::enums::InputMessageContent::InputMessageVoiceNote(note) = &contents[0]
+            else {
+                panic!("expected InputMessageVoiceNote, got {:?}", contents[0]);
+            };
+            let caption = note.caption.as_ref().expect("the words are its caption");
+            assert_eq!(caption.text, "listen");
+            assert_eq!(caption.entities.len(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn tdlib_reads_the_waveform_as_its_forty_bytes() {
+        // `testCallBytes` is an offline request that echoes a `bytes` field:
+        // TDLib decodes the base64 it is given and encodes the bytes it read
+        // back, so the same string returning means TDLib took the waveform as
+        // exactly the bytes we packed, as it will in `inputMessageVoiceNote`.
+        with_tdlib(|cid| async move {
+            let levels: Vec<u8> = (0..64).map(|i| ((i * 100 + 31) / 63) as u8).collect();
+            let waveform = crate::media::VoiceNote {
+                duration: 1,
+                levels,
+            }
+            .tdlib_waveform();
+            let tdlib_rs::enums::TestBytes::TestBytes(echo) =
+                tdlib_rs::functions::test_call_bytes(waveform.clone(), cid)
+                    .await
+                    .expect("TDLib answers testCallBytes offline");
+            assert_eq!(echo.value, waveform);
         })
         .await;
     }

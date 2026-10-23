@@ -274,7 +274,8 @@ recipient or identity field, a silent drop means a message delivered to the wron
 #### `send` with attachments
 
 `args.files` sends 1-10 local files as **one** Telegram message, with `args.message` as the
-caption. Omit the key entirely (or pass `null`) for a text-only send — that path is byte-identical
+caption (an empty `message` sends none). A voice note is always the one file
+([below](#a-voice-note-since-0180)). Omit the key entirely (or pass `null`) for a text-only send — that path is byte-identical
 to the pre-`files` contract, so a caller that never attaches anything needs no change.
 
 ```json
@@ -294,13 +295,15 @@ Per entry:
 | field | meaning |
 |---|---|
 | `path` | **required**, absolute, must exist and be readable *by the daemon* |
-| `kind` | `"photo"` or `"file"`; absent means `"file"` |
+| `kind` | `"photo"`, `"file"` or `"voice"` (since 0.18.0); absent means `"file"` |
 | `width`/`height` | photo pixel dimensions; `0` or absent lets Telegram work them out. Only read for `"photo"` |
+| `duration` | a voice note's length in whole seconds, 1 or more. Required for `"voice"`, refused for any other kind |
+| `waveform` | a voice note's waveform: exactly 64 integers, each 0-100, oldest first. Required for `"voice"`, refused for any other kind |
 
 `files[]` is as closed as `send` itself — an unknown key is refused:
 
 ```json
-{"id": "1", "ok": false, "error": "invalid args: unknown field `mime`, expected one of `path`, `kind`, `width`, `height`"}
+{"id": "1", "ok": false, "error": "invalid args: unknown field `mime`, expected one of `path`, `kind`, `width`, `height`, `duration`, `waveform`"}
 ```
 
 **The recipient sees the path's basename.** No TDLib input type carries a filename or a MIME
@@ -317,6 +320,10 @@ Refused in-band, with nothing sent, before any Telegram lookup:
   no single message to send; split it into two
 - a relative path, a missing file, a directory, or a file the daemon cannot open
 - a `width`/`height` on a `"file"` entry, or a negative dimension
+- a `"voice"` entry beside any other file, or any `width`/`height` on one (even `0`)
+- a `"voice"` entry without `duration` or `waveform`, a `duration` under 1, a `waveform` of other
+  than 64 levels or with a level outside 0-100 (named by its index); a `duration` or `waveform`
+  on another kind
 
 **Confirmation differs from a text send, deliberately.** A local file is uploaded *after* the send
 call returns, so `send` with `files` waits up to **300s** for Telegram to confirm every element and
@@ -396,6 +403,39 @@ caller "this was a media send".
 
 A daemon that predates attachments refuses the key loudly — "unknown field \`files\`" — and
 delivers nothing, so no capability probe is needed.
+
+##### A voice note (since 0.18.0)
+
+`"kind": "voice"` sends the file as a Telegram **voice note** (`inputMessageVoiceNote`): a play
+button with the caller's length and waveform, not a document. It is the request's only file —
+Telegram puts no voice note in an album — and may carry a caption (`message`) and a `reply_to` like
+any send:
+
+```json
+{"id": "1", "cmd": "send", "args": {
+  "id": 5550001,
+  "message": "",
+  "files": [{"path": "/outbox/42/0/voice-note.ogg", "kind": "voice", "duration": 42,
+             "waveform": [0, 4, 12, 30, 55, 71, 64, 40, 22, 35, 60, 88, 100, 92, 70, 48, 30, 18, 26, 44, 66, 80, 74, 58, 40, 28, 20, 14, 24, 38, 52, 63,
+                          70, 76, 68, 54, 42, 33, 25, 18, 12, 20, 34, 50, 62, 71, 79, 85, 77, 60, 45, 32, 22, 15, 10, 8, 12, 18, 14, 9, 6, 3, 1, 0]}]
+}}
+-> {"id": "1", "ok": true, "result": {"message_id": 900, "chat_id": 5550001,
+    "elements": {"delivered": [{"index": 0, "message_id": 900}]}}}
+```
+
+- **The recording is the caller's to make**: Ogg Opus, mono, as TDLib documents a voice note. `tg`
+  neither probes nor transcodes it (its image has no decoder), so `duration` and `waveform` are
+  taken as given and the bytes go up as they are.
+- **The waveform is scaled and packed by `tg`.** Each level 0-100 is rounded to Telegram's 0-31,
+  and the 64 values are packed 5 bits each into a little-endian bit stream, the first level in the
+  lowest bits of the first byte — 40 bytes, the layout Telegram's apps write and read — and handed
+  to TDLib in base64, as its JSON carries every `bytes` field.
+- **The answer is any media send's**: confirmed by Telegram within 300s or `ok: false`, with
+  `result.elements` for the one element.
+- A message listing reads it back as a voice note: `content_type: "voice"`, its text `[Voice: 0:42]`
+  (or `[Voice: <caption>]`), and `content` of kind `voice` with `duration_seconds` as sent.
+- A daemon older than 0.18.0 refuses it loudly, having sent nothing: "unknown field
+  \`duration\`" (or \`waveform\`, whichever key it meets first).
 
 #### `send` as a reply (since 0.7.0)
 

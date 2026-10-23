@@ -121,7 +121,7 @@ Telegram CLI client using TDLib via `tdlib-rs` with `download-tdlib` feature.
 - `credentials.rs` - API credential loading/saving (`TG_API_ID`/`TG_API_HASH` and `credentials.json`)
 - `error.rs` - Custom error types using thiserror; use `TgError` variants and `Result<T>` alias
 - `client.rs` - TDLib client wrapper with `TelegramClient` trait for mocking
-- `media.rs` - `send`'s attachments: the `SendFile` wire mirror, the validated `MediaFile`, and the one validator both go through
+- `media.rs` - `send`'s attachments: the `SendFile` wire mirror, the validated `MediaFile` with its `Presentation` (a photo's dimensions, a voice note's length and waveform, nothing for a document), the one validator both go through, and the voice note's 5-bit waveform packing
 - `output.rs` - Dual output formatting (plain text default, JSON with `--json`)
 - `reactions.rs` - Pure functions over TDLib's reaction types: `listed_reactions` (the ONE reader of `interaction_info.reactions`), `telegram_form` (which spelling of an emoji Telegram takes), `chosen_types` (what to take back)
 - `reaction_changes.rs` - The reaction changes Telegram has not answered yet, per message (`ReactionChanges`): what `react` waits on before it asks again
@@ -301,6 +301,31 @@ its caption*.
 - **A new shape does not rewrite what Mycelium already holds.** It keys a Telegram message on
   `tg:<chat>:<message>:<edit_date>` and records a message again only when that changes, so a
   message ingested before the change keeps its old body until it is edited.
+
+**Sending a voice note (`files[].kind: "voice"`, since 0.18.0):** for Tavola's voice recording
+(tavola-qdwo), through Postmaster's send; ticket tg-a2e. The contract is in `README.md` → *A voice
+note*. What the code relies on, read from `td_api.tl` (tdlib-rs 1.3.0) and Telegram's clients, not
+measured: **no test and no agent sends a real voice note.**
+
+- **`inputMessageVoiceNote.waveform` is `bytes`, which tdlib-rs types as `String`**: TDLib's JSON
+  carries every `bytes` field in standard base64 with padding. `VoiceNote::tdlib_waveform` is the
+  one writer. `tdlib_reads_the_waveform_as_its_forty_bytes` hands it to TDLib's offline
+  `testCallBytes`, which answers before `setTdlibParameters` like the static requests above and
+  echoes the bytes it decoded, so the same string returning proves TDLib reads our base64.
+- **The 5-bit layout is the clients', not TDLib's**: TDLib passes the waveform to Telegram as
+  given. Value `i` sits at bit `5 * i` of a little-endian stream (tdesktop's
+  `documentWaveformEncode5bit` ORs a `uint16` at byte `5i/8` shifted by `5i%8`; Android's
+  `getWaveform2` the same with an `int32`), so 64 levels are 40 bytes and the first level is the
+  low 5 bits of byte 0. Telegram's apps make 100 values; any count reads, the apps resample.
+  Levels 0-100 are rounded to 0-31 (`five_bit`). The test vectors (silence, full loudness, two
+  ramps) were computed by a separate implementation of tdesktop's encoder.
+- **Nothing is probed or transcoded**: the image has no ffmpeg. `duration` and `waveform` are the
+  caller's, both required, so no voice note goes out as `0:00` with a flat line.
+- **Never in an album**: `check_voice_alone` refuses a voice entry beside any other file, in
+  `validate_files` and again in `send_media_message` (the trait is public).
+- **It reads back as a voice note**: TDLib keeps the content it was given, so the sent message is
+  `MessageVoiceNote`, which `extract_message_data` lists as `content_type: "voice"` with
+  `[Voice: m:ss]` (or the caption) and `duration_seconds`, as Mycelium reads every other voice note.
 
 **TDLib `getChatMessageByDate` direction:** It returns the last message sent **no later than** the given date — the returned message's date is always `<= date` — and a **404** when the chat has no such message. It does not find the first message *after* a date. To turn a `--since-utc` cutoff into a fetch boundary, probe at `cutoff - 1` and use the returned message's `id + 1` as an exclusive lower bound (`boundary_probe_date` / `boundary_from_probe` in `client.rs`). Reading it as "at or after the date" makes the lookup silently never match.
 
