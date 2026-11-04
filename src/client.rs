@@ -9,11 +9,12 @@ use tokio::sync::{Mutex, broadcast};
 
 use crate::credentials::tg_data_dir;
 use crate::error::{Result, TgError};
+use crate::marks;
 use crate::media::{MediaFile, Presentation};
 use crate::output::{
     ChatInfo, ContactInfo, DeliveredElement, DownloadReport, DownloadStatus, DownloadedFileResult,
     FailedElement, MediaElements, MessageContentDetails, MessageFileRef, MessageInfo,
-    MessageReactionInfo, PartialSendResult, ReactionSender, SendResult,
+    MessageReactionInfo, PartialSendResult, ReactionSender, SendResult, TextMark,
 };
 use crate::parse_mode::ParseMode;
 use crate::reaction_changes::{Answer, Answered, ReactionChange, ReactionChanges};
@@ -825,6 +826,7 @@ impl TdLibClient {
             sender,
             sender_is_bot,
             text: extracted.text,
+            marks: extracted.marks,
             date: format_timestamp(msg.date),
             timestamp: msg.date,
             is_outgoing: msg.is_outgoing,
@@ -1094,10 +1096,10 @@ impl TdLibClient {
             match receiver.recv().await {
                 Ok(update) => {
                     // Track connection state updates that arrive during auth
-                    if let Update::ConnectionState(ref cs) = update {
-                        if matches!(cs.state, ConnectionState::Ready) {
-                            connection_ready = true;
-                        }
+                    if let Update::ConnectionState(ref cs) = update
+                        && matches!(cs.state, ConnectionState::Ready)
+                    {
+                        connection_ready = true;
                     }
                     if let Update::AuthorizationState(state) = update {
                         match state.authorization_state {
@@ -1470,12 +1472,12 @@ where
                 continue;
             }
 
-            if let Ok(chat) = source.fetch_chat_snapshot(chat_id).await {
-                if filter(&chat) {
-                    result.push(chat.to_chat_info());
-                    if result.len() as i32 >= limit {
-                        return Ok(result);
-                    }
+            if let Ok(chat) = source.fetch_chat_snapshot(chat_id).await
+                && filter(&chat)
+            {
+                result.push(chat.to_chat_info());
+                if result.len() as i32 >= limit {
+                    return Ok(result);
                 }
             }
         }
@@ -1821,6 +1823,21 @@ fn media_summary(summary: impl AsRef<str>) -> String {
     format!("[{}]", summary.as_ref())
 }
 
+/// A caption in its bracket, `Label: <caption>`, with the marks of its
+/// entities placed behind the bracket's opening (`[Label: `). `None` without a
+/// caption: whitespace alone is none. The label is written here once, for the
+/// text and for the marks' offset.
+fn captioned(
+    label: &str,
+    formatted: &tdlib_rs::types::FormattedText,
+    caption: &Option<String>,
+) -> Option<(String, Vec<TextMark>)> {
+    let caption = caption.as_ref()?;
+    let text = format!("{label}: {caption}");
+    // `media_summary` puts "[" before the text.
+    Some((text, marks::marks(formatted, label.len() + ": ".len() + 1)))
+}
+
 fn sticker_format_extension(format: &tdlib_rs::enums::StickerFormat) -> &'static str {
     match format {
         tdlib_rs::enums::StickerFormat::Webp => "webp",
@@ -1873,6 +1890,8 @@ fn message_file_ref(
 #[derive(Debug, Clone)]
 struct ExtractedMessageData {
     text: String,
+    /// The formatting of `text`, from the entities of its words or caption.
+    marks: Vec<TextMark>,
     content_type: Option<String>,
     is_downloadable: bool,
     download_files: Vec<MessageFileRef>,
@@ -1902,6 +1921,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         MessageContent::MessageText(t) => {
             let text = t.text.text.clone();
             ExtractedMessageData {
+                marks: marks::marks(&t.text, 0),
                 text: if text.is_empty() {
                     "[Text]".to_string()
                 } else {
@@ -1930,14 +1950,17 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                     Some("image/jpeg".to_string()),
                 ));
             }
-            let text = if let Some(c) = &caption {
-                format!("Photo: {c}")
+            let mut marks = vec![];
+            let text = if let Some((text, found)) = captioned("Photo", &p.caption, &caption) {
+                marks = found;
+                text
             } else if let (Some(w), Some(h)) = (width, height) {
                 format!("Photo: {w}x{h}")
             } else {
                 "Photo".to_string()
             };
             ExtractedMessageData {
+                marks,
                 text: media_summary(text),
                 content_type: Some("photo".to_string()),
                 is_downloadable: !files.is_empty(),
@@ -1953,8 +1976,10 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         }
         MessageContent::MessageVideo(v) => {
             let caption = non_empty(&v.caption.text);
-            let text = if let Some(c) = &caption {
-                format!("Video: {c}")
+            let mut marks = vec![];
+            let text = if let Some((text, found)) = captioned("Video", &v.caption, &caption) {
+                marks = found;
+                text
             } else {
                 format!(
                     "Video: {}x{} {}",
@@ -1971,6 +1996,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 non_empty(&v.video.mime_type),
             )];
             ExtractedMessageData {
+                marks,
                 text: media_summary(text),
                 content_type: Some("video".to_string()),
                 is_downloadable: true,
@@ -1991,10 +2017,14 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         MessageContent::MessageDocument(d) => {
             let caption = non_empty(&d.caption.text);
             let display_name = non_empty(&d.document.file_name);
-            let text = match (&caption, &display_name) {
-                (Some(c), _) => format!("Document: {c}"),
-                (None, Some(name)) => format!("Document: {name}"),
-                _ => "Document".to_string(),
+            let mut marks = vec![];
+            let text = if let Some((text, found)) = captioned("Document", &d.caption, &caption) {
+                marks = found;
+                text
+            } else if let Some(name) = &display_name {
+                format!("Document: {name}")
+            } else {
+                "Document".to_string()
             };
             let files = vec![message_file_ref(
                 &d.document.document,
@@ -2004,6 +2034,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 non_empty(&d.document.mime_type),
             )];
             ExtractedMessageData {
+                marks,
                 text: media_summary(text),
                 content_type: Some("document".to_string()),
                 is_downloadable: true,
@@ -2030,6 +2061,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 None,
             )];
             ExtractedMessageData {
+                marks: vec![],
                 text: media_summary(text),
                 content_type: Some("sticker".to_string()),
                 is_downloadable: true,
@@ -2046,8 +2078,10 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             let caption = non_empty(&a.caption.text);
             let title = non_empty(&a.audio.title);
             let performer = non_empty(&a.audio.performer);
-            let text = if let Some(c) = &caption {
-                format!("Audio: {c}")
+            let mut marks = vec![];
+            let text = if let Some((text, found)) = captioned("Audio", &a.caption, &caption) {
+                marks = found;
+                text
             } else {
                 let label = title
                     .clone()
@@ -2063,6 +2097,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 non_empty(&a.audio.mime_type),
             )];
             ExtractedMessageData {
+                marks,
                 text: media_summary(text),
                 content_type: Some("audio".to_string()),
                 is_downloadable: true,
@@ -2079,8 +2114,10 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         }
         MessageContent::MessageVoiceNote(v) => {
             let caption = non_empty(&v.caption.text);
-            let text = if let Some(c) = &caption {
-                format!("Voice: {c}")
+            let mut marks = vec![];
+            let text = if let Some((text, found)) = captioned("Voice", &v.caption, &caption) {
+                marks = found;
+                text
             } else {
                 format!("Voice: {}", format_duration(v.voice_note.duration))
             };
@@ -2092,6 +2129,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 non_empty(&v.voice_note.mime_type),
             )];
             ExtractedMessageData {
+                marks,
                 text: media_summary(text),
                 content_type: Some("voice".to_string()),
                 is_downloadable: true,
@@ -2106,8 +2144,10 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         }
         MessageContent::MessageAnimation(a) => {
             let caption = non_empty(&a.caption.text);
-            let text = if let Some(c) = &caption {
-                format!("Animation: {c}")
+            let mut marks = vec![];
+            let text = if let Some((text, found)) = captioned("Animation", &a.caption, &caption) {
+                marks = found;
+                text
             } else {
                 format!(
                     "Animation: {}x{} {}",
@@ -2124,6 +2164,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 non_empty(&a.animation.mime_type),
             )];
             ExtractedMessageData {
+                marks,
                 text: media_summary(text),
                 content_type: Some("animation".to_string()),
                 is_downloadable: true,
@@ -2150,6 +2191,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 Some("video/mp4".to_string()),
             )];
             ExtractedMessageData {
+                marks: vec![],
                 text: media_summary(text),
                 content_type: Some("video_note".to_string()),
                 is_downloadable: true,
@@ -2168,6 +2210,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 l.location.latitude, l.location.longitude
             );
             ExtractedMessageData {
+                marks: vec![],
                 text: media_summary(text),
                 content_type: Some("location".to_string()),
                 is_downloadable: false,
@@ -2191,6 +2234,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             };
             let text = format!("Contact: {} ({})", full_name, c.contact.phone_number);
             ExtractedMessageData {
+                marks: vec![],
                 text: media_summary(text),
                 content_type: Some("contact".to_string()),
                 is_downloadable: false,
@@ -2244,6 +2288,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             let emoji_text = emoji.clone().unwrap_or_else(|| "emoji".to_string());
             let text = media_summary(format!("Emoji: {emoji_text}"));
             ExtractedMessageData {
+                marks: vec![],
                 text,
                 content_type: Some("emoji".to_string()),
                 is_downloadable: !files.is_empty(),
@@ -2266,6 +2311,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             };
             let text = format!("Poll: {}", p.poll.question.text);
             ExtractedMessageData {
+                marks: vec![],
                 text: media_summary(text),
                 content_type: Some("poll".to_string()),
                 is_downloadable: false,
@@ -2297,6 +2343,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 format!("{kind} ({discard_reason})")
             };
             ExtractedMessageData {
+                marks: vec![],
                 text,
                 content_type: Some("call".to_string()),
                 is_downloadable: false,
@@ -2309,6 +2356,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }
         }
         MessageContent::MessageContactRegistered => ExtractedMessageData {
+            marks: vec![],
             text: "Contact registered".to_string(),
             content_type: Some("contact_registered".to_string()),
             is_downloadable: false,
@@ -2318,6 +2366,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         MessageContent::MessageVenue(v) => {
             let text = format!("Venue: {}, {}", v.venue.title, v.venue.address);
             ExtractedMessageData {
+                marks: vec![],
                 text,
                 content_type: Some("venue".to_string()),
                 is_downloadable: false,
@@ -2332,6 +2381,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }
         }
         MessageContent::MessagePinMessage(p) => ExtractedMessageData {
+            marks: vec![],
             text: "Pinned a message".to_string(),
             content_type: Some("pin_message".to_string()),
             is_downloadable: false,
@@ -2343,6 +2393,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         MessageContent::MessageGiftedPremium(g) => {
             let text = format!("Gifted Premium ({} months)", g.month_count);
             ExtractedMessageData {
+                marks: vec![],
                 text,
                 content_type: Some("gifted_premium".to_string()),
                 is_downloadable: false,
@@ -2358,6 +2409,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         MessageContent::MessageDice(d) => {
             let text = format!("Dice: {} (value: {})", d.emoji, d.value);
             ExtractedMessageData {
+                marks: vec![],
                 text,
                 content_type: Some("dice".to_string()),
                 is_downloadable: false,
@@ -2371,6 +2423,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         MessageContent::MessageGame(g) => {
             let text = format!("Game: {}", g.game.title);
             ExtractedMessageData {
+                marks: vec![],
                 text,
                 content_type: Some("game".to_string()),
                 is_downloadable: false,
@@ -2385,6 +2438,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         MessageContent::MessageStory(s) => {
             let text = format!("Story from chat {}", s.story_poster_chat_id);
             ExtractedMessageData {
+                marks: vec![],
                 text,
                 content_type: Some("story".to_string()),
                 is_downloadable: false,
@@ -2402,6 +2456,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                 inv.product_info.title, inv.total_amount, inv.currency
             );
             ExtractedMessageData {
+                marks: vec![],
                 text,
                 content_type: Some("invoice".to_string()),
                 is_downloadable: false,
@@ -2415,6 +2470,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }
         }
         MessageContent::MessageVideoChatScheduled(v) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Video chat scheduled (start: {})", v.start_date),
             content_type: Some("video_chat_scheduled".to_string()),
             is_downloadable: false,
@@ -2425,6 +2481,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageVideoChatStarted(v) => ExtractedMessageData {
+            marks: vec![],
             text: "Video chat started".to_string(),
             content_type: Some("video_chat_started".to_string()),
             is_downloadable: false,
@@ -2434,6 +2491,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageVideoChatEnded(v) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Video chat ended ({}s)", v.duration),
             content_type: Some("video_chat_ended".to_string()),
             is_downloadable: false,
@@ -2443,6 +2501,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageInviteVideoChatParticipants(v) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Invited {} participants to video chat", v.user_ids.len()),
             content_type: Some("invite_video_chat_participants".to_string()),
             is_downloadable: false,
@@ -2453,6 +2512,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageBasicGroupChatCreate(g) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Group created: {}", g.title),
             content_type: Some("group_created".to_string()),
             is_downloadable: false,
@@ -2463,6 +2523,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageSupergroupChatCreate(g) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Supergroup created: {}", g.title),
             content_type: Some("supergroup_created".to_string()),
             is_downloadable: false,
@@ -2472,6 +2533,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatChangeTitle(t) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Chat title changed to: {}", t.title),
             content_type: Some("chat_change_title".to_string()),
             is_downloadable: false,
@@ -2481,6 +2543,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatChangePhoto(_) => ExtractedMessageData {
+            marks: vec![],
             text: "Chat photo changed".to_string(),
             content_type: Some("chat_change_photo".to_string()),
             is_downloadable: false,
@@ -2488,6 +2551,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ChatChangePhoto {}),
         },
         MessageContent::MessageChatDeletePhoto => ExtractedMessageData {
+            marks: vec![],
             text: "Chat photo deleted".to_string(),
             content_type: Some("chat_delete_photo".to_string()),
             is_downloadable: false,
@@ -2495,6 +2559,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ChatDeletePhoto {}),
         },
         MessageContent::MessageChatAddMembers(m) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Members added: {:?}", m.member_user_ids),
             content_type: Some("members_added".to_string()),
             is_downloadable: false,
@@ -2504,6 +2569,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatJoinByLink => ExtractedMessageData {
+            marks: vec![],
             text: "Joined by invite link".to_string(),
             content_type: Some("chat_join_by_link".to_string()),
             is_downloadable: false,
@@ -2511,6 +2577,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ChatJoinByLink {}),
         },
         MessageContent::MessageChatJoinByRequest => ExtractedMessageData {
+            marks: vec![],
             text: "Joined by request".to_string(),
             content_type: Some("chat_join_by_request".to_string()),
             is_downloadable: false,
@@ -2518,6 +2585,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ChatJoinByRequest {}),
         },
         MessageContent::MessageChatDeleteMember(m) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Member removed: {}", m.user_id),
             content_type: Some("chat_delete_member".to_string()),
             is_downloadable: false,
@@ -2525,6 +2593,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ChatDeleteMember { user_id: m.user_id }),
         },
         MessageContent::MessageChatUpgradeTo(u) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Upgraded to supergroup {}", u.supergroup_id),
             content_type: Some("chat_upgrade_to".to_string()),
             is_downloadable: false,
@@ -2534,6 +2603,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatUpgradeFrom(u) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Upgraded from basic group: {}", u.title),
             content_type: Some("chat_upgrade_from".to_string()),
             is_downloadable: false,
@@ -2544,6 +2614,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageScreenshotTaken => ExtractedMessageData {
+            marks: vec![],
             text: "Screenshot taken".to_string(),
             content_type: Some("screenshot_taken".to_string()),
             is_downloadable: false,
@@ -2551,6 +2622,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ScreenshotTaken {}),
         },
         MessageContent::MessageChatSetBackground(b) => ExtractedMessageData {
+            marks: vec![],
             text: "Chat background changed".to_string(),
             content_type: Some("chat_set_background".to_string()),
             is_downloadable: false,
@@ -2561,6 +2633,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatSetTheme(t) => ExtractedMessageData {
+            marks: vec![],
             text: match &t.theme {
                 Some(_) => format!("Chat theme set to: {:?}", t.theme),
                 None => "Chat theme reset".to_string(),
@@ -2573,6 +2646,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatSetMessageAutoDeleteTime(t) => ExtractedMessageData {
+            marks: vec![],
             text: if t.message_auto_delete_time == 0 {
                 "Auto-delete timer disabled".to_string()
             } else {
@@ -2587,6 +2661,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatBoost(b) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Chat boosted ({} boosts)", b.boost_count),
             content_type: Some("chat_boost".to_string()),
             is_downloadable: false,
@@ -2596,6 +2671,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageForumTopicCreated(t) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Forum topic created: {}", t.name),
             content_type: Some("forum_topic_created".to_string()),
             is_downloadable: false,
@@ -2605,6 +2681,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageForumTopicEdited(t) => ExtractedMessageData {
+            marks: vec![],
             text: if t.name.is_empty() {
                 "Forum topic edited".to_string()
             } else {
@@ -2620,6 +2697,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageForumTopicIsClosedToggled(t) => ExtractedMessageData {
+            marks: vec![],
             text: if t.is_closed {
                 "Forum topic closed".to_string()
             } else {
@@ -2633,6 +2711,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageForumTopicIsHiddenToggled(t) => ExtractedMessageData {
+            marks: vec![],
             text: if t.is_hidden {
                 "Forum topic hidden".to_string()
             } else {
@@ -2646,6 +2725,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageSuggestProfilePhoto(_) => ExtractedMessageData {
+            marks: vec![],
             text: "Profile photo suggested".to_string(),
             content_type: Some("suggest_profile_photo".to_string()),
             is_downloadable: false,
@@ -2653,6 +2733,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::SuggestProfilePhoto {}),
         },
         MessageContent::MessageCustomServiceAction(a) => ExtractedMessageData {
+            marks: vec![],
             text: a.text.clone(),
             content_type: Some("custom_service_action".to_string()),
             is_downloadable: false,
@@ -2662,6 +2743,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageGameScore(g) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Game score: {}", g.score),
             content_type: Some("game_score".to_string()),
             is_downloadable: false,
@@ -2673,6 +2755,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessagePaymentSuccessful(p) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Payment: {} {}", p.total_amount, p.currency),
             content_type: Some("payment_successful".to_string()),
             is_downloadable: false,
@@ -2687,6 +2770,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessagePremiumGiftCode(g) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Premium gift code ({} months)", g.month_count),
             content_type: Some("premium_gift_code".to_string()),
             is_downloadable: false,
@@ -2701,6 +2785,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageGiveawayCreated(_) => ExtractedMessageData {
+            marks: vec![],
             text: "Premium giveaway created".to_string(),
             content_type: Some("premium_giveaway_created".to_string()),
             is_downloadable: false,
@@ -2708,6 +2793,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::GiveawayCreated {}),
         },
         MessageContent::MessageGiveaway(g) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Premium giveaway ({} winners)", g.winner_count),
             content_type: Some("premium_giveaway".to_string()),
             is_downloadable: false,
@@ -2717,6 +2803,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageGiveawayCompleted(g) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Premium giveaway completed ({} winners)", g.winner_count),
             content_type: Some("premium_giveaway_completed".to_string()),
             is_downloadable: false,
@@ -2728,6 +2815,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageGiveawayWinners(g) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Premium giveaway winners ({} winners)", g.winner_count),
             content_type: Some("premium_giveaway_winners".to_string()),
             is_downloadable: false,
@@ -2741,6 +2829,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageUsersShared(u) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Users shared ({} users)", u.users.len()),
             content_type: Some("users_shared".to_string()),
             is_downloadable: false,
@@ -2750,6 +2839,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatShared(c) => ExtractedMessageData {
+            marks: vec![],
             text: "Chat shared".to_string(),
             content_type: Some("chat_shared".to_string()),
             is_downloadable: false,
@@ -2759,6 +2849,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageBotWriteAccessAllowed(_) => ExtractedMessageData {
+            marks: vec![],
             text: "Bot write access allowed".to_string(),
             content_type: Some("bot_write_access_allowed".to_string()),
             is_downloadable: false,
@@ -2766,6 +2857,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::BotWriteAccessAllowed {}),
         },
         MessageContent::MessageWebAppDataSent(w) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Web app data sent: {}", w.button_text),
             content_type: Some("web_app_data_sent".to_string()),
             is_downloadable: false,
@@ -2775,6 +2867,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessagePassportDataSent(_) => ExtractedMessageData {
+            marks: vec![],
             text: "Passport data sent".to_string(),
             content_type: Some("passport_data_sent".to_string()),
             is_downloadable: false,
@@ -2782,6 +2875,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::PassportDataSent {}),
         },
         MessageContent::MessageProximityAlertTriggered(p) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Proximity alert ({}m)", p.distance),
             content_type: Some("proximity_alert_triggered".to_string()),
             is_downloadable: false,
@@ -2791,6 +2885,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageExpiredPhoto => ExtractedMessageData {
+            marks: vec![],
             text: "Expired photo".to_string(),
             content_type: Some("expired_photo".to_string()),
             is_downloadable: false,
@@ -2798,6 +2893,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ExpiredPhoto {}),
         },
         MessageContent::MessageExpiredVideo => ExtractedMessageData {
+            marks: vec![],
             text: "Expired video".to_string(),
             content_type: Some("expired_video".to_string()),
             is_downloadable: false,
@@ -2805,6 +2901,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ExpiredVideo {}),
         },
         MessageContent::MessageExpiredVideoNote => ExtractedMessageData {
+            marks: vec![],
             text: "Expired video note".to_string(),
             content_type: Some("expired_video_note".to_string()),
             is_downloadable: false,
@@ -2812,6 +2909,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::ExpiredVideoNote {}),
         },
         MessageContent::MessageExpiredVoiceNote => ExtractedMessageData {
+            marks: vec![],
             text: "Expired voice note".to_string(),
             content_type: Some("expired_voice_note".to_string()),
             is_downloadable: false,
@@ -2829,9 +2927,10 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             } else if g.was_missed {
                 format!("{kind} (missed)")
             } else {
-                format!("{kind}")
+                kind.to_string()
             };
             ExtractedMessageData {
+                marks: vec![],
                 text,
                 content_type: Some("group_call".to_string()),
                 is_downloadable: false,
@@ -2843,6 +2942,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }
         }
         MessageContent::MessageGiftedStars(g) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Gifted {} stars", g.star_count),
             content_type: Some("gifted_stars".to_string()),
             is_downloadable: false,
@@ -2856,12 +2956,15 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         MessageContent::MessagePaidMedia(p) => {
             // Its measure is its price: the media stay hidden until bought.
             let caption = non_empty(&p.caption.text);
-            let text = if let Some(c) = &caption {
-                format!("Paid media: {c}")
+            let mut marks = vec![];
+            let text = if let Some((text, found)) = captioned("Paid media", &p.caption, &caption) {
+                marks = found;
+                text
             } else {
                 format!("Paid media: {} stars", p.star_count)
             };
             ExtractedMessageData {
+                marks,
                 text: media_summary(text),
                 content_type: Some("paid_media".to_string()),
                 is_downloadable: false,
@@ -2873,6 +2976,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }
         }
         MessageContent::MessageGift(_) => ExtractedMessageData {
+            marks: vec![],
             text: "Gift".to_string(),
             content_type: Some("gift".to_string()),
             is_downloadable: false,
@@ -2880,6 +2984,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             content: Some(MessageContentDetails::Gift {}),
         },
         MessageContent::MessageGiveawayPrizeStars(g) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Giveaway prize: {} stars", g.star_count),
             content_type: Some("giveaway_prize_stars".to_string()),
             is_downloadable: false,
@@ -2890,6 +2995,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatOwnerChanged(o) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Chat owner changed to user {}", o.new_owner_user_id),
             content_type: Some("chat_owner_changed".to_string()),
             is_downloadable: false,
@@ -2899,6 +3005,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessageChatOwnerLeft(o) => ExtractedMessageData {
+            marks: vec![],
             text: "Chat owner left".to_string(),
             content_type: Some("chat_owner_left".to_string()),
             is_downloadable: false,
@@ -2908,6 +3015,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
             }),
         },
         MessageContent::MessagePaymentRefunded(r) => ExtractedMessageData {
+            marks: vec![],
             text: format!("Payment refunded ({} {})", r.total_amount, r.currency),
             content_type: Some("payment_refunded".to_string()),
             is_downloadable: false,
@@ -2920,6 +3028,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         MessageContent::MessageUnsupported => {
             let tdlib_type = "messageUnsupported".to_string();
             ExtractedMessageData {
+                marks: vec![],
                 text: "[Unsupported]".to_string(),
                 content_type: Some("unsupported".to_string()),
                 is_downloadable: false,
@@ -2930,6 +3039,7 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
         other => {
             let tdlib_type = tdlib_type_name(other);
             ExtractedMessageData {
+                marks: vec![],
                 text: format!("[{}]", tdlib_type),
                 content_type: Some("unsupported".to_string()),
                 is_downloadable: false,
@@ -3515,10 +3625,10 @@ impl TelegramClient for TdLibClient {
                             .replying(confirmed_reply(&msg_update.message, reply_to)));
                         }
                     }
-                    Update::MessageSendFailed(msg_update) => {
-                        if msg_update.old_message_id == local_message_id {
-                            return Err(TgError::TdLib(msg_update.error.message));
-                        }
+                    Update::MessageSendFailed(msg_update)
+                        if msg_update.old_message_id == local_message_id =>
+                    {
+                        return Err(TgError::TdLib(msg_update.error.message));
                     }
                     _ => {}
                 },
@@ -4571,6 +4681,7 @@ pub mod mock {
                         sender: "John Doe".to_string(),
                         sender_is_bot: Some(false),
                         text: "Hello!".to_string(),
+                        marks: vec![],
                         date: "1h ago".to_string(),
                         timestamp: 0,
                         is_outgoing: false,
@@ -4589,6 +4700,7 @@ pub mod mock {
                         sender: "You".to_string(),
                         sender_is_bot: Some(false),
                         text: "Hi there!".to_string(),
+                        marks: vec![],
                         date: "30m ago".to_string(),
                         timestamp: 0,
                         is_outgoing: true,
@@ -5586,6 +5698,135 @@ mod tests {
         })
     }
 
+    // The marks of the one writer (AGENTS.md, *A message's `text`*).
+
+    fn bold_over(text: &str, word: &str) -> tdlib_rs::types::FormattedText {
+        let start = text.find(word).expect("word in text");
+        let offset = text[..start].encode_utf16().count() as i32;
+        tdlib_rs::types::FormattedText {
+            text: text.to_string(),
+            entities: vec![tdlib_rs::types::TextEntity {
+                offset,
+                length: word.encode_utf16().count() as i32,
+                r#type: tdlib_rs::enums::TextEntityType::Bold,
+            }],
+        }
+    }
+
+    fn assert_one_bold(extracted: &ExtractedMessageData, prefix: &str, word: &str) {
+        assert_eq!(extracted.marks.len(), 1, "text: {}", extracted.text);
+        let mark = &extracted.marks[0];
+        assert_eq!(mark.kind, crate::output::MarkKind::Bold);
+        assert_eq!(&extracted.text[mark.at..mark.at + mark.len], word);
+        assert!(mark.at >= prefix.len());
+        assert!(extracted.text.starts_with(prefix));
+    }
+
+    #[test]
+    fn a_texts_marks_are_written_beside_it() {
+        use tdlib_rs::enums::MessageContent;
+        let content = MessageContent::MessageText(tdlib_rs::types::MessageText {
+            text: bold_over("See you Saturday", "Saturday"),
+            link_preview: None,
+            link_preview_options: None,
+        });
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.text, "See you Saturday");
+        assert_eq!(
+            serde_json::to_string(&extracted.marks).unwrap(),
+            r#"[{"k":"bold","at":8,"len":8}]"#
+        );
+    }
+
+    #[test]
+    fn a_captions_marks_shift_by_its_bracket() {
+        use tdlib_rs::enums::MessageContent as C;
+        let caption = || bold_over("Ciao à tutti 🙂 domani", "domani");
+        let with_caption = |mut content: C| {
+            match &mut content {
+                C::MessageAudio(m) => m.caption = caption(),
+                C::MessageVoiceNote(m) => m.caption = caption(),
+                C::MessageAnimation(m) => m.caption = caption(),
+                C::MessagePaidMedia(m) => m.caption = caption(),
+                other => panic!("no caption to set on {other:?}"),
+            }
+            content
+        };
+        let cases: Vec<(C, &str)> = vec![
+            (
+                C::MessagePhoto(tdlib_rs::types::MessagePhoto {
+                    caption: caption(),
+                    ..Default::default()
+                }),
+                "[Photo: ",
+            ),
+            (
+                C::MessageVideo(tdlib_rs::types::MessageVideo {
+                    video: tdlib_rs::types::Video {
+                        duration: 14,
+                        width: 1280,
+                        height: 720,
+                        file_name: String::new(),
+                        mime_type: "video/mp4".to_string(),
+                        has_stickers: false,
+                        supports_streaming: true,
+                        minithumbnail: None,
+                        thumbnail: None,
+                        video: file(3, "/tmp/clip.mp4"),
+                    },
+                    alternative_videos: vec![],
+                    storyboards: vec![],
+                    cover: None,
+                    start_timestamp: 0,
+                    caption: caption(),
+                    show_caption_above_media: false,
+                    has_spoiler: false,
+                    is_secret: false,
+                }),
+                "[Video: ",
+            ),
+            (
+                C::MessageDocument(tdlib_rs::types::MessageDocument {
+                    document: tdlib_rs::types::Document {
+                        file_name: "plan.pdf".to_string(),
+                        mime_type: "application/pdf".to_string(),
+                        minithumbnail: None,
+                        thumbnail: None,
+                        document: file(4, "/tmp/plan.pdf"),
+                    },
+                    caption: caption(),
+                }),
+                "[Document: ",
+            ),
+            (with_caption(audio("x")), "[Audio: "),
+            (with_caption(voice("x")), "[Voice: "),
+            (with_caption(animation("x")), "[Animation: "),
+            (with_caption(paid_media("x")), "[Paid media: "),
+        ];
+        for (content, prefix) in cases {
+            assert_one_bold(&extract_message_data(&content), prefix, "domani");
+        }
+    }
+
+    #[test]
+    fn a_blank_caption_has_no_marks() {
+        let blank = tdlib_rs::types::FormattedText {
+            text: " \n".to_string(),
+            entities: vec![tdlib_rs::types::TextEntity {
+                offset: 0,
+                length: 1,
+                r#type: tdlib_rs::enums::TextEntityType::Bold,
+            }],
+        };
+        let mut content = voice("");
+        if let tdlib_rs::enums::MessageContent::MessageVoiceNote(v) = &mut content {
+            v.caption = blank;
+        }
+        let extracted = extract_message_data(&content);
+        assert_eq!(extracted.text, "[Voice: 0:42]");
+        assert!(extracted.marks.is_empty());
+    }
+
     #[test]
     fn paid_medias_text_is_its_caption_else_its_price() {
         let captioned = extract_message_data(&paid_media("The whole set from Saturday"));
@@ -6124,6 +6365,7 @@ mod tests {
             sender: "Alice".to_string(),
             sender_is_bot: Some(false),
             text: format!("msg {id}"),
+            marks: vec![],
             date: "1h ago".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -7520,11 +7762,10 @@ mod tests {
         loop {
             match receiver.recv().await {
                 Ok(update) => {
-                    if let Update::AuthorizationState(state) = update {
-                        match state.authorization_state {
-                            AuthorizationState::Ready => return Ok(()),
-                            _ => {}
-                        }
+                    if let Update::AuthorizationState(state) = update
+                        && state.authorization_state == AuthorizationState::Ready
+                    {
+                        return Ok(());
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
@@ -7581,10 +7822,10 @@ mod tests {
             loop {
                 match receiver.recv().await {
                     Ok(update) => {
-                        if let Update::AuthorizationState(state) = update {
-                            if matches!(state.authorization_state, AuthorizationState::Ready) {
-                                return Ok(());
-                            }
+                        if let Update::AuthorizationState(state) = update
+                            && matches!(state.authorization_state, AuthorizationState::Ready)
+                        {
+                            return Ok(());
                         }
                     }
                     // No Lagged handler — this is the bug

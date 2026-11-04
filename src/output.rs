@@ -107,16 +107,14 @@ fn strip_ansi(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\u{1b}' {
-            if chars.peek() == Some(&'[') {
-                let _ = chars.next();
-                while let Some(next) = chars.next() {
-                    if next == 'm' {
-                        break;
-                    }
+        if ch == '\u{1b}' && chars.peek() == Some(&'[') {
+            let _ = chars.next();
+            for next in chars.by_ref() {
+                if next == 'm' {
+                    break;
                 }
-                continue;
             }
+            continue;
         }
         result.push(ch);
     }
@@ -756,6 +754,30 @@ pub struct MessageReactionInfo {
     pub recent_senders: Vec<ReactionSender>,
 }
 
+/// One piece of a message's formatting, over the `text` tg writes beside it:
+/// `at` and `len` count UTF-8 bytes of that `text`, `kind` is one of `link`,
+/// `bold`, `italic`, `strike` and `code`, and `url` is a link's address alone
+/// (AGENTS.md, *A message's `text`*).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextMark {
+    #[serde(rename = "k")]
+    pub kind: MarkKind,
+    pub at: usize,
+    pub len: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MarkKind {
+    Link,
+    Bold,
+    Italic,
+    Strike,
+    Code,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageInfo {
     pub id: i64,
@@ -774,6 +796,11 @@ pub struct MessageInfo {
     /// measures' place (`[Voice: 0:42]`, `[Voice: <caption>]`). Consumers store
     /// it as the message's body: README → *A message's `text`, and its caption*.
     pub text: String,
+    /// The formatting of `text` as Telegram's entities give it: bold, italic,
+    /// strikethrough, code and link words, in bytes of `text`. Absent when
+    /// there is none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<TextMark>,
     pub date: String,
     #[serde(skip)]
     pub timestamp: i32,
@@ -1251,6 +1278,7 @@ mod tests {
             sender: "John".to_string(),
             sender_is_bot: Some(false),
             text: "Hello!".to_string(),
+            marks: vec![],
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1278,6 +1306,7 @@ mod tests {
             sender: "Me".to_string(),
             sender_is_bot: Some(false),
             text: "Hi there!".to_string(),
+            marks: vec![],
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
             is_outgoing: true,
@@ -1303,6 +1332,7 @@ mod tests {
             sender: "BotFather".to_string(),
             sender_is_bot: Some(true),
             text: "/start".to_string(),
+            marks: vec![],
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1328,6 +1358,7 @@ mod tests {
             sender: "Unknown".to_string(),
             sender_is_bot: None,
             text: "Hello!".to_string(),
+            marks: vec![],
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1399,6 +1430,7 @@ mod tests {
             sender: "John".to_string(),
             sender_is_bot: Some(false),
             text: "[Photo: 720x1280]".to_string(),
+            marks: vec![],
             date: "2026-02-25T17:45:12Z".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1423,6 +1455,7 @@ mod tests {
             sender: "Alice".to_string(),
             sender_is_bot: Some(false),
             text: "[Emoji: 😀]".to_string(),
+            marks: vec![],
             date: "2026-02-25T17:45:12Z".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1455,6 +1488,7 @@ mod tests {
             sender: "Alice".to_string(),
             sender_is_bot: Some(false),
             text: "Audio: Song".to_string(),
+            marks: vec![],
             date: "1h ago".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1505,6 +1539,7 @@ mod tests {
             sender: "Tech Channel".to_string(),
             sender_is_bot: Some(false),
             text: "Channel announcement".to_string(),
+            marks: vec![],
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1530,6 +1565,7 @@ mod tests {
             sender: "Tech Channel".to_string(),
             sender_is_bot: Some(false),
             text: "Channel announcement".to_string(),
+            marks: vec![],
             date: "2024-01-01 12:00".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1595,6 +1631,7 @@ mod tests {
             sender: "Alice".to_string(),
             sender_is_bot: Some(false),
             text: "Hello".to_string(),
+            marks: vec![],
             date: "2024-01-01T00:00:00Z".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1619,6 +1656,7 @@ mod tests {
             sender: "Alice".to_string(),
             sender_is_bot: Some(false),
             text: "Hello (edited)".to_string(),
+            marks: vec![],
             date: "2024-01-01T00:00:00Z".to_string(),
             timestamp: 0,
             is_outgoing: false,
@@ -1634,6 +1672,26 @@ mod tests {
         assert!(json.contains("\"edit_date\":\"2024-01-01T00:05:00Z\""));
     }
 
+    #[test]
+    fn marks_are_left_out_when_empty_and_written_in_bytes_when_not() {
+        let mut msg = replying(None);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("marks"));
+
+        msg.marks = vec![TextMark {
+            kind: MarkKind::Link,
+            at: 4,
+            len: 3,
+            url: Some("https://example.com".to_string()),
+        }];
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(
+            json.contains(r#""marks":[{"k":"link","at":4,"len":3,"url":"https://example.com"}]"#)
+        );
+        let back: MessageInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.marks, msg.marks);
+    }
+
     fn replying(reply_to_message_id: Option<i64>) -> MessageInfo {
         MessageInfo {
             id: 89_508_544_512,
@@ -1642,6 +1700,7 @@ mod tests {
             sender: "Alice".to_string(),
             sender_is_bot: Some(false),
             text: "Agreed".to_string(),
+            marks: vec![],
             date: "2024-01-01T00:00:00Z".to_string(),
             timestamp: 0,
             is_outgoing: false,

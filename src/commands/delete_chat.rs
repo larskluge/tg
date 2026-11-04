@@ -212,6 +212,7 @@ mod tests {
             sender: "Ada Lindqvist".to_string(),
             sender_is_bot: Some(false),
             text: "See you then".to_string(),
+            marks: vec![],
             date: "-".to_string(),
             timestamp,
             is_outgoing: false,

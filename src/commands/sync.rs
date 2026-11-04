@@ -280,6 +280,7 @@ mod tests {
             sender: "Alice".to_string(),
             sender_is_bot: Some(false),
             text: format!("msg {id}"),
+            marks: vec![],
             date: "1h ago".to_string(),
             timestamp,
             is_outgoing: false,

@@ -298,6 +298,21 @@ its caption*.
   before 0.16.0 (tavola-i4cx; Mycelium held no paid media on 2026-10-18). `content` (with its
   `caption` and measures), `content_type` and the files do not change with it. A video note has no
   caption in TDLib.
+- **`marks` sits beside `text`, written by the same one writer (since 0.19.0).**
+  `extract_message_data` turns the `FormattedText`'s entities (a text's, and every caption's: photo,
+  video, document, audio, voice, animation, paid media) into `marks` (`src/marks.rs`),
+  `message_info` copies them to `MessageInfo.marks`, and an edit is read again through the same
+  path, so it brings its marks. Each is `{"k","at","len"}` (and `"url"` on a link); `at` and `len`
+  count **UTF-8 bytes of that `text`**, where TDLib counts UTF-16 units, so a caption's marks are
+  shifted by its bracket (`[Photo: `, `[Paid media: `, …). Only five kinds: `bold`, `italic`,
+  `strike`, `code` (`Code`, `Pre`, `PreCode`) and `link` (`TextUrl`, its URL http, https or mailto,
+  at most 2,048 bytes). Every other entity (`Url`, `EmailAddress`, `Mention`, `Hashtag`,
+  `Underline`, `Spoiler`, `BlockQuote`, `CustomEmoji`, …) shows plain. Ordered by `at`, the longer
+  first; at most 500; two links never overlap; an empty or out-of-range entity, or one that starts
+  or ends inside a character, makes none. A whitespace-only caption is no caption and has none, and
+  a poll's question carries only custom emoji, so a poll has none. The key is left out where there
+  are no marks, and `text` does not change. The record has no version field; a reader that does not
+  know `marks` passes it by.
 - **A new shape does not rewrite what Mycelium already holds.** It keys a Telegram message on
   `tg:<chat>:<message>:<edit_date>` and records a message again only when that changes, so a
   message ingested before the change keeps its old body until it is edited.

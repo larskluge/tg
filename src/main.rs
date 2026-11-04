@@ -428,19 +428,19 @@ fn check_auth_storage(data_dir: &Path, expected: &ApiCredentials) -> AuthStorage
     let mut api_hash_stored = false;
 
     let creds_path = credentials::credentials_file_path(data_dir);
-    if let Ok(raw) = std::fs::read_to_string(creds_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-            api_id_stored = json
-                .get("api_id")
-                .and_then(|v| v.as_i64())
-                .map(|id| id == expected.api_id as i64)
-                .unwrap_or(false);
-            api_hash_stored = json
-                .get("api_hash")
-                .and_then(|v| v.as_str())
-                .map(|hash| hash == expected.api_hash)
-                .unwrap_or(false);
-        }
+    if let Ok(raw) = std::fs::read_to_string(creds_path)
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        api_id_stored = json
+            .get("api_id")
+            .and_then(|v| v.as_i64())
+            .map(|id| id == expected.api_id as i64)
+            .unwrap_or(false);
+        api_hash_stored = json
+            .get("api_hash")
+            .and_then(|v| v.as_str())
+            .map(|hash| hash == expected.api_hash)
+            .unwrap_or(false);
     }
 
     let session_stored =

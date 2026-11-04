@@ -825,6 +825,13 @@ say what they carry in brackets, and a caption takes the measures' place there:
   media were `Paid media (25 stars)`**, unbracketed, caption or not. A caption edited
   later changes `text` and moves `edit_date`, as any edit does.
 
+`marks` (since 0.19.0; left out when empty) is the formatting of `text`, from Telegram's entities:
+`[{"k":"bold","at":8,"len":8}, {"k":"link","at":0,"len":4,"url":"https://example.com"}]`. `k` is
+`bold`, `italic`, `strike`, `code` or `link` (`url` on a link alone, http, https or mailto); `at`
+and `len` count **UTF-8 bytes of `text`**, so a caption's marks count past its bracket (`[Photo: `).
+Other entities (plain URLs, mentions, hashtags, underline, spoilers, quotes, custom emoji) make no
+mark. Ordered by `at`, the longer first, at most 500.
+
 ### Reply targets (since 0.8.0)
 
 Each message from `tg messages --json`, `tg sync` and the server's `messages`/`sync` carries
