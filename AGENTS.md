@@ -744,3 +744,11 @@ caller that omits the key entirely still gets a plain send, and "absent means pl
 contract. Pinned by `send_request_accepts_explicit_null_parse_mode`.
 
 **Clap negative IDs:** Telegram supergroup IDs are negative (e.g. `-1001666847309`). Any `--id` arg that accepts `i64` needs `#[arg(long, allow_hyphen_values = true)]` or clap will treat the leading `-` as a flag.
+
+<!-- BEGIN OWL -->
+## Testing (owl tier: ci-gated)
+
+- Before landing: the tests your change touches, plus `cargo test cli::tests` (smoke). Never the full suite in-session.
+- One test: `cargo test <test_name>`.
+- Full suite: GitHub CI (`ci.yml`). After pushing a change it covers, `gh run watch --exit-status`: the deploy waits on it.
+<!-- END OWL -->

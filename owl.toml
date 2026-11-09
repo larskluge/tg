@@ -1,0 +1,7 @@
+# How owl reads this repo's CI: ~/code/owl/docs/specs/2026-11-10-owl-design.md §4.
+tier = "ci-gated"
+smoke = "cargo test cli::tests"
+one_test = "cargo test <test_name>"
+
+[ci]
+workflows = ["ci.yml"]
