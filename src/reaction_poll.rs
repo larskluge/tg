@@ -12,10 +12,10 @@
 //! `messageSourceNotification` and `force_read: false`: TDLib marks messages, mentions and
 //! reactions read only for a chat-history source or `force_read`, and the default source in an
 //! open chat IS chat history. A live location is never reported, since viewing one marks its
-//! content read whatever the source. AGENTS.md, *Reactions*, has the TDLib source this rests on.
-//! Every poll also checks it: a chat's read state is read before it is opened and again after its
-//! messages are reported, and anything read in between stops the poll for the rest of the session
-//! ([`Stop::Dropped`]).
+//! content read whatever the source. docs/architecture/reactions.md, *The reaction poll*, has the
+//! TDLib source this rests on. Every poll also checks it: a chat's read state is read before it
+//! is opened and again after its messages are reported, and anything read in between stops the
+//! poll for the rest of the session ([`Stop::Dropped`]).
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;

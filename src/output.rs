@@ -757,7 +757,7 @@ pub struct MessageReactionInfo {
 /// One piece of a message's formatting, over the `text` tg writes beside it:
 /// `at` and `len` count UTF-8 bytes of that `text`, `kind` is one of `link`,
 /// `bold`, `italic`, `strike` and `code`, and `url` is a link's address alone
-/// (AGENTS.md, *A message's `text`*).
+/// (docs/architecture/messages.md, *A message's `text`*).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TextMark {
     #[serde(rename = "k")]

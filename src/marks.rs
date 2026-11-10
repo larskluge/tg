@@ -1,6 +1,6 @@
-//! A message's formatting as `marks` (AGENTS.md, *A message's `text`*): TDLib's
-//! entities over a `FormattedText`, turned into the five kinds a reader draws
-//! and into UTF-8 byte offsets of the `text` tg writes.
+//! A message's formatting as `marks` (docs/architecture/messages.md, *A message's
+//! `text`*): TDLib's entities over a `FormattedText`, turned into the five kinds a
+//! reader draws and into UTF-8 byte offsets of the `text` tg writes.
 
 use crate::output::{MarkKind, TextMark};
 use tdlib_rs::enums::TextEntityType;

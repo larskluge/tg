@@ -1911,7 +1911,7 @@ fn tdlib_type_name(content: &tdlib_rs::enums::MessageContent) -> String {
     }
 }
 
-/// The one writer of a message's `text` (AGENTS.md, *A message's `text`*): a
+/// The one writer of a message's `text` (docs/architecture/messages.md, *A message's `text`*): a
 /// content that can carry a caption puts it in the bracket in the measures'
 /// place, and says its measures only without one.
 fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedMessageData {
@@ -5698,7 +5698,7 @@ mod tests {
         })
     }
 
-    // The marks of the one writer (AGENTS.md, *A message's `text`*).
+    // The marks of the one writer (docs/architecture/messages.md, *A message's `text`*).
 
     fn bold_over(text: &str, word: &str) -> tdlib_rs::types::FormattedText {
         let start = text.find(word).expect("word in text");

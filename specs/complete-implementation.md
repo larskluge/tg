@@ -494,14 +494,14 @@ Member filters: `supergroupMembersFilterRecent`, `supergroupMembersFilterAdminis
 | Name a custom emoji | `getCustomEmojiStickers(custom_emoji_ids)` | Internal: a custom emoji reaction is listed under the standard emoji it stands for |
 
 The shapes are in `README.md` (*Reactions*, *`react`*, *One message*); what TDLib does and does
-not deliver is in `AGENTS.md` (*Reactions*). Custom-emoji and paid reactions cannot be sent, and
+not deliver is in `docs/architecture/reactions.md` (*Reactions*). Custom-emoji and paid reactions cannot be sent, and
 a reaction is never sent big.
 
 ### To Implement
 
 | Feature | TDLib Functions | CLI UX |
 |---------|----------------|--------|
-| Reactions between other people in a group | `openChat` + `viewMessages` (a non-history source) + `closeChat`, which makes TDLib poll `messages.getMessagesReactions`; or `getMessageAddedReactions(chat_id, message_id, reaction_type, offset, limit)` per message | None yet. TDLib receives these only by polling; see `AGENTS.md` → *Reactions* before building |
+| Reactions between other people in a group | `openChat` + `viewMessages` (a non-history source) + `closeChat`, which makes TDLib poll `messages.getMessagesReactions`; or `getMessageAddedReactions(chat_id, message_id, reaction_type, offset, limit)` per message | None yet. TDLib receives these only by polling; see `docs/architecture/reactions.md` → *Reactions* before building |
 | Who reacted, beyond the three Telegram names | `getMessageAddedReactions(chat_id, message_id, reaction_type, offset, limit)` | `tg reactions <CHAT_ID> <MSG_ID>` |
 | Set chat reactions | `setChatAvailableReactions(chat_id, available_reactions)` | `tg chat set-reactions <CHAT_ID>` |
 | Set default reaction | `setDefaultReaction(reaction_type)` | `tg settings default-reaction <EMOJI>` |

@@ -3,10 +3,11 @@
 //!
 //! TDLib puts a reaction change on its own copy of the message at once and only
 //! then asks Telegram, and it answers a second request for a change that copy
-//! already shows at once, without asking Telegram again (AGENTS.md,
-//! *Reactions*). So a request that stops waiting leaves its change here, still
-//! waiting on Telegram's answer, and the next request for the same message waits
-//! on that answer instead of being answered from TDLib's copy.
+//! already shows at once, without asking Telegram again
+//! (docs/architecture/reactions.md, *Reactions*). So a request that stops
+//! waiting leaves its change here, still waiting on Telegram's answer, and the
+//! next request for the same message waits on that answer instead of being
+//! answered from TDLib's copy.
 
 use std::collections::HashMap;
 use std::future::Future;
