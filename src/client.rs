@@ -778,7 +778,12 @@ impl TdLibClient {
         msg: tdlib_rs::types::Message,
         custom: &CustomEmoji,
     ) -> MessageInfo {
-        let extracted = extract_message_data(&msg.content);
+        let mut extracted = extract_message_data(&msg.content);
+        if let Err(e) =
+            add_contact_usernames(self, msg.chat_id, msg.id, &mut extracted.content).await
+        {
+            eprintln!("tg: warning: {e}");
+        }
         let (sender_id, sender, sender_is_bot) = match &msg.sender_id {
             tdlib_rs::enums::MessageSender::User(u) => {
                 match tdlib_rs::functions::get_user(u.user_id, client_id).await {
@@ -1288,6 +1293,56 @@ impl ChatDataSource for TdLibClient {
             is_bot,
         })
     }
+}
+
+/// What a shared contact's usernames are read from: TDLib's `getUser`.
+#[async_trait]
+trait UserUsernames: Send + Sync {
+    /// The user's `usernames.active_usernames`, in TDLib's order: the ones
+    /// `https://t.me/<username>` opens.
+    async fn active_usernames(&self, user_id: i64) -> Result<Vec<String>>;
+}
+
+#[async_trait]
+impl UserUsernames for TdLibClient {
+    async fn active_usernames(&self, user_id: i64) -> Result<Vec<String>> {
+        let client_id = self.get_client_id().await?;
+        let user = tdlib_rs::functions::get_user(user_id, client_id)
+            .await
+            .map_err(|e| TgError::TdLib(e.message))?;
+        Ok(unwrap_user(user)
+            .usernames
+            .map(|u| u.active_usernames)
+            .unwrap_or_default())
+    }
+}
+
+/// A shared contact's card with the usernames of the user it names, read now:
+/// a card holds none of its own. Any other content, and a card that names no
+/// user (`user_id` 0), is left as it is without asking TDLib. A user TDLib does
+/// not know leaves the card without usernames, and the error, naming the
+/// message but never the card's name or number, is the caller's to log.
+async fn add_contact_usernames(
+    users: &impl UserUsernames,
+    chat_id: i64,
+    message_id: i64,
+    content: &mut Option<MessageContentDetails>,
+) -> Result<()> {
+    let Some(MessageContentDetails::Contact {
+        user_id, usernames, ..
+    }) = content
+    else {
+        return Ok(());
+    };
+    if *user_id == 0 {
+        return Ok(());
+    }
+    *usernames = users.active_usernames(*user_id).await.map_err(|e| {
+        TgError::Other(format!(
+            "message {message_id} in chat {chat_id}: the shared contact's usernames could not be read ({e}); it is listed without them"
+        ))
+    })?;
+    Ok(())
 }
 
 /// How many chats of each list the reaction poll asks TDLib for. Both lists together hold far
@@ -2245,6 +2300,8 @@ fn extract_message_data(content: &tdlib_rs::enums::MessageContent) -> ExtractedM
                     last_name: non_empty(&c.contact.last_name),
                     user_id: c.contact.user_id,
                     vcard: non_empty(&c.contact.vcard),
+                    // A card holds no usernames: `message_info` reads them.
+                    usernames: vec![],
                 }),
             }
         }
@@ -5959,6 +6016,147 @@ mod tests {
         assert!(!poll_extracted.is_downloadable);
         assert!(poll_extracted.text.starts_with("[Poll:"));
         assert!(poll_extracted.text.ends_with(']'));
+    }
+
+    /// `getUser` as a shared contact's usernames see it: the users it knows,
+    /// every call counted. A user it does not know fails as TDLib does.
+    struct StubUsers {
+        known: Vec<(i64, Vec<String>)>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StubUsers {
+        fn new(known: Vec<(i64, Vec<String>)>) -> Self {
+            Self {
+                known,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl UserUsernames for StubUsers {
+        async fn active_usernames(&self, user_id: i64) -> Result<Vec<String>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.known
+                .iter()
+                .find(|(id, _)| *id == user_id)
+                .map(|(_, usernames)| usernames.clone())
+                .ok_or_else(|| TgError::TdLib("User not found".to_string()))
+        }
+    }
+
+    fn shared_contact(user_id: i64) -> tdlib_rs::enums::MessageContent {
+        tdlib_rs::enums::MessageContent::MessageContact(tdlib_rs::types::MessageContact {
+            contact: tdlib_rs::types::Contact {
+                phone_number: "+15555550147".to_string(),
+                first_name: "Olga".to_string(),
+                last_name: "Marsh".to_string(),
+                vcard: String::new(),
+                user_id,
+            },
+        })
+    }
+
+    fn contact_usernames(content: &Option<MessageContentDetails>) -> &[String] {
+        match content {
+            Some(MessageContentDetails::Contact { usernames, .. }) => usernames,
+            other => panic!("not a contact: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_shared_contact_carries_its_users_active_usernames_in_order() {
+        let users = StubUsers::new(vec![(
+            777000123,
+            vec!["olga_marsh".to_string(), "olga_m".to_string()],
+        )]);
+        let mut extracted = extract_message_data(&shared_contact(777000123));
+
+        add_contact_usernames(&users, -1001666847309, 4242, &mut extracted.content)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            contact_usernames(&extracted.content),
+            ["olga_marsh", "olga_m"]
+        );
+        let json = serde_json::to_string(&extracted.content).unwrap();
+        assert!(
+            json.contains(r#""usernames":["olga_marsh","olga_m"]"#),
+            "{json}"
+        );
+        // The text is the card's, as before: usernames stay out of it.
+        assert_eq!(extracted.text, "[Contact: Olga Marsh (+15555550147)]");
+    }
+
+    #[tokio::test]
+    async fn a_shared_contact_without_a_user_asks_tdlib_nothing() {
+        let users = StubUsers::new(vec![]);
+        let mut extracted = extract_message_data(&shared_contact(0));
+
+        add_contact_usernames(&users, -1001666847309, 4242, &mut extracted.content)
+            .await
+            .unwrap();
+
+        assert_eq!(users.calls(), 0);
+        let json = serde_json::to_value(&extracted.content).unwrap();
+        assert_eq!(json["kind"], "contact");
+        assert!(json.get("usernames").is_none(), "{json}");
+    }
+
+    #[tokio::test]
+    async fn content_other_than_a_shared_contact_asks_tdlib_nothing() {
+        let users = StubUsers::new(vec![]);
+        let mut extracted = extract_message_data(&tdlib_rs::enums::MessageContent::MessageText(
+            tdlib_rs::types::MessageText {
+                text: formatted("@olga_marsh"),
+                link_preview: None,
+                link_preview_options: None,
+            },
+        ));
+
+        add_contact_usernames(&users, -1001666847309, 4242, &mut extracted.content)
+            .await
+            .unwrap();
+
+        assert_eq!(users.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_user_tdlib_does_not_know_leaves_the_card_without_usernames() {
+        let users = StubUsers::new(vec![]);
+        let mut extracted = extract_message_data(&shared_contact(777000123));
+
+        let warning = add_contact_usernames(&users, -1001666847309, 4242, &mut extracted.content)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(contact_usernames(&extracted.content).is_empty());
+        match &extracted.content {
+            Some(MessageContentDetails::Contact {
+                phone_number,
+                first_name,
+                user_id,
+                ..
+            }) => {
+                assert_eq!(phone_number, "+15555550147");
+                assert_eq!(first_name, "Olga");
+                assert_eq!(*user_id, 777000123);
+            }
+            other => panic!("not a contact: {other:?}"),
+        }
+        assert!(warning.contains("-1001666847309"), "{warning}");
+        assert!(warning.contains("4242"), "{warning}");
+        assert!(warning.contains("User not found"), "{warning}");
+        for private in ["Olga", "Marsh", "+15555550147", "5555550147"] {
+            assert!(!warning.contains(private), "{private} in {warning}");
+        }
     }
 
     #[test]

@@ -14,7 +14,8 @@ moves to another TDLib.
   (`sync --report-deleted`).
 - [chats.md](chats.md): a channel is a supergroup with `is_channel`; deleting a private chat
   (`delete_chat`).
-- [messages.md](messages.md): a message's `text` and its caption, its `marks`, and `reply_to`.
+- [messages.md](messages.md): a message's `text` and its caption, its `marks`, a shared
+  contact's usernames, and `reply_to`.
 - [sending.md](sending.md): TDLib's HTML and MarkdownV2 parse modes, an explicit `null`,
   attachments, a partial album, one file, and a voice note.
 - [serve.md](serve.md): subscriptions (`subscribe`, `tg stream`) and serve request strictness.

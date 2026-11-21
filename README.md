@@ -832,6 +832,30 @@ and `len` count **UTF-8 bytes of `text`**, so a caption's marks count past its b
 Other entities (plain URLs, mentions, hashtags, underline, spoilers, quotes, custom emoji) make no
 mark. Ordered by `at`, the longer first, at most 500.
 
+### A shared contact
+
+A contact card shared in a chat, by Lars or to him, is `content_type: "contact"`, and its
+`content` holds the whole card:
+
+```json
+{"content_type": "contact", "text": "[Contact: Olga Marsh (+15555550147)]",
+ "content": {"kind": "contact", "phone_number": "+15555550147", "first_name": "Olga",
+             "last_name": "Marsh", "user_id": 777000123, "vcard": null,
+             "usernames": ["olga_marsh", "olga_m"]}}
+```
+
+- `phone_number` and `first_name` as on the card; `last_name` and `vcard` `null` when it has none;
+  `user_id` the Telegram user the card names, `0` when it names none.
+- **`usernames` (since 0.20.0)**: that user's active usernames, in Telegram's order (the first is
+  the primary one), each opening `https://t.me/<username>`. They are **read when the message is
+  read, not when it was shared**: reading an old message again gives the user's usernames as of
+  now. The key is absent when there are none: the user has none, `user_id` is `0`, TDLib does not
+  know the user (`tg` then logs a warning to stderr naming the chat and the message), or the
+  payload came from a `tg` older than 0.20.0. Disabled usernames are not listed.
+- Every listing carries them: `tg messages --json`, `tg message --json`, `tg sync` and the
+  server's `messages`/`message`/`sync`. `tg download`'s report gives the card without them.
+- `text` stays `[Contact: <first> <last> (<phone>)]`; the usernames are never in it.
+
 ### Reply targets (since 0.8.0)
 
 Each message from `tg messages --json`, `tg sync` and the server's `messages`/`sync` carries

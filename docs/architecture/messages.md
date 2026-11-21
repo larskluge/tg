@@ -1,7 +1,8 @@
 # Messages
 
-What a listed message carries: its `text`, its `marks` and the message it replies to. The rules
-every change keeps are in [AGENTS.md](../../AGENTS.md); this file is how it works as built.
+What a listed message carries: its `text`, its `marks`, a shared contact's usernames and the
+message it replies to. The rules every change keeps are in [AGENTS.md](../../AGENTS.md); this file
+is how it works as built.
 
 **A message's `text` is a body other programs store (its caption where it has one, since 0.14.0
 for animation, audio and voice, 0.16.0 for paid media):** Mycelium stores `text` as the message's body unparsed, and
@@ -39,6 +40,20 @@ its caption*.
 - **A new shape does not rewrite what Mycelium already holds.** It keys a Telegram message on
   `tg:<chat>:<message>:<edit_date>` and records a message again only when that changes, so a
   message ingested before the change keeps its old body until it is edited.
+
+**A shared contact's usernames come from `getUser`, read with the message (since 0.20.0):**
+TDLib's `contact` (`td_api.tl`) holds `phone_number`, `first_name`, `last_name`, `vcard` and
+`user_id`, and no username. `extract_message_data` writes the card into `content` as it is (and
+the text, `[Contact: <first> <last> (<phone>)]`, unchanged); `message_info` then calls
+`add_contact_usernames`, which for a contact with a nonzero `user_id` asks `getUser` (through the
+`UserUsernames` seam, stubbed in the tests) and sets `usernames` to `usernames.active_usernames`,
+in TDLib's order (the first is the primary one); disabled and editable usernames are not read. No
+other content and no card with `user_id` 0 makes the call. A `getUser` that fails leaves the card
+without usernames and the message listed as before, with a warning on stderr naming the chat id,
+the message id and TDLib's error, never the card's name or number. Being read at read time, a
+re-read of an old message gives today's usernames: that is how Mycelium's backfill
+(mycelium-cc4r) reads them for messages it stored before. `download_message_media` reads the card
+through `extract_message_data` alone, so `tg download`'s report has none.
 
 **TDLib `message.reply_to` names a chat, not just a message (since 0.8.0):**
 `messageReplyToMessage { chat_id, message_id, … }` — `chat_id` is the chat of the *replied*

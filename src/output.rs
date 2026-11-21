@@ -477,6 +477,11 @@ pub enum MessageContentDetails {
         last_name: Option<String>,
         user_id: i64,
         vcard: Option<String>,
+        /// The active usernames of the user `user_id` names, in TDLib's order,
+        /// read when the message is read (not when it was shared); absent when
+        /// there are none.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        usernames: Vec<String>,
     },
     Emoji {
         emoji: Option<String>,
@@ -1412,6 +1417,17 @@ mod tests {
         let json = r#"{"id": 1, "first_name": "John", "last_name": "Doe"}"#;
         let user: UserInfo = serde_json::from_str(json).unwrap();
         assert_eq!(user.is_bot, None);
+    }
+
+    #[test]
+    fn contact_content_without_usernames_deserialises_with_none() {
+        // A contact's content from a `tg serve` older than 0.20.0: the key is absent.
+        let json = r#"{"kind": "contact", "phone_number": "+15555550147", "first_name": "Olga",
+            "last_name": "Marsh", "user_id": 777000123, "vcard": null}"#;
+        match serde_json::from_str(json).unwrap() {
+            MessageContentDetails::Contact { usernames, .. } => assert!(usernames.is_empty()),
+            other => panic!("not a contact: {other:?}"),
+        }
     }
 
     #[test]
