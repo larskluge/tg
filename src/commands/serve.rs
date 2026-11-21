@@ -57,30 +57,45 @@ pub async fn run(mut client: TdLibClient) -> Result<()> {
     let path = serve::socket_path().ok_or_else(|| {
         TgError::Other("TG_SERVE_SOCKET is empty; refusing to start tg serve".to_string())
     })?;
+    let read_path = serve::read_socket_path();
+    if read_path.as_deref() == Some(path.as_path()) {
+        return Err(TgError::Other(format!(
+            "{} names the same path as the full socket ({}); refusing to start tg serve",
+            serve::READ_SOCKET_ENV,
+            path.display()
+        )));
+    }
 
     // Read before anything starts, so a bad value refuses to serve rather than half-starting.
     let reaction_poll = reaction_poll::setting(std::env::var_os(reaction_poll::ENV).as_deref())?;
 
     prepare_socket_path(&path).await?;
+    if let Some(read_path) = &read_path {
+        prepare_socket_path(read_path).await?;
+    }
 
     // Initialize TDLib once and wait for the post-auth update sync so every
     // request served from here on sees a fully-synced cache.
     client.start().await?;
     client.wait_for_sync().await;
 
-    // Bind under a restrictive umask so the socket is created with mode 0600
-    // atomically — no window where another local user can connect to a
-    // world-accessible socket. Restore the previous umask immediately after.
-    let listener = bind_with_restricted_umask(&path)?;
-    // Defense in depth: explicitly chmod after bind. Failure is fatal —
-    // if we can't guarantee 0600 perms, refuse to serve.
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
-        // Clean up before bailing.
-        let _ = std::fs::remove_file(&path);
-        TgError::Other(format!("failed to chmod socket {}: {e}", path.display()))
-    })?;
-
+    let listener = bind_socket(&path)?;
     eprintln!("tg serve: listening at {}", path.display());
+    let read_listener = match &read_path {
+        None => None,
+        Some(read_path) => match bind_socket(read_path) {
+            Ok(read_listener) => {
+                eprintln!("tg serve: reads only at {}", read_path.display());
+                Some(read_listener)
+            }
+            Err(e) => {
+                // Clean up the full socket before bailing.
+                drop(listener);
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+        },
+    };
 
     // A subscription never ends on its own, so shutdown has to end it: without
     // this switch every live subscriber would hold the drain below for its full
@@ -88,7 +103,6 @@ pub async fn run(mut client: TdLibClient) -> Result<()> {
     let (stop_subscriptions, shutdown) = watch::channel(false);
     let subscriptions = Subscriptions::new(client.updates(), shutdown);
     let client_arc = Arc::new(Mutex::new(client));
-    let mut tasks: JoinSet<()> = JoinSet::new();
 
     let mut sigterm = signal(SignalKind::terminate())
         .map_err(|e| TgError::Other(format!("install sigterm handler: {e}")))?;
@@ -115,31 +129,23 @@ pub async fn run(mut client: TdLibClient) -> Result<()> {
         }
     };
 
-    loop {
+    let stop = async {
         tokio::select! {
-            res = listener.accept() => {
-                match res {
-                    Ok((stream, _)) => {
-                        let client_arc = client_arc.clone();
-                        let subscriptions = subscriptions.clone();
-                        tasks.spawn(async move {
-                            if let Err(e) = handle_connection(stream, client_arc, subscriptions).await {
-                                eprintln!("tg serve: connection error: {e}");
-                            }
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("tg serve: accept error: {e}");
-                    }
-                }
-            }
-            _ = sigterm.recv() => break,
-            _ = sigint.recv() => break,
+            _ = sigterm.recv() => {}
+            _ = sigint.recv() => {}
         }
-    }
+    };
+    // Returns once it has stopped accepting: both listeners are gone.
+    let mut tasks = accept_until(
+        listener,
+        read_listener,
+        client_arc.clone(),
+        subscriptions,
+        stop,
+    )
+    .await;
 
-    // Stop accepting, end every subscription, and drain.
-    drop(listener);
+    // End every subscription, and drain.
     stop_subscriptions.send_replace(true);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(SHUTDOWN_DRAIN_SECS), async {
         while tasks.join_next().await.is_some() {}
@@ -170,8 +176,69 @@ pub async fn run(mut client: TdLibClient) -> Result<()> {
 
     // Best-effort socket cleanup.
     let _ = std::fs::remove_file(&path);
+    if let Some(read_path) = &read_path {
+        let _ = std::fs::remove_file(read_path);
+    }
 
     Ok(())
+}
+
+/// Accept connections on both sockets until `stop` resolves, each served on a
+/// task of its own with the [`serve::Access`] of the socket it came in on.
+/// Returns the connections' tasks, for the caller to drain; the listeners are
+/// dropped on return, so nothing more is accepted.
+async fn accept_until<C: TelegramClient + 'static>(
+    listener: UnixListener,
+    read_listener: Option<UnixListener>,
+    client: Arc<Mutex<C>>,
+    subscriptions: Subscriptions,
+    stop: impl std::future::Future<Output = ()>,
+) -> JoinSet<()> {
+    let mut tasks = JoinSet::new();
+    tokio::pin!(stop);
+    loop {
+        let (accepted, access) = tokio::select! {
+            res = listener.accept() => (res, serve::Access::Full),
+            res = accept_on(read_listener.as_ref()) => (res, serve::Access::Read),
+            _ = &mut stop => return tasks,
+        };
+        match accepted {
+            Ok((stream, _)) => {
+                let client = client.clone();
+                let subscriptions = subscriptions.clone();
+                tasks.spawn(async move {
+                    if let Err(e) = handle_connection(stream, client, subscriptions, access).await {
+                        eprintln!("tg serve: connection error: {e}");
+                    }
+                });
+            }
+            Err(e) => eprintln!("tg serve: accept error: {e}"),
+        }
+    }
+}
+
+/// Accept on `listener`, or wait forever when there is none.
+async fn accept_on(
+    listener: Option<&UnixListener>,
+) -> std::io::Result<(UnixStream, tokio::net::unix::SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Bind a socket at `path` under a restrictive umask, so it is created with
+/// mode 0600 atomically — no window where another local user can connect to a
+/// world-accessible socket. Then chmod it 0600 again, as defense in depth:
+/// failure is fatal, since without 0600 we refuse to serve.
+fn bind_socket(path: &Path) -> Result<UnixListener> {
+    let listener = bind_with_restricted_umask(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        // Clean up before bailing.
+        let _ = std::fs::remove_file(path);
+        TgError::Other(format!("failed to chmod socket {}: {e}", path.display()))
+    })?;
+    Ok(listener)
 }
 
 /// Bind a `UnixListener` at `path` with the process umask temporarily set to
@@ -263,10 +330,14 @@ pub async fn prepare_socket_path(path: &Path) -> Result<()> {
 /// A `subscribe` request turns the rest of the connection into an event
 /// stream (see [`run_subscription`]); it is answered here, never by the
 /// dispatcher, and never takes the client lock.
+///
+/// A command `access` does not allow is refused here, before it reaches the
+/// dispatcher or the client lock.
 pub async fn handle_connection<C: TelegramClient>(
     stream: UnixStream,
     client: Arc<Mutex<C>>,
     subscriptions: Subscriptions,
+    access: serve::Access,
 ) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
@@ -297,6 +368,13 @@ pub async fn handle_connection<C: TelegramClient>(
         }
 
         let response = match serde_json::from_str::<RequestEnvelope>(&line) {
+            Ok(req) if !access.allows(&req.cmd) => ResponseEnvelope::err(
+                req.id,
+                format!(
+                    "`{}` is not served on the read-only socket, which takes only reads",
+                    req.cmd
+                ),
+            ),
             Ok(req) if req.cmd == serve::SUBSCRIBE_CMD => {
                 // Attach to the channel BEFORE the ack, so every update after
                 // the ack reaches this subscriber.
@@ -571,7 +649,7 @@ mod tests {
         let (subscriptions, _updates, _stop) = subscriptions();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, client, subscriptions)
+            handle_connection(stream, client, subscriptions, serve::Access::Full)
                 .await
                 .unwrap();
         });
@@ -816,7 +894,7 @@ mod tests {
         let server_client = client.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
-            handle_connection(stream, server_client, subscriptions).await
+            handle_connection(stream, server_client, subscriptions, serve::Access::Full).await
         });
 
         let stream = UnixStream::connect(&path).await.unwrap();
@@ -842,5 +920,78 @@ mod tests {
             .expect("the subscription ends when the peer closes")
             .unwrap()
             .unwrap();
+    }
+
+    /// Send one request line on a connection of its own and read the answer.
+    async fn ask(path: &Path, line: &str) -> serde_json::Value {
+        let stream = UnixStream::connect(path).await.unwrap();
+        let (read, mut write) = stream.into_split();
+        write.write_all(line.as_bytes()).await.unwrap();
+        write.write_all(b"\n").await.unwrap();
+        next_frame(&mut BufReader::new(read)).await
+    }
+
+    #[tokio::test]
+    async fn the_read_socket_refuses_what_changes_a_chat_and_the_full_one_takes_it() {
+        use crate::client::mock::MockClient;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let full = dir.path().join("full.sock");
+        let read = dir.path().join("read.sock");
+        let client = Arc::new(Mutex::new(MockClient::default()));
+        let (subscriptions, _updates, _stop_subscriptions) = subscriptions();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(accept_until(
+            UnixListener::bind(&full).unwrap(),
+            Some(UnixListener::bind(&read).unwrap()),
+            client.clone(),
+            subscriptions,
+            async {
+                let _ = stopped.await;
+            },
+        ));
+
+        let send = r#"{"id":"s","cmd":"send","args":{"message":"hi","id":42}}"#;
+        for line in [
+            send,
+            r#"{"id":"r","cmd":"react","args":{"chat":42,"message":1,"emoji":"👍"}}"#,
+            r#"{"id":"m","cmd":"mark_read","args":{"id":42}}"#,
+            r#"{"id":"u","cmd":"mark_unread","args":{"id":42}}"#,
+            r#"{"id":"d","cmd":"delete_chat","args":{"id":42,"through":1}}"#,
+        ] {
+            let answer = ask(&read, line).await;
+            assert_eq!(answer["ok"], false, "{answer}");
+            assert!(
+                answer["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("read-only socket"),
+                "{answer}"
+            );
+        }
+        assert!(client.lock().await.sent.lock().unwrap().is_empty());
+
+        // The reads it serves, the event stream among them.
+        let chats = ask(&read, r#"{"id":"c","cmd":"chats","args":{}}"#).await;
+        assert_eq!(chats["ok"], true, "{chats}");
+        let subscribed = ask(&read, r#"{"id":"1","cmd":"subscribe","args":{}}"#).await;
+        assert_eq!(subscribed["result"]["subscribed"], true, "{subscribed}");
+
+        // The full socket takes the send the read socket refused.
+        let sent = ask(&full, send).await;
+        assert_eq!(sent["ok"], true, "{sent}");
+        assert_eq!(client.lock().await.sent.lock().unwrap().len(), 1);
+
+        stop.send(()).unwrap();
+        let mut tasks = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("accepting stops once stop resolves")
+            .unwrap();
+        tasks.abort_all();
+        assert!(
+            UnixStream::connect(&read).await.is_err(),
+            "the read listener is gone"
+        );
     }
 }

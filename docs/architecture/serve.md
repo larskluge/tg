@@ -43,6 +43,21 @@ are a contract with Mycelium's Telegram consumer (its spec:
   tokio's `stdin()` cannot be cancelled and would hold the runtime's shutdown — and so the exit
   after `tg serve closed the stream` — until stdin closed.
 
+**The read socket (`TG_SERVE_READ_SOCKET`, since 0.21.0):** a second listener for readers that
+must never write to a chat (Mycelium on outpost, whose container parses every inbound message,
+so an RCE there must not reach `send`). What the code relies on:
+
+- **The socket decides, not the request.** `accept_until` gives each connection the
+  `serve::Access` of the listener it came in on, and `handle_connection` answers a command that
+  access does not allow itself, before the dispatcher or the client lock. Pinned by
+  `the_read_socket_refuses_what_changes_a_chat_and_the_full_one_takes_it`, over both sockets.
+- **An allowlist, `serve::READ_COMMANDS`.** A command added later is refused on the read
+  socket until it is listed there; `download` is on it, since it writes into the download
+  directory, never to a chat.
+- **Like the full socket in everything else:** prepared before TDLib starts, bound `0600` once
+  it is synced, removed at shutdown. Its path must differ from the full one's, and isolation is
+  the operator's: a directory (on outpost, a volume) of its own.
+
 **Serve request strictness:** `SendRequest`, its nested `media::SendFile`, `ReactRequest` and
 `DeleteChatRequest` — the requests that change a chat — are the only serve request structs carrying
 `#[serde(deny_unknown_fields)]`. The others are deliberately open: `WhoamiRequest{}` backs

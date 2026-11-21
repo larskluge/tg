@@ -46,9 +46,9 @@ GitHub issues moved here as `tg-gh<N>`, keeping their numbers). Storage, the Dol
 - `reaction_poll.rs` - `tg serve`'s poll of group reactions: which groups and messages, the tiers,
   the guard against a drop in unread counts, and the round loop (`Poller`); `PollSource` is what it
   asks of TDLib, implemented for `TdLibClient` in `client.rs`
-- `serve.rs` - The serve protocol: envelopes, the dispatcher, and the `StreamEvent` frames a
-  `subscribe` connection carries (`StreamEvent::from_update` is the one TDLib-update → event
-  mapping)
+- `serve.rs` - The serve protocol: envelopes, the dispatcher, what the read socket serves
+  (`Access`), and the `StreamEvent` frames a `subscribe` connection carries
+  (`StreamEvent::from_update` is the one TDLib-update → event mapping)
 - `serve_client.rs` - The CLI's side of the socket: one request per connection, plus `stream` for
   `tg stream`
 
@@ -83,6 +83,9 @@ and `~/.local/share/tg` on Linux), including `credentials.json`
 - **The requests that change a chat are strict**: `SendRequest`, `media::SendFile`, `ReactRequest`
   and `DeleteChatRequest` carry `#[serde(deny_unknown_fields)]`; the others stay open on purpose
   (`WhoamiRequest` backs the container's health check; [serve.md](docs/architecture/serve.md)).
+- **The read socket serves `serve::READ_COMMANDS` only**: a command that changes a chat never
+  goes on that list, and a new command stays off it until it is shown to change nothing
+  ([serve.md](docs/architecture/serve.md)).
 - **`tg stream` never opens a TDLib client of its own**: a second client on serve's database is
   the one thing it must never open.
 - **The reaction poll reports with `messageSourceNotification`, `force_read: false`**, never the

@@ -39,6 +39,54 @@ pub fn socket_path() -> Option<PathBuf> {
     }
 }
 
+/// The variable naming the read socket: a second listener, beside the one
+/// [`socket_path`] resolves, that serves only [`READ_COMMANDS`] (since 0.21.0).
+pub const READ_SOCKET_ENV: &str = "TG_SERVE_READ_SOCKET";
+
+/// The read socket's path, verbatim from [`READ_SOCKET_ENV`]. Unset or empty:
+/// `tg serve` binds no read socket.
+pub fn read_socket_path() -> Option<PathBuf> {
+    std::env::var_os(READ_SOCKET_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// What the read socket serves: every command that changes nothing in a chat.
+/// `download` writes a file into the daemon's download directory, never to a
+/// chat, so it is here. `send`, `react`, `mark_read`, `mark_unread` and
+/// `delete_chat` are not, and neither is a command added later until it is
+/// listed here.
+pub const READ_COMMANDS: &[&str] = &[
+    "whoami",
+    "chats",
+    "groups",
+    "unread",
+    "search",
+    "messages",
+    "message",
+    "download",
+    "sync",
+    SUBSCRIBE_CMD,
+];
+
+/// Which commands a connection may issue, by the socket it came in on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// The socket [`socket_path`] resolves: every command.
+    Full,
+    /// The read socket ([`READ_SOCKET_ENV`]): [`READ_COMMANDS`] only.
+    Read,
+}
+
+impl Access {
+    pub fn allows(self, cmd: &str) -> bool {
+        match self {
+            Access::Full => true,
+            Access::Read => READ_COMMANDS.contains(&cmd),
+        }
+    }
+}
+
 /// Incoming request envelope: `{"id": ..., "cmd": ..., "args": ...}`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RequestEnvelope {
@@ -1266,11 +1314,43 @@ mod tests {
         assert!(err.contains("connection"), "{err}");
     }
 
+    #[test]
+    fn the_read_socket_takes_the_reads_and_nothing_that_changes_a_chat() {
+        for cmd in [
+            "whoami",
+            "chats",
+            "groups",
+            "unread",
+            "search",
+            "messages",
+            "message",
+            "download",
+            "sync",
+            "subscribe",
+        ] {
+            assert!(Access::Read.allows(cmd), "{cmd} is a read");
+            assert!(Access::Full.allows(cmd), "{cmd}");
+        }
+        for cmd in [
+            "send",
+            "react",
+            "mark_read",
+            "mark_unread",
+            "delete_chat",
+            "auth",
+            "a_command_added_later",
+        ] {
+            assert!(!Access::Read.allows(cmd), "{cmd} is not a read");
+            assert!(Access::Full.allows(cmd), "{cmd}");
+        }
+    }
+
     // Env-var-mutating tests are gathered into one to avoid cross-test races on
     // the shared process environment.
     #[test]
-    fn socket_path_respects_env_variants() {
+    fn socket_paths_respect_env_variants() {
         let prev = std::env::var_os("TG_SERVE_SOCKET");
+        let prev_read = std::env::var_os(READ_SOCKET_ENV);
 
         // Explicit path
         unsafe { std::env::set_var("TG_SERVE_SOCKET", "/tmp/tg-explicit.sock") };
@@ -1283,10 +1363,24 @@ mod tests {
         unsafe { std::env::set_var("TG_SERVE_SOCKET", "") };
         assert!(socket_path().is_none());
 
+        // The read socket: verbatim, and none when unset or empty
+        unsafe { std::env::set_var(READ_SOCKET_ENV, "/tmp/tg-read.sock") };
+        assert_eq!(
+            read_socket_path().unwrap(),
+            PathBuf::from("/tmp/tg-read.sock")
+        );
+        unsafe { std::env::set_var(READ_SOCKET_ENV, "") };
+        assert!(read_socket_path().is_none());
+        unsafe { std::env::remove_var(READ_SOCKET_ENV) };
+        assert!(read_socket_path().is_none());
+
         // Restore prior state
         match prev {
             Some(v) => unsafe { std::env::set_var("TG_SERVE_SOCKET", v) },
             None => unsafe { std::env::remove_var("TG_SERVE_SOCKET") },
+        }
+        if let Some(v) = prev_read {
+            unsafe { std::env::set_var(READ_SOCKET_ENV, v) };
         }
     }
 }

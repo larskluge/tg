@@ -231,6 +231,14 @@ The socket path is resolved in this order:
 
 `TG_REACTION_POLL=off` turns off the server's poll of group reactions (see *Reactions*).
 
+`TG_SERVE_READ_SOCKET=/path` (since 0.21.0) binds a second socket beside the first, also `0600`,
+that serves only the reads: `whoami`, `chats`, `groups`, `unread`, `search`, `messages`,
+`message`, `download`, `sync` and `subscribe`. Every other `cmd` (`send`, `react`, `mark_read`,
+`mark_unread`, `delete_chat`, and any added later) is answered there with `ok: false` and does
+nothing. A reader that must never write to a chat is given only this one, in a directory of its
+own, so it cannot reach the full socket: Mycelium on outpost. Unset or empty, there is none; the
+same path as the full socket refuses to start.
+
 The socket is created with `0600` permissions. Concurrent connections are accepted, but TDLib calls are serialised internally — slow commands (e.g. `download`) block the channel until they complete.
 
 **Operational notes:**
