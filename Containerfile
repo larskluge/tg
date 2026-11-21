@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked \
     && mkdir -p /out/lib \
     && cp target/release/tg /out/tg \
-    && cp target/release/build/tdlib-rs-*/out/tdlib/lib/libtdjson.so* /out/lib/
+    && cp target/release/build/tdlib-rs/*/out/tdlib/lib/libtdjson.so* /out/lib/
 
 # --- runtime ---------------------------------------------------------------
 FROM docker.io/library/debian:trixie-slim

@@ -10,7 +10,7 @@ build:
 release:
 	cargo build --release
 	mkdir -p target/lib
-	cp target/release/build/tdlib-rs-*/out/tdlib/lib/libtdjson*.dylib target/lib/
+	cp target/release/build/tdlib-rs/*/out/tdlib/lib/libtdjson*.dylib target/lib/
 	@echo ""
 	@echo "Release build complete:"
 	@echo "  Binary: target/release/tg"
